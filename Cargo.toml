@@ -1,0 +1,20 @@
+[package]
+name = "litematica"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Conflux-Union/litematica-rust"
+readme = "README.md"
+description = "Streaming, low-memory parser for Minecraft .litematic schematic files"
+keywords = ["minecraft", "litematic", "litematica", "nbt", "parser"]
+categories = ["encoding", "parser-implementations", "game-development"]
+
+[dependencies]
+flate2 = "1.0"
+thiserror = "2.0"
+
+[dev-dependencies]
+# Differential oracle and fixture generator for tests only. Default features
+# are disabled so the oracle exposes raw i64 timestamps and stays lightweight.
+rustmatica = { version = "0.5", default-features = false }
+mcdata = "0.4"
