@@ -26,6 +26,15 @@ This crate takes a different route:
 Peak RSS is therefore roughly *decompressed file size + epsilon*, and parse
 errors carry byte offsets for diagnosing hostile files.
 
+## Installation
+
+```toml
+[dependencies]
+litematica = "0.1"
+```
+
+Requires Rust 1.88 or newer.
+
 ## Usage
 
 ```rust
