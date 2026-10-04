@@ -1,7 +1,6 @@
 //! Regions, block state palettes, and the bit-unpacking block iterator.
 
 use std::fmt;
-use std::slice::ChunksExact;
 
 use crate::error::{Error, Result};
 
@@ -165,7 +164,8 @@ impl<'a> Region<'a> {
 #[derive(Debug)]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct BlockIter<'a> {
-    longs: ChunksExact<'a, u8>,
+    longs: &'a [[u8; 8]],
+    next_long: usize,
     cur: u64,
     cur_bits: u32,
     mask: u64,
@@ -175,8 +175,12 @@ pub struct BlockIter<'a> {
 
 impl<'a> BlockIter<'a> {
     pub(crate) fn new(bytes: &'a [u8], bits: u32, volume: u64) -> Self {
+        // A long array payload is a whole number of 8-byte entries, so the
+        // remainder is empty for well-formed input and ignored otherwise.
+        let (longs, _remainder) = bytes.as_chunks::<8>();
         Self {
-            longs: bytes.chunks_exact(8),
+            longs,
+            next_long: 0,
             cur: 0,
             cur_bits: 0,
             mask: (1u64 << bits) - 1,
@@ -208,12 +212,11 @@ impl Iterator for BlockIter<'_> {
             // long boundary, low bits from the old long, high from the new.
             let low = self.cur_bits;
             let mut v = self.cur & self.mask;
-            // After validation a refill is always available; map_or(0) keeps
-            // this panic-free regardless.
-            self.cur = self
-                .longs
-                .next()
-                .map_or(0, |c| u64::from_be_bytes(c.try_into().unwrap_or_default()));
+            // After validation a refill is always available; falling back to
+            // a zero long keeps this panic-free regardless.
+            let next = self.longs.get(self.next_long).copied().unwrap_or([0; 8]);
+            self.next_long += 1;
+            self.cur = u64::from_be_bytes(next);
             self.cur_bits = 64;
             v |= (self.cur & (self.mask >> low)) << low;
             self.cur >>= bits - low;
