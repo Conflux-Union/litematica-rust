@@ -1,8 +1,12 @@
-//! A minimal big-endian Java NBT cursor.
+//! Minimal big-endian Java NBT serialization primitives.
 //!
 //! The reader never builds a tree: values are decoded in place and unknown
 //! subtrees are skipped in O(length) without allocation, so a decompressed
-//! litematic buffer is scanned exactly once.
+//! litematic buffer is scanned exactly once. The writer is its mirror image:
+//! a forward-only encoder that streams values to any `std::io::Write`
+//! without buffering a tree.
+
+use std::io::Write as IoWrite;
 
 use crate::error::{Error, Result};
 
@@ -193,9 +197,157 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// A forward-only NBT encoder writing big-endian values to a sink.
+pub(crate) struct Writer<W: IoWrite> {
+    out: W,
+}
+
+impl<W: IoWrite> Writer<W> {
+    /// Creates a writer that serializes into `out`.
+    pub(crate) fn new(out: W) -> Self {
+        Self { out }
+    }
+
+    /// Writes all bytes, mapping sink failures to [`Error::WriteIo`].
+    fn put(&mut self, bytes: &[u8]) -> Result<()> {
+        self.out
+            .write_all(bytes)
+            .map_err(|source| Error::WriteIo { source })
+    }
+
+    /// Writes one tag id byte.
+    #[inline]
+    pub(crate) fn u8(&mut self, v: u8) -> Result<()> {
+        self.put(&[v])
+    }
+
+    /// Writes one big-endian `i32`.
+    #[inline]
+    pub(crate) fn i32(&mut self, v: i32) -> Result<()> {
+        self.put(&v.to_be_bytes())
+    }
+
+    /// Writes one big-endian `i64`.
+    #[inline]
+    pub(crate) fn i64(&mut self, v: i64) -> Result<()> {
+        self.put(&v.to_be_bytes())
+    }
+
+    /// Writes an NBT string: `u16` byte-length prefix plus UTF-8 payload.
+    pub(crate) fn string(&mut self, s: &str) -> Result<()> {
+        let bytes = s.as_bytes();
+        let len =
+            u16::try_from(bytes.len()).map_err(|_| Error::StringTooLong { len: bytes.len() })?;
+        self.put(&len.to_be_bytes())?;
+        self.put(bytes)
+    }
+
+    /// Writes a named-tag header: tag id byte followed by the field name.
+    pub(crate) fn named(&mut self, tag: u8, name: &str) -> Result<()> {
+        self.u8(tag)?;
+        self.string(name)
+    }
+
+    /// Writes the root compound header: `TAG_Compound` with an empty name.
+    pub(crate) fn root(&mut self) -> Result<()> {
+        self.named(TAG_COMPOUND, "")
+    }
+
+    /// Writes a `TAG_End` marker closing the innermost compound.
+    pub(crate) fn end(&mut self) -> Result<()> {
+        self.u8(TAG_END)
+    }
+
+    /// Flushes and returns the underlying sink.
+    pub(crate) fn into_inner(mut self) -> std::io::Result<W> {
+        self.out.flush()?;
+        Ok(self.out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SCALAR_SIZE, TAG_INT, TAG_LONG};
+    use super::{
+        Reader, Writer, SCALAR_SIZE, TAG_COMPOUND, TAG_END, TAG_INT, TAG_LONG, TAG_LONG_ARRAY,
+        TAG_STRING,
+    };
+    use crate::Error;
+
+    #[test]
+    fn writer_scalars_round_trip_through_reader() {
+        let mut w = Writer::new(Vec::new());
+        w.root().unwrap();
+        w.named(TAG_INT, "a").unwrap();
+        w.i32(-5).unwrap();
+        w.named(TAG_STRING, "\u{540d}\u{5b57}").unwrap();
+        w.string("h\u{e9}llo \u{2713}").unwrap();
+        w.named(TAG_LONG, "c").unwrap();
+        w.i64(i64::MIN).unwrap();
+        w.end().unwrap();
+        let buf = w.into_inner().unwrap();
+
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.tag_id().unwrap(), TAG_COMPOUND);
+        assert_eq!(r.string().unwrap(), "");
+        assert_eq!(r.tag_id().unwrap(), TAG_INT);
+        assert_eq!(r.string().unwrap(), "a");
+        assert_eq!(r.i32().unwrap(), -5);
+        assert_eq!(r.tag_id().unwrap(), TAG_STRING);
+        assert_eq!(r.string().unwrap(), "\u{540d}\u{5b57}");
+        assert_eq!(r.string().unwrap(), "h\u{e9}llo \u{2713}");
+        assert_eq!(r.tag_id().unwrap(), TAG_LONG);
+        assert_eq!(r.string().unwrap(), "c");
+        assert_eq!(r.i64().unwrap(), i64::MIN);
+        assert_eq!(r.tag_id().unwrap(), TAG_END);
+        assert_eq!(r.pos(), buf.len());
+    }
+
+    #[test]
+    fn writer_long_array_round_trips_and_skips() {
+        let mut w = Writer::new(Vec::new());
+        w.root().unwrap();
+        w.named(TAG_LONG_ARRAY, "data").unwrap();
+        w.i32(3).unwrap();
+        w.i64(0x0102_0304_0506_0708).unwrap();
+        w.i64(-1).unwrap();
+        w.i64(0).unwrap();
+        w.end().unwrap();
+        let buf = w.into_inner().unwrap();
+
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.tag_id().unwrap(), TAG_COMPOUND);
+        r.string().unwrap();
+        let tag = r.tag_id().unwrap();
+        r.string().unwrap(); // skip_value skips payloads only, not names
+        r.skip_value(tag, 1).unwrap();
+        assert_eq!(r.tag_id().unwrap(), TAG_END);
+        assert_eq!(r.pos(), buf.len());
+    }
+
+    #[test]
+    fn writer_propagates_sink_io_errors() {
+        struct Failing;
+        impl std::io::Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("boom"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut w = Writer::new(Failing);
+        assert!(matches!(w.root(), Err(Error::WriteIo { .. })));
+    }
+
+    #[test]
+    fn writer_rejects_strings_over_u16_limit() {
+        let mut w = Writer::new(Vec::new());
+        let s = "x".repeat(70_000);
+        assert!(matches!(
+            w.string(&s),
+            Err(Error::StringTooLong { len: 70_000 })
+        ));
+    }
 
     #[test]
     fn scalar_sizes_match_tag_ids() {

@@ -17,6 +17,13 @@
 //! data, ...) are skipped in O(length) without allocation, so parsing cost is
 //! a single linear scan of the decompressed bytes plus lazy iteration.
 //!
+//! The crate also writes schematics with the same discipline: a [`Layout`]
+//! answers point queries (`size`, `block_at`), and [`write`] serializes it
+//! as a single-region file straight into any [`std::io::Write`] (file or
+//! network stream), with memory bounded by the palette rather than the
+//! volume — writing a 566x256x1423 layout (206 million voxels) peaks at a
+//! few MiB of RSS.
+//!
 //! Every parse error reports the byte offset at which it was detected, and
 //! hostile inputs (huge claimed sizes, negative lengths, over-deep nesting)
 //! are rejected instead of being trusted.
@@ -51,9 +58,12 @@ mod error;
 mod nbt;
 mod parse;
 mod region;
+mod write;
 
 pub use error::{Error, Result};
+pub use flate2::Compression;
 pub use region::{BlockIter, BlockState, Region};
+pub use write::{write, Layout, WriteOptions};
 
 use std::io::Read;
 

@@ -112,6 +112,44 @@ pub enum Error {
         offset: usize,
     },
 
+    /// Serializing the schematic to the output stream failed. The underlying
+    /// I/O error is preserved as the source.
+    #[error("writing schematic output failed: {source}")]
+    WriteIo {
+        /// The wrapped I/O error.
+        source: io::Error,
+    },
+
+    /// A `Layout::block_at` result is not covered by the layout's declared
+    /// palette.
+    #[error("block state `{name}` at ({x}, {y}, {z}) is not present in the declared palette")]
+    BlockNotInPalette {
+        /// Name of the offending block state.
+        name: String,
+        /// X coordinate of the query position.
+        x: u32,
+        /// Y coordinate of the query position.
+        y: u32,
+        /// Z coordinate of the query position.
+        z: u32,
+    },
+
+    /// A layout dimension or volume exceeds what a litematic file can store.
+    #[error("layout {what} {value} exceeds the i32 limit of the litematic format")]
+    DimensionOverflow {
+        /// Which quantity overflowed, e.g. `volume`.
+        what: &'static str,
+        /// The overflowing value.
+        value: u128,
+    },
+
+    /// A string value exceeds the u16 byte-length limit of the NBT format.
+    #[error("string of {len} bytes exceeds the NBT u16 length limit")]
+    StringTooLong {
+        /// The string length in bytes.
+        len: usize,
+    },
+
     /// The palette is so large that entries would need more than 32 bits,
     /// which cannot be represented by the `u32` indices this crate yields.
     #[error("block state palette requires more than 32 bits per entry at byte offset {offset}")]

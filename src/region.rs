@@ -5,7 +5,7 @@ use std::fmt;
 use crate::error::{Error, Result};
 
 /// A single block state from a region palette.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockState {
     /// Namespaced block id, e.g. `minecraft:redstone_wire`.
     pub name: String,

@@ -1,6 +1,6 @@
 # litematica
 
-Streaming, low-memory parser for Minecraft [Litematica](https://github.com/masa-tools/litematica)
+Streaming, low-memory reader and writer for Minecraft [Litematica](https://github.com/masa-tools/litematica)
 `.litematic` schematic files (format version 6).
 
 ## Why
@@ -55,6 +55,49 @@ for region in &doc.regions {
 }
 ```
 
+## Writing
+
+Serialization is declarative: implement `Layout` with two point queries and
+the crate streams the file out with memory bounded by the palette, not the
+volume — suited to procedural generation and network sinks alike.
+
+```rust
+use litematica::{write, BlockState, Layout, WriteOptions};
+
+struct MyLayout {
+    stone: BlockState,
+}
+
+impl Layout for MyLayout {
+    fn size(&self) -> [u32; 3] {
+        [16, 16, 16]
+    }
+
+    fn block_at(&self, pos: [u32; 3]) -> Option<&BlockState> {
+        // None means air; return references to your own state storage.
+        (pos[1] == 0).then_some(&self.stone)
+    }
+}
+
+# fn main() -> Result<(), litematica::Error> {
+let options = WriteOptions::new(4189, "my build"); // data version 4189 = 1.21.4
+let mut file = std::io::Cursor::new(Vec::new()); // any `std::io::Write` works
+write(&MyLayout { stone: BlockState { name: "minecraft:stone".into(), properties: vec![] } }, &options, &mut file)?;
+# Ok(())
+# }
+```
+
+Design notes:
+
+- `Layout::block_at` may return `None` (air) or a reference to one of the
+  states `Layout::palette` declares; the default `palette` implementation
+  discovers it with one extra scan, and over-approximation is allowed.
+- The writer enforces the format invariants itself: air is pinned to palette
+  index 0, duplicate states collapse, and the bit width matches the reader's
+  rule. A state not covered by the declared palette fails with
+  `Error::BlockNotInPalette` naming the block and position.
+- v1 writing scope is a single region without entities or tile entities.
+
 ## Format notes
 
 `.litematic` files are gzipped, big-endian Java NBT with a root compound
@@ -85,6 +128,11 @@ the Litematica mod and rustmatica.
   `palette()`, `dims()`, `volume()`, `bits_per_entry()`, and
   `iter_blocks() -> impl Iterator<Item = u32> + ExactSizeIterator`.
 - `BlockState` — `name` plus `properties` in file order.
+- `Layout` — `size()` + `block_at(pos) -> Option<&BlockState>`, with a
+  default `palette()` discovery scan; the declarative source for writing.
+- `write(layout, &options, sink)` — single-region streaming serialization
+  into any `Write`; `WriteOptions` carries name/author/description, the
+  Minecraft data version, timestamps, and the gzip level.
 - Errors: a `thiserror` enum, parse variants carry byte offsets;
   `Result<T>` alias included.
 
@@ -122,9 +170,24 @@ A repeat of the differential run on the same machine gave 15.44 GiB /
 the gap of roughly two orders of magnitude in both time and memory does
 not.
 
+### Writing
+
+`examples/write_bench.rs` serializes a procedurally generated hollow sphere
+in the same 566×256×1423 envelope (206,187,008 voxels), then the file is
+read back by this crate with exact volume agreement:
+
+| stage | wall time |
+| --- | --- |
+| stream-write 206M voxels (queries + packing + gzip 6) | 12.2 s |
+| read back (decompress + parse + iterate) | 89 ms |
+
+Peak RSS while writing: **2.5 MiB** — the rust runtime baseline plus the
+palette. Writer memory is O(palette) regardless of volume.
+
 ## Status
 
-v1 scope is **read-only** parsing: no writing or editing of schematics.
+Reading is complete and production-ready. Writing is a newer addition:
+single-region, declarative `Layout` input, no entities or tile entities yet.
 
 ## License
 
