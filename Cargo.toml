@@ -1,14 +1,14 @@
 [package]
 name = "litematica"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # slice::as_chunks, used by the block iterator, was stabilized in 1.88.
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/Conflux-Union/litematica-rust"
 readme = "README.md"
-description = "Streaming, low-memory parser for Minecraft .litematic schematic files"
-keywords = ["minecraft", "litematic", "litematica", "nbt", "parser"]
+description = "Streaming, low-memory reader and writer for Minecraft .litematic schematic files"
+keywords = ["minecraft", "litematic", "litematica", "nbt", "schematic"]
 categories = ["encoding", "parser-implementations", "game-development"]
 
 [dependencies]
