@@ -18,7 +18,7 @@
 //! a single linear scan of the decompressed bytes plus lazy iteration.
 //!
 //! The crate also writes schematics with the same discipline: a [`Layout`]
-//! answers point queries (`size`, `block_at`), and [`write`] serializes it
+//! answers point queries (`size`, `block_at`), and [`write()`] serializes it
 //! as a single-region file straight into any [`std::io::Write`] (file or
 //! network stream), with memory bounded by the palette rather than the
 //! volume — writing a 566x256x1423 layout (206 million voxels) peaks at a
