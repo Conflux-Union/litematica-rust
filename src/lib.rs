@@ -63,7 +63,7 @@ mod write;
 
 pub use error::{Error, Result};
 pub use flate2::Compression;
-pub use mcdata::BlockState;
+pub use mcdata::{BlockState, Properties};
 pub use region::{BlockIter, Region};
 pub use write::{write, Layout, WriteOptions};
 
@@ -170,19 +170,17 @@ impl Document<'_> {
         if self.regions.is_empty() {
             return None;
         }
-        let mut lo = [0i64; 3];
-        let mut hi = [0i64; 3];
-        for region in &self.regions {
-            for axis in 0..3 {
+        let bounds = |axis: usize| {
+            self.regions.iter().fold((0i64, 0i64), |(lo, hi), region| {
                 let p = i64::from(region.position[axis]);
                 let s = i64::from(region.size[axis]);
-                lo[axis] = lo[axis].min(p.min(p + s + 1));
-                hi[axis] = hi[axis].max(p.max(p + s - 1));
-            }
-        }
-        let extent = |axis: usize| {
-            (hi[axis] - lo[axis] + 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+                (lo.min(p.min(p + s + 1)), hi.max(p.max(p + s - 1)))
+            })
         };
-        Some([extent(0), extent(1), extent(2)])
+        let sizes = [0, 1, 2].map(|axis| {
+            let (lo, hi) = bounds(axis);
+            (hi - lo + 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        });
+        Some(sizes)
     }
 }

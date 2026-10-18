@@ -8,11 +8,7 @@ use crate::mcdata::BlockState;
 /// Computes the litematica bit width for a palette of `len` entries: the
 /// smallest `n >= 2` with `2^n >= len`.
 pub(crate) fn num_bits(len: usize) -> u32 {
-    let mut n = 2u32;
-    while n < 32 && (1u64 << n) < len as u64 {
-        n += 1;
-    }
-    n
+    (2..32).find(|n| (1u64 << n) >= len as u64).unwrap_or(32)
 }
 
 /// One region of a schematic.
@@ -49,8 +45,10 @@ impl fmt::Debug for Region<'_> {
 
 impl<'a> Region<'a> {
     /// Assembles a region from parsed pieces and validates the block data
-    /// against the palette and volume. `offset` is the byte offset of the
-    /// region's `BlockStates` payload and is used in error reports.
+    /// against the palette and volume.
+    ///
+    /// `offset` is the byte offset of the region's `BlockStates` payload and
+    /// is used in error reports.
     pub(crate) fn from_parts(
         name: String,
         position: [i32; 3],
@@ -274,22 +272,17 @@ mod tests {
     fn iter_entries_crossing_long_boundaries() {
         // 5 bits per entry, 20 entries -> 100 bits, crossing 64-bit borders.
         let values: Vec<u32> = (0..20).map(|i| (i * 7 + 3) % 32).collect();
+        let bits: Vec<u8> = values
+            .iter()
+            .flat_map(|v| (0..5).map(move |k| ((v >> k) & 1) as u8))
+            .collect();
         let mut longs = Vec::new();
-        let mut acc = 0u64;
-        let mut filled = 0u32;
-        for &v in &values {
-            for k in 0..5 {
-                acc |= u64::from((v >> k) & 1) << filled;
-                filled += 1;
-                if filled == 64 {
-                    longs.extend_from_slice(&acc.to_be_bytes());
-                    acc = 0;
-                    filled = 0;
-                }
-            }
-        }
-        if filled > 0 {
-            longs.extend_from_slice(&acc.to_be_bytes());
+        for chunk in bits.chunks(64) {
+            let word = chunk
+                .iter()
+                .enumerate()
+                .fold(0u64, |word, (k, &bit)| word | (u64::from(bit) << k));
+            longs.extend_from_slice(&word.to_be_bytes());
         }
         let decoded: Vec<u32> = BlockIter::new(&longs, 5, values.len() as u64).collect();
         assert_eq!(decoded, values);

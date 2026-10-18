@@ -24,6 +24,7 @@ pub(crate) const TAG_INT_ARRAY: u8 = 11;
 pub(crate) const TAG_LONG_ARRAY: u8 = 12;
 
 /// Payload size in bytes for fixed-size scalar tags, indexed by tag id.
+///
 /// Entries are `None` for tags with variable or prefixed sizes.
 const SCALAR_SIZE: [Option<u64>; 13] = [
     None,    // 0 end (never a standalone value)
@@ -94,9 +95,11 @@ impl<'a> Reader<'a> {
     }
 
     /// Reads an NBT string (u16 length prefix + bytes) and decodes it as
-    /// UTF-8, replacing invalid sequences. Java's modified UTF-8 differs from
-    /// standard UTF-8 only in encodings that never appear in litematic files,
-    /// so a lossy decode is sufficient here.
+    /// UTF-8, replacing invalid sequences.
+    ///
+    /// Java's modified UTF-8 differs from standard UTF-8 only in encodings
+    /// that never appear in litematic files, so a lossy decode is sufficient
+    /// here.
     pub(crate) fn string(&mut self) -> Result<String> {
         let b = self.take(2)?;
         let n = u16::from_be_bytes([b[0], b[1]]) as u64;
@@ -134,66 +137,65 @@ impl<'a> Reader<'a> {
     }
 
     /// Skips the payload of `tag`, which is a value nested inside a container
-    /// at `enclosing_depth`. Sized arrays jump directly by length * element
-    /// size; compounds and lists walk their headers only.
+    /// at `enclosing_depth`.
+    ///
+    /// Sized arrays jump directly by length * element size; compounds and
+    /// lists walk their headers only.
     pub(crate) fn skip_value(&mut self, tag: u8, enclosing_depth: usize) -> Result<()> {
         if let Some(n) = SCALAR_SIZE[tag as usize] {
             return self.take(n).map(|_| ());
         }
         match tag {
-            TAG_BYTE_ARRAY => {
-                let n = self.count()?;
-                self.take(n as u64)?;
-            }
-            TAG_STRING => {
-                self.string()?;
-            }
-            TAG_LIST => {
-                let elem = self.tag_id()?;
-                let count = self.count()?;
-                if count > 0 {
-                    let depth = self.descend(enclosing_depth)?;
-                    if elem == TAG_END {
-                        return Err(Error::UnexpectedTag {
-                            field: "list element",
-                            tag: elem,
-                            offset: self.pos,
-                        });
-                    }
-                    for _ in 0..count {
-                        self.skip_value(elem, depth)?;
-                    }
-                }
-            }
-            TAG_COMPOUND => {
-                let depth = self.descend(enclosing_depth)?;
-                loop {
-                    let t = self.tag_id()?;
-                    if t == TAG_END {
-                        break;
-                    }
-                    self.string()?;
-                    self.skip_value(t, depth)?;
-                }
-            }
-            TAG_INT_ARRAY => {
-                let n = self.count()?;
-                self.take(n as u64 * 4)?;
-            }
-            TAG_LONG_ARRAY => {
-                let n = self.count()?;
-                self.take(n as u64 * 8)?;
-            }
+            TAG_BYTE_ARRAY => self.skip_array(1),
+            TAG_STRING => self.string().map(|_| ()),
+            TAG_LIST => self.skip_list(enclosing_depth),
+            TAG_COMPOUND => self.skip_compound(enclosing_depth),
+            TAG_INT_ARRAY => self.skip_array(4),
+            TAG_LONG_ARRAY => self.skip_array(8),
             // Unreachable for validated ids: every id is covered above.
-            _ => {
-                return Err(Error::UnexpectedTag {
-                    field: "value",
-                    tag,
-                    offset: self.pos,
-                });
-            }
+            _ => Err(Error::UnexpectedTag {
+                field: "value",
+                tag,
+                offset: self.pos(),
+            }),
         }
-        Ok(())
+    }
+
+    /// Skips a sized array of `width`-byte elements.
+    fn skip_array(&mut self, width: u64) -> Result<()> {
+        let n = self.count()?;
+        self.take(n as u64 * width).map(|_| ())
+    }
+
+    /// Skips a list payload, descending one nesting level for its elements.
+    fn skip_list(&mut self, enclosing_depth: usize) -> Result<()> {
+        let elem = self.tag_id()?;
+        let count = self.count()?;
+        if count == 0 {
+            return Ok(());
+        }
+        let depth = self.descend(enclosing_depth)?;
+        if elem == TAG_END {
+            return Err(Error::UnexpectedTag {
+                field: "list element",
+                tag: elem,
+                offset: self.pos(),
+            });
+        }
+        (0..count).try_for_each(|_| self.skip_value(elem, depth))
+    }
+
+    /// Skips a compound payload, descending one nesting level for its fields.
+    fn skip_compound(&mut self, enclosing_depth: usize) -> Result<()> {
+        let depth = self.descend(enclosing_depth)?;
+        loop {
+            let tag = self.tag_id()?;
+            if tag == TAG_END {
+                return Ok(());
+            }
+            self.string()?;
+            self.skip_value(tag, depth)?;
+        }
     }
 }
 
@@ -267,10 +269,8 @@ impl<W: IoWrite> Writer<W> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Reader, Writer, SCALAR_SIZE, TAG_COMPOUND, TAG_END, TAG_INT, TAG_LONG, TAG_LONG_ARRAY,
-        TAG_STRING,
-    };
+    use super::{Reader, Writer, SCALAR_SIZE, TAG_COMPOUND, TAG_END};
+    use super::{TAG_INT, TAG_LONG, TAG_LONG_ARRAY, TAG_STRING};
     use crate::Error;
 
     #[test]

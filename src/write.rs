@@ -20,9 +20,8 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 
 use crate::error::{Error, Result};
-use crate::nbt::{
-    Writer, TAG_COMPOUND, TAG_END, TAG_INT, TAG_LIST, TAG_LONG, TAG_LONG_ARRAY, TAG_STRING,
-};
+use crate::nbt::{Writer, TAG_COMPOUND, TAG_END, TAG_INT, TAG_LIST};
+use crate::nbt::{TAG_LONG, TAG_LONG_ARRAY, TAG_STRING};
 use crate::{mcdata::BlockState, region::num_bits};
 
 /// Litematica format version written by this crate (`Version`).
@@ -100,10 +99,7 @@ impl Encode for Palette {
         out.u8(TAG_COMPOUND)?;
         out.i32(self.len() as i32)?;
         air().body(out)?;
-        for state in self.states() {
-            state.body(out)?;
-        }
-        Ok(())
+        self.states().iter().try_for_each(|state| state.body(out))
     }
 }
 
@@ -148,17 +144,10 @@ pub trait Layout {
     /// every voxel.
     fn palette(&self) -> HashSet<BlockState> {
         let [sx, sy, sz] = self.size();
-        let mut seen = HashSet::new();
-        for y in 0..sy {
-            for z in 0..sz {
-                for x in 0..sx {
-                    if let Some(state) = self.block_at([x, y, z]) {
-                        seen.insert(state.clone());
-                    }
-                }
-            }
-        }
-        seen
+        (0..sy)
+            .flat_map(move |y| (0..sz).flat_map(move |z| (0..sx).map(move |x| [x, y, z])))
+            .filter_map(|pos| self.block_at(pos).cloned())
+            .collect()
     }
 }
 
@@ -244,13 +233,11 @@ impl WriteOptions {
 /// ```
 pub fn write<L: Layout, W: IoWrite>(layout: &L, options: &WriteOptions, sink: W) -> Result<()> {
     let size = layout.size();
-    for &d in &size {
-        if d > i32::MAX as u32 {
-            return Err(Error::DimensionOverflow {
-                what: "size axis",
-                value: u128::from(d),
-            });
-        }
+    if let Some(&d) = size.iter().find(|&&d| d > i32::MAX as u32) {
+        return Err(Error::DimensionOverflow {
+            what: "size axis",
+            value: u128::from(d),
+        });
     }
     let volume = u128::from(size[0]) * u128::from(size[1]) * u128::from(size[2]);
     let volume_i32 = i32::try_from(volume).map_err(|_| Error::DimensionOverflow {
@@ -383,23 +370,10 @@ impl<L: Layout> Encode for BlockStates<'_, L> {
             let rest = index / sx;
             let z = (rest % sz) as u32;
             let y = (rest / sz) as u32;
-            let id = match self.layout.block_at([x, y, z]) {
-                None => 0,
-                Some(state) => {
-                    let Some(id) = self.palette.id_of(state) else {
-                        return Err(Error::BlockNotInPalette {
-                            name: state.name.to_string(),
-                            x,
-                            y,
-                            z,
-                        });
-                    };
-                    if id != 0 {
-                        self.total_blocks.set(self.total_blocks.get() + 1);
-                    }
-                    id
-                }
-            };
+            let id = id_at(self.layout, self.palette, [x, y, z])?;
+            if id != 0 {
+                self.total_blocks.set(self.total_blocks.get() + 1);
+            }
             if let Some(word) = packer.push(id) {
                 out.i64(word as i64)?;
             }
@@ -408,6 +382,24 @@ impl<L: Layout> Encode for BlockStates<'_, L> {
             out.i64(word as i64)?;
         }
         Ok(())
+    }
+}
+
+/// Resolves the palette id written at `pos`, or the error to report.
+///
+/// Air is id 0; every other state must be covered by `palette`.
+fn id_at<L: Layout>(layout: &L, palette: &Palette, [x, y, z]: [u32; 3]) -> Result<u32> {
+    let Some(state) = layout.block_at([x, y, z]) else {
+        return Ok(0);
+    };
+    match palette.id_of(state) {
+        Some(id) => Ok(id),
+        None => Err(Error::BlockNotInPalette {
+            name: state.name.to_string(),
+            x,
+            y,
+            z,
+        }),
     }
 }
 
@@ -532,13 +524,14 @@ mod encode {
 
         fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
             self.name.as_ref().encode("Name", out)?;
-            if !self.properties.is_empty() {
-                out.named(TAG_COMPOUND, "Properties")?;
-                for (key, value) in &self.properties {
-                    value.encode(key.as_ref(), out)?;
-                }
-                out.end()?;
+            if self.properties.is_empty() {
+                return out.end();
             }
+            out.named(TAG_COMPOUND, "Properties")?;
+            for (key, value) in &self.properties {
+                value.encode(key.as_ref(), out)?;
+            }
+            out.end()?;
             out.end()
         }
     }
