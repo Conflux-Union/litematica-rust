@@ -10,10 +10,10 @@
 
 use self::encode::{empty_list, Encode};
 use crate::error::{Error, Result};
-use crate::mcdata::util::BlockPos;
+use crate::mcdata::{util::BlockPos, BlockState};
 use crate::nbt::{Writer, TAG_COMPOUND, TAG_END, TAG_INT, TAG_LIST};
 use crate::nbt::{TAG_LONG, TAG_LONG_ARRAY, TAG_STRING};
-use crate::{mcdata::BlockState, region::num_bits};
+use crate::region::num_bits;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::cell::Cell;
@@ -39,33 +39,18 @@ const FORMAT_SUB_VERSION: i32 = 1;
 pub trait Layout {
     /// Absolute dimensions per axis, never negative. Every position handed to
     /// [`Layout::block_at`] is contained by this box, as decided by
-    /// [`BlockPos::contains`].
+    /// [`BlockPos::contains`]. The value must stay stable throughout one
+    /// [`write()`] call: it defines both the declared `Region.Size` and the
+    /// voxels that get packed.
     fn size(&self) -> BlockPos;
 
     /// The block state at `pos`, or `None` for air; `pos` is assumed in bounds.
     ///
     /// Every returned state must be structurally equal (name and properties)
     /// to some entry of [`Layout::block_palette`]; a violation surfaces as
-    /// [`Error::BlockNotInPalette`] during serialization.
+    /// [`Error::BlockNotInPalette`] during serialization. Air never needs an
+    /// entry: both `None` and plain `minecraft:air` map to palette index 0.
     fn block_at(&self, pos: BlockPos) -> Option<BlockState>;
-
-    /// The block state at `pos`, or `None` when it misses the bounding box.
-    fn get_block(&self, pos: BlockPos) -> Option<BlockState> {
-        match self.contains(pos) {
-            true => self.block_at(pos),
-            false => None,
-        }
-    }
-
-    /// The block state at `pos`, or air where the layout is empty.
-    fn get_block_or_air(&self, pos: BlockPos) -> BlockState {
-        self.get_block(pos).unwrap_or(BlockState::AIR)
-    }
-
-    /// Whether `pos` is inside the bounding box.
-    fn contains(&self, pos: BlockPos) -> bool {
-        self.size().contains(pos)
-    }
 
     /// Every state [`Layout::block_at`] may return, as a set, empty cells
     /// counted as air.
@@ -78,10 +63,11 @@ pub trait Layout {
     /// with a full scan of the bounding box, which costs one extra pass over
     /// every voxel.
     fn block_palette(&self) -> HashSet<BlockState> {
-        self.size()
-            .cartesian_positions()
-            .map(|pos| self.get_block_or_air(pos))
-            .collect()
+        let positions = self.size().cartesian_positions();
+        positions.fold(HashSet::new(), |mut palette, pos| {
+            palette.insert(self.block_at(pos).unwrap_or(BlockState::AIR));
+            palette
+        })
     }
 }
 
@@ -597,7 +583,8 @@ impl Packer {
 
 #[cfg(test)]
 mod tests {
-    use super::Palette;
+    use super::{Layout, Palette};
+    use crate::mcdata::util::BlockPos;
     use crate::mcdata::BlockState;
 
     fn st(name: &str, props: &[(&str, &str)]) -> BlockState {
@@ -706,6 +693,25 @@ mod tests {
             let expect = crate::region::num_bits(len + 1);
             assert_eq!(p.num_bits(), expect, "palette of {len} entries + air");
         }
+    }
+
+    #[test]
+    fn default_palette_does_not_reserve_the_whole_box() {
+        struct Empty(BlockPos);
+
+        impl Layout for Empty {
+            fn size(&self) -> BlockPos {
+                self.0
+            }
+
+            fn block_at(&self, _pos: BlockPos) -> Option<BlockState> {
+                None
+            }
+        }
+
+        let palette = Empty(BlockPos::new(64, 64, 64)).block_palette();
+        assert_eq!(palette, [air()].into());
+        assert!(palette.capacity() < 1024, "palette reserved the whole box");
     }
 
     #[test]

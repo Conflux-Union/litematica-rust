@@ -131,9 +131,8 @@ the Litematica mod and rustmatica.
   `palette()`, `dims()`, `volume()`, `bits_per_entry()`, and
   `iter_blocks() -> impl Iterator<Item = u32> + ExactSizeIterator`.
 - `BlockState` — `name` plus `properties` in file order.
-- `Layout` — `size()` + `block_at(pos) -> Option<BlockState>`, plus
-  `get_block`, `get_block_or_air`, `contains`, and a default `block_palette()`
-  discovery scan; the declarative source for writing.
+- `Layout` — `size()`, `block_at(pos) -> Option<BlockState>`, and a default
+  `block_palette()` discovery scan; the declarative source for writing.
 - `write(layout, &options, sink)` — single-region streaming serialization
   into any `Write`; `WriteOptions` carries name/author/description, the
   Minecraft data version, timestamps, and the gzip level.
