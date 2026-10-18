@@ -7,9 +7,10 @@
 
 use std::collections::HashSet;
 
-use litematica::mcdata::util::BlockPos;
-use litematica::mcdata::BlockState;
-use litematica::{decompress_gzip_with_limit, write, Document, Error, Layout, WriteOptions};
+use litematica::write::mcdata::util::BlockPos;
+use litematica::write::mcdata::BlockState;
+use litematica::write::{write, Layout, WriteOptions};
+use litematica::{decompress_gzip_with_limit, Document, Error};
 
 fn st(name: &str, props: &[(&str, &str)]) -> BlockState {
     BlockState {
@@ -23,6 +24,21 @@ fn st(name: &str, props: &[(&str, &str)]) -> BlockState {
 
 fn air() -> BlockState {
     st("minecraft:air", &[])
+}
+
+/// A reader palette entry as `(name, properties)`, the shape both sides share.
+fn read_view(state: &litematica::BlockState) -> (String, Vec<(String, String)>) {
+    (state.name.clone(), state.properties.clone())
+}
+
+/// A writer palette entry in that same shape; its map is already sorted.
+fn write_view(state: &BlockState) -> (String, Vec<(String, String)>) {
+    let props = state
+        .properties
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    (state.name.to_string(), props)
 }
 
 const AIR: u8 = 255;
@@ -195,7 +211,9 @@ fn round_trip_full_layout() {
     assert_eq!(region.size, [5, 3, 7]);
     assert_eq!(region.volume(), 105);
     let expected_palette = expected_file_palette(&table);
-    assert_eq!(region.palette(), expected_palette.as_slice());
+    let got: Vec<_> = region.palette().iter().map(read_view).collect();
+    let want: Vec<_> = expected_palette.iter().map(write_view).collect();
+    assert_eq!(got, want);
     assert_eq!(region.bits_per_entry(), num_bits(expected_palette.len()));
 
     // Properties survive keyed by name, in the map's sorted order.
@@ -208,7 +226,7 @@ fn round_trip_full_layout() {
     let props: Vec<(&str, &str)> = wire
         .properties
         .iter()
-        .map(|(k, v)| (k.as_ref(), v.as_ref()))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     assert_eq!(props, vec![("east", "side"), ("power", "15")]);
 
@@ -236,11 +254,14 @@ fn round_trip_over_approximated_palette_keeps_unused_entries() {
     let region = &doc.regions[0];
     // air + sorted {stone, unused_entry}; the unused entry travels along.
     assert_eq!(region.palette().len(), 3);
-    assert_eq!(region.palette()[0], air());
-    assert_eq!(region.palette()[1], st("minecraft:stone", &[]));
+    assert_eq!(read_view(&region.palette()[0]), write_view(&air()));
     assert_eq!(
-        region.palette()[2],
-        st("minecraft:unused_entry", &[("never", "emitted")])
+        read_view(&region.palette()[1]),
+        write_view(&st("minecraft:stone", &[]))
+    );
+    assert_eq!(
+        read_view(&region.palette()[2]),
+        write_view(&st("minecraft:unused_entry", &[("never", "emitted")]))
     );
     assert_voxels_match(&table, &doc);
 }
@@ -253,7 +274,8 @@ fn round_trip_zero_axis_writes_empty_block_states() {
 
     let region = &doc.regions[0];
     assert_eq!(region.volume(), 0);
-    assert_eq!(region.palette(), [air()].as_slice());
+    assert_eq!(region.palette().len(), 1);
+    assert_eq!(read_view(&region.palette()[0]), write_view(&air()));
     assert_eq!(region.iter_blocks().len(), 0);
     assert_eq!(doc.metadata.total_blocks, Some(0));
     assert_eq!(doc.metadata.total_volume, Some(0));
@@ -268,7 +290,8 @@ fn round_trip_all_air_uses_two_bit_entries() {
     let doc = rt.doc();
     let region = &doc.regions[0];
     assert_eq!(region.bits_per_entry(), 2);
-    assert_eq!(region.palette(), [air()].as_slice());
+    assert_eq!(region.palette().len(), 1);
+    assert_eq!(read_view(&region.palette()[0]), write_view(&air()));
     assert_eq!(doc.metadata.total_blocks, Some(0));
 }
 
@@ -364,15 +387,16 @@ fn default_palette_discovers_only_used_states() {
     let rt = RoundTrip::run(&bare, &WriteOptions::new(4189, "bare"));
     let doc = rt.doc();
     let region = &doc.regions[0];
-    assert_eq!(
-        region.palette(),
-        [
-            air(),
-            st("minecraft:glass", &[]),
-            st("minecraft:stone", &[])
-        ]
-        .as_slice()
-    );
+    let got: Vec<_> = region.palette().iter().map(read_view).collect();
+    let want: Vec<_> = [
+        air(),
+        st("minecraft:glass", &[]),
+        st("minecraft:stone", &[]),
+    ]
+    .iter()
+    .map(write_view)
+    .collect();
+    assert_eq!(got, want);
     assert_eq!(region.bits_per_entry(), 2);
     assert_eq!(doc.metadata.total_blocks, Some(16));
 }

@@ -8,9 +8,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use litematica::mcdata::util::BlockPos;
-use litematica::mcdata::BlockState;
-use litematica::{decompress_gzip_with_limit, write, Document, Layout, WriteOptions};
+use litematica::write::mcdata::util::BlockPos;
+use litematica::write::mcdata::BlockState;
+use litematica::write::{write, Layout, WriteOptions};
+use litematica::{decompress_gzip_with_limit, Document};
 use rustmatica::{Litematic, Region};
 
 type Schematic = Litematic<CowStrState, CowEntity, CowBlockEntity>;
@@ -134,6 +135,11 @@ fn expected_file_palette(table: &Table) -> Vec<BlockState> {
     p
 }
 
+/// A reader palette entry as `(name, properties)`, the shape both sides share.
+fn read_view(state: &litematica::BlockState) -> (String, Vec<(String, String)>) {
+    (state.name.clone(), state.properties.clone())
+}
+
 fn sorted_props(state: &BlockState) -> Vec<(String, String)> {
     state
         .properties
@@ -227,7 +233,12 @@ fn assert_written_file_matches(table: &Table, options: &WriteOptions) {
             "palette[{i}] properties"
         );
     }
-    assert_eq!(region.palette(), expected.as_slice(), "our palette order");
+    let got: Vec<_> = region.palette().iter().map(read_view).collect();
+    let want: Vec<_> = expected
+        .iter()
+        .map(|s| (s.name.to_string(), sorted_props(s)))
+        .collect();
+    assert_eq!(got, want, "our palette order");
     let mut n = 2u32;
     while (1u64 << n) < expected.len() as u64 {
         n += 1;

@@ -8,12 +8,13 @@
 //! may over-approximate, and its default implementation discovers the palette
 //! with one extra scan.
 
+pub mod mcdata;
+
 use self::encode::{empty_list, Encode};
+use self::mcdata::{util::BlockPos, BlockState};
 use crate::error::{Error, Result};
-use crate::mcdata::{util::BlockPos, BlockState};
 use crate::nbt::{Writer, TAG_COMPOUND, TAG_END, TAG_INT, TAG_LIST};
 use crate::nbt::{TAG_LONG, TAG_LONG_ARRAY, TAG_STRING};
-use crate::region::num_bits;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::cell::Cell;
@@ -75,9 +76,15 @@ pub trait Layout {
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
+/// Computes the litematica bit width for `len` palette entries: the smallest
+/// `n >= 2` with `2^n >= len`.
+fn num_bits(len: usize) -> u32 {
+    (2..32).find(|n| (1u64 << n) >= len as u64).unwrap_or(32)
+}
+
 /// The file-side block state palette of a written schematic.
 ///
-/// Built from the states a [`crate::Layout`] declares: air entries collapse
+/// Built from the states a [`Layout`] declares: air entries collapse
 /// into the format-mandated index 0, the rest are sorted and deduplicated so
 /// that [`Palette::id_of`] can answer with a binary search.
 pub(crate) struct Palette {
@@ -209,14 +216,14 @@ impl WriteOptions {
 /// # Example
 ///
 /// ```no_run
-/// # use litematica::{Layout, WriteOptions, write};
+/// # use litematica::write::{write, Layout, WriteOptions};
 /// # struct MyLayout;
 /// # impl Layout for MyLayout {
-/// #     fn size(&self) -> litematica::mcdata::util::BlockPos {
-/// #         litematica::mcdata::util::BlockPos::new(16, 16, 16)
+/// #     fn size(&self) -> litematica::write::mcdata::util::BlockPos {
+/// #         litematica::write::mcdata::util::BlockPos::new(16, 16, 16)
 /// #     }
-/// #     fn block_at(&self, pos: litematica::mcdata::util::BlockPos)
-/// #         -> Option<litematica::mcdata::BlockState> { None }
+/// #     fn block_at(&self, pos: litematica::write::mcdata::util::BlockPos)
+/// #         -> Option<litematica::write::mcdata::BlockState> { None }
 /// # }
 /// # fn main() -> Result<(), litematica::Error> {
 /// let layout = MyLayout;
@@ -441,7 +448,7 @@ impl Encode for Header<'_> {
 ///
 /// Scalars, vectors, and block states write themselves without owning a
 /// schema node, so they live together here and leave the top level for the
-/// document structure. The low-level sink stays in [`crate::nbt`], which is
+/// document structure. The low-level sink stays in the crate's `nbt` module, which is
 /// also why this module is named `encode` rather than `nbt`.
 mod encode {
     use super::{BlockPos, BlockState, IoWrite, Result, Writer};
@@ -541,7 +548,7 @@ mod encode {
 
 /// Packs palette indices into the `BlockStates` bit stream.
 ///
-/// The mirror of [`crate::region::BlockIter`]: one continuous LSB-first
+/// The mirror of [`crate::BlockIter`]: one continuous LSB-first
 /// stream of `bits`-wide entries, big-endian longs, entries straddling long
 /// boundaries. A long is returned the moment 64 bits have accumulated;
 /// [`Packer::finish`] flushes the trailing partial long, zero-padded.
@@ -594,9 +601,9 @@ impl Packer {
 
 #[cfg(test)]
 mod tests {
+    use super::mcdata::util::BlockPos;
+    use super::mcdata::BlockState;
     use super::{Layout, Palette};
-    use crate::mcdata::util::BlockPos;
-    use crate::mcdata::BlockState;
 
     fn st(name: &str, props: &[(&str, &str)]) -> BlockState {
         BlockState {
@@ -701,7 +708,7 @@ mod tests {
                 .map(|i| st("litematica:p", &[("i", &i.to_string())]))
                 .collect();
             let p = Palette::build(declared);
-            let expect = crate::region::num_bits(len + 1);
+            let expect = super::num_bits(len + 1);
             assert_eq!(p.num_bits(), expect, "palette of {len} entries + air");
         }
     }

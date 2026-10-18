@@ -1,4 +1,4 @@
-//! Minecraft coordinate types shared by layouts and schematics.
+//! Minecraft coordinate types used by the writer.
 //!
 //! Schematic code thinks in two quantities that happen to share one shape: a
 //! point in the world, and the span of a box. This module gives both the same

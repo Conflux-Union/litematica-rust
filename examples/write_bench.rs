@@ -15,9 +15,9 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use litematica::mcdata::util::BlockPos;
-use litematica::mcdata::BlockState;
-use litematica::{write, Layout, WriteOptions};
+use litematica::write::mcdata::util::BlockPos;
+use litematica::write::mcdata::BlockState;
+use litematica::write::{write, Layout, WriteOptions};
 
 /// Peak resident set size in bytes (Linux only, from VmHWM).
 fn peak_rss_bytes() -> Option<u64> {

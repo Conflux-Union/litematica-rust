@@ -1,4 +1,4 @@
-//! Minecraft data types shared by the reader and the writer.
+//! The writer's block and coordinate types.
 
 pub mod util;
 use std::borrow::Cow;

@@ -17,8 +17,9 @@
 //! data, ...) are skipped in O(length) without allocation, so parsing cost is
 //! a single linear scan of the decompressed bytes plus lazy iteration.
 //!
-//! The crate also writes schematics with the same discipline: a [`Layout`]
-//! answers point queries (`size`, `block_at`), and [`write()`] serializes it
+//! The crate also writes schematics with the same discipline: a
+//! [`write::Layout`] answers point queries (`size`, `block_at`), and
+//! [`write::write()`] serializes it
 //! as a single-region file straight into any [`std::io::Write`] (file or
 //! network stream), with memory bounded by the palette rather than the
 //! volume — writing a 566x256x1423 layout (206 million voxels) peaks at a
@@ -58,15 +59,13 @@ mod error;
 mod nbt;
 mod parse;
 mod region;
-mod write;
+pub mod write;
 use flate2::read::GzDecoder;
 use std::io::Read;
 
-pub mod mcdata;
 pub use error::{Error, Result};
 pub use flate2::Compression;
-pub use region::{BlockIter, Region};
-pub use write::{write, Layout, WriteOptions};
+pub use region::{BlockIter, BlockState, Region};
 
 /// Decompresses a single gzip member with a hard cap on the output size.
 ///
@@ -167,17 +166,19 @@ impl Document<'_> {
         if self.regions.is_empty() {
             return None;
         }
-        let bounds = |axis: usize| {
-            self.regions.iter().fold((0i64, 0i64), |(lo, hi), region| {
+        let mut lo = [0i64; 3];
+        let mut hi = [0i64; 3];
+        for region in &self.regions {
+            for axis in 0..3 {
                 let p = i64::from(region.position[axis]);
                 let s = i64::from(region.size[axis]);
-                (lo.min(p.min(p + s + 1)), hi.max(p.max(p + s - 1)))
-            })
+                lo[axis] = lo[axis].min(p.min(p + s + 1));
+                hi[axis] = hi[axis].max(p.max(p + s - 1));
+            }
+        }
+        let extent = |axis: usize| {
+            (hi[axis] - lo[axis] + 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
         };
-        let sizes = [0, 1, 2].map(|axis| {
-            let (lo, hi) = bounds(axis);
-            (hi - lo + 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-        });
-        Some(sizes)
+        Some([extent(0), extent(1), extent(2)])
     }
 }
