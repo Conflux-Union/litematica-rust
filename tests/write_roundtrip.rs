@@ -5,16 +5,18 @@
 //! checked field by field: metadata, region layout, palette order
 //! (air pinned to index 0, rest sorted), and the voxel-by-voxel stream.
 
+use std::collections::HashSet;
+
 use litematica::{
     decompress_gzip_with_limit, write, BlockState, Document, Error, Layout, WriteOptions,
 };
 
 fn st(name: &str, props: &[(&str, &str)]) -> BlockState {
     BlockState {
-        name: name.to_string(),
+        name: name.to_string().into(),
         properties: props
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (k.to_string().into(), v.to_string().into()))
             .collect(),
     }
 }
@@ -72,9 +74,9 @@ impl Layout for Table {
         }
     }
 
-    fn palette(&self) -> Vec<BlockState> {
+    fn palette(&self) -> HashSet<BlockState> {
         match &self.declared {
-            Some(d) => d.clone(),
+            Some(d) => d.iter().cloned().collect(),
             None => std::iter::once(air())
                 .chain(self.states.iter().cloned())
                 .collect(),
@@ -195,20 +197,19 @@ fn round_trip_full_layout() {
     assert_eq!(region.palette(), expected_palette.as_slice());
     assert_eq!(region.bits_per_entry(), num_bits(expected_palette.len()));
 
-    // Properties survive in declared order, not sorted.
+    // Properties survive keyed by name, in the map's sorted order.
     let wire = region
         .palette()
         .iter()
         .find(|s| s.name == "minecraft:redstone_wire")
         .expect("wire in palette");
     assert_eq!(wire.name, "minecraft:redstone_wire");
-    assert_eq!(
-        wire.properties,
-        vec![
-            ("east".to_string(), "side".to_string()),
-            ("power".to_string(), "15".to_string()),
-        ]
-    );
+    let props: Vec<(&str, &str)> = wire
+        .properties
+        .iter()
+        .map(|(k, v)| (k.as_ref(), v.as_ref()))
+        .collect();
+    assert_eq!(props, vec![("east", "side"), ("power", "15")]);
 
     assert_voxels_match(&table, &doc);
 }
@@ -299,8 +300,8 @@ impl Layout for Sparse {
         Some(&self.state)
     }
 
-    fn palette(&self) -> Vec<BlockState> {
-        vec![self.state.clone()]
+    fn palette(&self) -> HashSet<BlockState> {
+        HashSet::from([self.state.clone()])
     }
 }
 

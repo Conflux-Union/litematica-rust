@@ -55,6 +55,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod mcdata;
 mod nbt;
 mod parse;
 mod region;
@@ -62,7 +63,8 @@ mod write;
 
 pub use error::{Error, Result};
 pub use flate2::Compression;
-pub use region::{BlockIter, BlockState, Region};
+pub use mcdata::BlockState;
+pub use region::{BlockIter, Region};
 pub use write::{write, Layout, WriteOptions};
 
 use std::io::Read;

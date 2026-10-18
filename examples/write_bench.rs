@@ -12,6 +12,7 @@
 //! cargo run --release --example write_bench -- [out.litematic]
 //! ```
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use litematica::{write, BlockState, Layout, WriteOptions};
@@ -71,12 +72,12 @@ fn main() -> Result<(), litematica::Error> {
     let layout = HollowSphere {
         size: [566, 256, 1423],
         shell: BlockState {
-            name: "minecraft:stone".to_string(),
-            properties: Vec::new(),
+            name: "minecraft:stone".into(),
+            properties: BTreeMap::new(),
         },
         filler: BlockState {
-            name: "minecraft:glass".to_string(),
-            properties: Vec::new(),
+            name: "minecraft:glass".into(),
+            properties: BTreeMap::new(),
         },
     };
     let options = WriteOptions::new(4189, "write bench");

@@ -6,7 +6,7 @@
 //! and every consumer must agree on metadata, palette order, bit width and
 //! the voxel-by-voxel state stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use litematica::{decompress_gzip_with_limit, write, BlockState, Document, Layout, WriteOptions};
 use rustmatica::{Litematic, Region};
@@ -45,10 +45,10 @@ impl Rng {
 
 fn st(name: &str, props: &[(&str, &str)]) -> BlockState {
     BlockState {
-        name: name.to_string(),
+        name: name.to_string().into(),
         properties: props
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (k.to_string().into(), v.to_string().into()))
             .collect(),
     }
 }
@@ -115,7 +115,7 @@ impl Layout for Table {
         }
     }
 
-    fn palette(&self) -> Vec<BlockState> {
+    fn palette(&self) -> HashSet<BlockState> {
         std::iter::once(air())
             .chain(self.states.iter().cloned())
             .collect()
@@ -134,9 +134,11 @@ fn expected_file_palette(table: &Table) -> Vec<BlockState> {
 }
 
 fn sorted_props(state: &BlockState) -> Vec<(String, String)> {
-    let mut props = state.properties.clone();
-    props.sort();
-    props
+    state
+        .properties
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 fn oracle_sorted_props(state: &GenericBlockState) -> Vec<(String, String)> {

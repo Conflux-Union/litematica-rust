@@ -1,18 +1,9 @@
-//! Regions, block state palettes, and the bit-unpacking block iterator.
+//! Regions and the bit-unpacking block iterator.
 
 use std::fmt;
 
 use crate::error::{Error, Result};
-
-/// A single block state from a region palette.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BlockState {
-    /// Namespaced block id, e.g. `minecraft:redstone_wire`.
-    pub name: String,
-    /// Block state properties as `(name, value)` pairs, exactly in the order
-    /// they appear in the file.
-    pub properties: Vec<(String, String)>,
-}
+use crate::mcdata::BlockState;
 
 /// Computes the litematica bit width for a palette of `len` entries: the
 /// smallest `n >= 2` with `2^n >= len`.

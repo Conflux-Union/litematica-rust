@@ -5,12 +5,15 @@
 //! decoded; everything else (entities, tile entities, pending ticks, preview
 //! image data, ...) is skipped by length without allocation.
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+
 use crate::error::{Error, Result};
 use crate::nbt::{
     Reader, TAG_COMPOUND, TAG_END, TAG_INT, TAG_LIST, TAG_LONG, TAG_LONG_ARRAY, TAG_STRING,
 };
-use crate::region::{BlockState, Region};
 use crate::Document;
+use crate::{mcdata::BlockState, region::Region};
 
 // Nesting depths of the schema levels, used only for the depth limit.
 const ROOT_DEPTH: usize = 1;
@@ -345,7 +348,7 @@ fn parse_palette(r: &mut Reader<'_>) -> Result<Vec<BlockState>> {
     for _ in 0..count {
         let entry_offset = r.pos();
         let mut name: Option<String> = None;
-        let mut properties: Vec<(String, String)> = Vec::new();
+        let mut properties = BTreeMap::new();
         loop {
             let tag = r.tag_id()?;
             if tag == TAG_END {
@@ -367,7 +370,7 @@ fn parse_palette(r: &mut Reader<'_>) -> Result<Vec<BlockState>> {
                         let key = r.string()?;
                         expect_tag(r, "palette property value", ptag, TAG_STRING)?;
                         let value = r.string()?;
-                        properties.push((key, value));
+                        properties.insert(Cow::Owned(key), Cow::Owned(value));
                     }
                 }
                 _ => r.skip_value(tag, PALETTE_DEPTH)?,
@@ -377,7 +380,10 @@ fn parse_palette(r: &mut Reader<'_>) -> Result<Vec<BlockState>> {
             field: "palette entry Name",
             offset: entry_offset,
         })?;
-        palette.push(BlockState { name, properties });
+        palette.push(BlockState {
+            name: name.into(),
+            properties,
+        });
     }
     Ok(palette)
 }
