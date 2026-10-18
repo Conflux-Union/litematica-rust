@@ -257,8 +257,8 @@ fn round_trip_zero_axis_writes_empty_block_states() {
     assert_eq!(region.iter_blocks().len(), 0);
     assert_eq!(doc.metadata.total_blocks, Some(0));
     assert_eq!(doc.metadata.total_volume, Some(0));
-    // The enclosing-size formula reports 1 for a zero axis.
-    assert_eq!(doc.metadata.enclosing_size, Some([4, 1, 2]));
+    // `EnclosingSize` mirrors `Region.Size` verbatim, zero axes included.
+    assert_eq!(doc.metadata.enclosing_size, Some([4, 0, 2]));
 }
 
 #[test]

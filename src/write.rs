@@ -132,8 +132,12 @@ impl Encode for Palette {
     const TAG: u8 = TAG_LIST;
 
     fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
+        let len = i32::try_from(self.len()).map_err(|_| Error::DimensionOverflow {
+            what: "BlockStatePalette length",
+            value: self.len() as u128,
+        })?;
         out.u8(TAG_COMPOUND)?;
-        out.i32(self.len() as i32)?;
+        out.i32(len)?;
         BlockState::AIR.body(out)?;
         self.states().iter().try_for_each(|state| state.body(out))
     }
@@ -309,7 +313,7 @@ impl<L: Layout> Encode for Schematic<'_, L> {
     }
 }
 
-/// One region: its box, palette, block states, and the empty entity lists.
+/// One region: its box, palette, block states, and tile entities.
 struct RegionNbt<'a, L: Layout> {
     layout: &'a L,
     palette: &'a Palette,
@@ -328,11 +332,13 @@ impl<L: Layout> Encode for RegionNbt<'_, L> {
         let states = BlockStates {
             layout: self.layout,
             palette: self.palette,
+            size: self.size,
             longs: self.longs,
             total_blocks: self.total_blocks,
         };
         states.encode("BlockStates", out)?;
-        // An absent `TileEntities` is rejected by rustmatica, so emit it.
+        // rustmatica requires `TileEntities` to be present. `Entities` and the
+        // pending-tick lists carry serde defaults, so omitting them is fine.
         empty_list(out, "TileEntities")?;
         out.end()
     }
@@ -342,6 +348,7 @@ impl<L: Layout> Encode for RegionNbt<'_, L> {
 struct BlockStates<'a, L: Layout> {
     layout: &'a L,
     palette: &'a Palette,
+    size: BlockPos,
     longs: i32,
     total_blocks: &'a Cell<i64>,
 }
@@ -352,7 +359,9 @@ impl<L: Layout> Encode for BlockStates<'_, L> {
     fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
         out.i32(self.longs)?;
         let mut packer = Packer::new(self.palette.num_bits());
-        for pos in self.layout.size().cartesian_positions() {
+        // Walk the cached size, the same value `Region.Size` declared, instead
+        // of asking the layout again.
+        for pos in self.size.cartesian_positions() {
             let id = id_at(self.layout, self.palette, pos)?;
             if id != 0 {
                 self.total_blocks.set(self.total_blocks.get() + 1);
@@ -391,6 +400,8 @@ struct Header<'a> {
     options: &'a WriteOptions,
     size: BlockPos,
     volume: i32,
+    /// Accumulated by `BlockStates` while the regions stream. Metadata is
+    /// written after the regions, so the count is final when read here.
     total_blocks: &'a Cell<i64>,
 }
 
@@ -404,20 +415,20 @@ impl Encode for Header<'_> {
         options.author.encode("Author", out)?;
         1i32.encode("RegionCount", out)?;
         self.volume.encode("TotalVolume", out)?;
-        let total_blocks =
-            i32::try_from(self.total_blocks.get()).map_err(|_| Error::DimensionOverflow {
-                what: "TotalBlocks",
-                value: self.total_blocks.get() as u128,
-            })?;
+        let total_blocks = i32::try_from(self.total_blocks.get());
+        let total_blocks = total_blocks.map_err(|_| Error::DimensionOverflow {
+            what: "TotalBlocks",
+            value: self.total_blocks.get() as u128,
+        })?;
         total_blocks.encode("TotalBlocks", out)?;
         options.time_created.encode("TimeCreated", out)?;
         options.time_modified.encode("TimeModified", out)?;
-        // The mod's enclosing-size formula reports `max(axis, 1)`: a zero-size
-        // axis still spans one block. Match it so our files' declared bounds
-        // agree with what readers compute from the region.
-        let size = self.size;
-        let enclosing = BlockPos::new(size.x.max(1), size.y.max(1), size.z.max(1));
-        enclosing.encode("EnclosingSize", out)?;
+        // `EnclosingSize` is a cached summary only: no reader validates or uses
+        // it, and Litematica stores whatever value it last computed. Write the
+        // declared region size verbatim. Do not clamp a zero axis to 1 to mimic
+        // rustmatica's recomputation: that clamp is an artifact of supporting
+        // negative sizes and would make the header disagree with `Region.Size`.
+        self.size.encode("EnclosingSize", out)?;
         out.end()
     }
 }

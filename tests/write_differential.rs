@@ -186,16 +186,18 @@ fn assert_written_file_matches(table: &Table, options: &WriteOptions) {
     let volume = i64::from(sx) * i64::from(sy) * i64::from(sz);
     assert_eq!(doc.metadata.total_volume, Some(volume), "total volume");
     assert_eq!(doc.metadata.total_blocks, Some(non_air));
+    // The oracle recomputes the bounding box and clamps zero axes to 1.
     let enclosing = oracle.enclosing_size();
     assert_eq!(
         [enclosing.x, enclosing.y, enclosing.z],
         [sx.max(1), sy.max(1), sz.max(1)],
-        "enclosing size follows the mod formula"
+        "oracle enclosing size follows the mod formula"
     );
+    // We store the region size verbatim; the field is never validated.
     assert_eq!(
         doc.metadata.enclosing_size,
-        Some([sx.max(1), sy.max(1), sz.max(1)]),
-        "declared enclosing size"
+        Some([sx, sy, sz]),
+        "declared enclosing size mirrors Region.Size"
     );
 
     // Region layout.
