@@ -17,8 +17,9 @@
 //! data, ...) are skipped in O(length) without allocation, so parsing cost is
 //! a single linear scan of the decompressed bytes plus lazy iteration.
 //!
-//! The crate also writes schematics with the same discipline: a [`Layout`]
-//! answers point queries (`size`, `block_at`), and [`write`] serializes it
+//! The crate also writes schematics with the same discipline: a
+//! [`write::Layout`] answers point queries (`size`, `block_at`), and
+//! [`write::write()`] serializes it
 //! as a single-region file straight into any [`std::io::Write`] (file or
 //! network stream), with memory bounded by the palette rather than the
 //! volume — writing a 566x256x1423 layout (206 million voxels) peaks at a
@@ -58,16 +59,13 @@ mod error;
 mod nbt;
 mod parse;
 mod region;
-mod write;
+pub mod write;
+use flate2::read::GzDecoder;
+use std::io::Read;
 
 pub use error::{Error, Result};
 pub use flate2::Compression;
 pub use region::{BlockIter, BlockState, Region};
-pub use write::{write, Layout, WriteOptions};
-
-use std::io::Read;
-
-use flate2::read::GzDecoder;
 
 /// Decompresses a single gzip member with a hard cap on the output size.
 ///

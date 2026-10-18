@@ -6,9 +6,12 @@
 //! and every consumer must agree on metadata, palette order, bit width and
 //! the voxel-by-voxel state stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use litematica::{decompress_gzip_with_limit, write, BlockState, Document, Layout, WriteOptions};
+use litematica::write::mcdata::util::BlockPos;
+use litematica::write::mcdata::BlockState;
+use litematica::write::{write, Layout, WriteOptions};
+use litematica::{decompress_gzip_with_limit, Document};
 use rustmatica::{Litematic, Region};
 
 type Schematic = Litematic<CowStrState, CowEntity, CowBlockEntity>;
@@ -45,10 +48,10 @@ impl Rng {
 
 fn st(name: &str, props: &[(&str, &str)]) -> BlockState {
     BlockState {
-        name: name.to_string(),
+        name: name.to_string().into(),
         properties: props
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (k.to_string().into(), v.to_string().into()))
             .collect(),
     }
 }
@@ -61,13 +64,13 @@ const AIR: u8 = 255;
 
 /// Table-backed layout, as in write_roundtrip.rs, with a default `palette`.
 struct Table {
-    size: [u32; 3],
+    size: BlockPos,
     states: Vec<BlockState>,
     grid: Vec<u8>,
 }
 
 impl Table {
-    fn random(size: [u32; 3], distinct: usize, rng: &mut Rng) -> Self {
+    fn random(size: BlockPos, distinct: usize, rng: &mut Rng) -> Self {
         let states: Vec<BlockState> = (0..distinct)
             .map(|i| {
                 st(
@@ -80,11 +83,10 @@ impl Table {
                 )
             })
             .collect();
-        let [sx, sy, sz] = size;
-        let mut grid = Vec::with_capacity((sx * sy * sz) as usize);
-        for y in 0..sy {
-            for z in 0..sz {
-                for x in 0..sx {
+        let mut grid = Vec::with_capacity(size.volume() as usize);
+        for y in 0..size.y {
+            for z in 0..size.z {
+                for x in 0..size.x {
                     let _ = (x, y, z);
                     grid.push(if rng.below(4) == 0 {
                         AIR
@@ -97,25 +99,25 @@ impl Table {
         Self { size, states, grid }
     }
 
-    fn voxel_index(&self, [x, y, z]: [u32; 3]) -> usize {
-        let [sx, _, sz] = self.size;
-        ((y * sz + z) * sx + x) as usize
+    fn voxel_index(&self, pos: BlockPos) -> usize {
+        let size = self.size;
+        ((pos.y * size.z + pos.z) * size.x + pos.x) as usize
     }
 }
 
 impl Layout for Table {
-    fn size(&self) -> [u32; 3] {
+    fn size(&self) -> BlockPos {
         self.size
     }
 
-    fn block_at(&self, pos: [u32; 3]) -> Option<&BlockState> {
+    fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
         match self.grid[self.voxel_index(pos)] {
             AIR => None,
-            i => Some(&self.states[i as usize]),
+            i => Some(self.states[i as usize].clone()),
         }
     }
 
-    fn palette(&self) -> Vec<BlockState> {
+    fn block_palette(&self) -> HashSet<BlockState> {
         std::iter::once(air())
             .chain(self.states.iter().cloned())
             .collect()
@@ -133,10 +135,17 @@ fn expected_file_palette(table: &Table) -> Vec<BlockState> {
     p
 }
 
+/// A reader palette entry as `(name, properties)`, the shape both sides share.
+fn read_view(state: &litematica::BlockState) -> (String, Vec<(String, String)>) {
+    (state.name.clone(), state.properties.clone())
+}
+
 fn sorted_props(state: &BlockState) -> Vec<(String, String)> {
-    let mut props = state.properties.clone();
-    props.sort();
-    props
+    state
+        .properties
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 fn oracle_sorted_props(state: &GenericBlockState) -> Vec<(String, String)> {
@@ -178,20 +187,23 @@ fn assert_written_file_matches(table: &Table, options: &WriteOptions) {
     assert_eq!(oracle.regions.len(), 1);
     let non_air = table.grid.iter().filter(|&&i| i != AIR).count() as i64;
     assert_eq!(oracle.total_blocks(), non_air, "total blocks");
-    let [sx, sy, sz] = table.size;
-    let volume = (sx as i64) * (sy as i64) * (sz as i64);
+    let size = table.size;
+    let (sx, sy, sz) = (size.x, size.y, size.z);
+    let volume = i64::from(sx) * i64::from(sy) * i64::from(sz);
     assert_eq!(doc.metadata.total_volume, Some(volume), "total volume");
     assert_eq!(doc.metadata.total_blocks, Some(non_air));
+    // The oracle recomputes the bounding box and clamps zero axes to 1.
     let enclosing = oracle.enclosing_size();
     assert_eq!(
         [enclosing.x, enclosing.y, enclosing.z],
-        [sx.max(1) as i32, sy.max(1) as i32, sz.max(1) as i32],
-        "enclosing size follows the mod formula"
+        [sx.max(1), sy.max(1), sz.max(1)],
+        "oracle enclosing size follows the mod formula"
     );
+    // We store the region size verbatim; the field is never validated.
     assert_eq!(
         doc.metadata.enclosing_size,
-        Some([sx.max(1) as i32, sy.max(1) as i32, sz.max(1) as i32]),
-        "declared enclosing size"
+        Some([sx, sy, sz]),
+        "declared enclosing size mirrors Region.Size"
     );
 
     // Region layout.
@@ -206,7 +218,7 @@ fn assert_written_file_matches(table: &Table, options: &WriteOptions) {
     assert_eq!(region.position, [0, 0, 0]);
     assert_eq!(
         (oregion.size.x, oregion.size.y, oregion.size.z),
-        (sx as i32, sy as i32, sz as i32)
+        (sx, sy, sz)
     );
 
     // Palette: file order (air first, sorted rest) and bit width.
@@ -221,7 +233,12 @@ fn assert_written_file_matches(table: &Table, options: &WriteOptions) {
             "palette[{i}] properties"
         );
     }
-    assert_eq!(region.palette(), expected.as_slice(), "our palette order");
+    let got: Vec<_> = region.palette().iter().map(read_view).collect();
+    let want: Vec<_> = expected
+        .iter()
+        .map(|s| (s.name.to_string(), sorted_props(s)))
+        .collect();
+    assert_eq!(got, want, "our palette order");
     let mut n = 2u32;
     while (1u64 << n) < expected.len() as u64 {
         n += 1;
@@ -265,7 +282,7 @@ fn assert_written_file_matches(table: &Table, options: &WriteOptions) {
 fn random_layouts_match_oracle() {
     let mut seed = 0x0ddb_a11a_dead_beef_u64;
     for (sx, sy, sz, distinct) in [
-        (5u32, 3u32, 7u32, 5usize),
+        (5i32, 3i32, 7i32, 5usize),
         (13, 2, 11, 1),
         (1, 1, 1, 1),
         (9, 4, 3, 17),
@@ -276,7 +293,7 @@ fn random_layouts_match_oracle() {
         seed = seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let table = Table::random([sx, sy, sz], distinct, &mut Rng::new(seed));
+        let table = Table::random(BlockPos::new(sx, sy, sz), distinct, &mut Rng::new(seed));
         let mut options = WriteOptions::new(4189, "差分 write ✓");
         options.description = "written by litematica-rust".into();
         options.author = "litematica-rust".into();
@@ -290,7 +307,7 @@ fn random_layouts_match_oracle() {
 fn palette_boundary_sizes_match_oracle() {
     for distinct in [1usize, 2, 3, 4, 5, 8, 9, 16, 17, 33, 64] {
         let table = Table::random(
-            [8, 4, 4],
+            BlockPos::new(8, 4, 4),
             distinct,
             &mut Rng::new(0x9e37_79b9_7f4a_7c15 ^ distinct as u64),
         );
@@ -301,7 +318,7 @@ fn palette_boundary_sizes_match_oracle() {
 
 #[test]
 fn zero_axis_layout_matches_oracle() {
-    let mut table = Table::random([4, 0, 2], 1, &mut Rng::new(1));
+    let mut table = Table::random(BlockPos::new(4, 0, 2), 1, &mut Rng::new(1));
     table.grid.clear(); // volume zero: nothing to query
     let options = WriteOptions::new(4189, "flat");
     assert_written_file_matches(&table, &options);
