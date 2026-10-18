@@ -127,14 +127,24 @@ pub enum Error {
         /// Name of the offending block state.
         name: String,
         /// X coordinate of the query position.
-        x: u32,
+        x: i32,
         /// Y coordinate of the query position.
-        y: u32,
+        y: i32,
         /// Z coordinate of the query position.
-        z: u32,
+        z: i32,
     },
 
-    /// A layout dimension or volume exceeds what a litematic file can store.
+    /// A layout declared a negative dimension, which no region can span.
+    #[error("layout {axis} size {value} is negative")]
+    NegativeSize {
+        /// The axis with the negative dimension, e.g. `x`.
+        axis: &'static str,
+        /// The negative dimension.
+        value: i32,
+    },
+
+    /// A layout volume or a file quantity exceeds what a litematic file can
+    /// store.
     #[error("layout {what} {value} exceeds the i32 limit of the litematic format")]
     DimensionOverflow {
         /// Which quantity overflowed, e.g. `volume`.

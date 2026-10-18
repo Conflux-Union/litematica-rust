@@ -15,7 +15,9 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use litematica::{write, BlockState, Layout, WriteOptions};
+use litematica::mcdata::util::BlockPos;
+use litematica::mcdata::BlockState;
+use litematica::{write, Layout, WriteOptions};
 
 /// Peak resident set size in bytes (Linux only, from VmHWM).
 fn peak_rss_bytes() -> Option<u64> {
@@ -33,33 +35,33 @@ fn peak_rss_bytes() -> Option<u64> {
 /// A hollow sphere inside an air box; blocks are computed per query, so
 /// nothing about the volume is ever stored.
 struct HollowSphere {
-    size: [u32; 3],
+    size: BlockPos,
     shell: BlockState,
     filler: BlockState,
 }
 
 impl Layout for HollowSphere {
-    fn size(&self) -> [u32; 3] {
+    fn size(&self) -> BlockPos {
         self.size
     }
 
-    fn block_at(&self, [x, y, z]: [u32; 3]) -> Option<&BlockState> {
-        let [sx, sy, sz] = self.size;
+    fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
+        let size = self.size;
         let c = [
-            f64::from(sx - 1) / 2.0,
-            f64::from(sy - 1) / 2.0,
-            f64::from(sz - 1) / 2.0,
+            f64::from(size.x - 1) / 2.0,
+            f64::from(size.y - 1) / 2.0,
+            f64::from(size.z - 1) / 2.0,
         ];
-        let d = (f64::from(x) - c[0])
-            .hypot(f64::from(y) - c[1])
-            .hypot(f64::from(z) - c[2]);
+        let d = (f64::from(pos.x) - c[0])
+            .hypot(f64::from(pos.y) - c[1])
+            .hypot(f64::from(pos.z) - c[2]);
         let r = c[0].min(c[1]).min(c[2]);
         if d > r {
             None
         } else if d >= r - 3.0 {
-            Some(&self.shell)
+            Some(self.shell.clone())
         } else {
-            Some(&self.filler)
+            Some(self.filler.clone())
         }
     }
 }
@@ -70,7 +72,7 @@ fn main() -> Result<(), litematica::Error> {
         .unwrap_or_else(|| "write_bench.litematic".to_string());
 
     let layout = HollowSphere {
-        size: [566, 256, 1423],
+        size: BlockPos::new(566, 256, 1423),
         shell: BlockState {
             name: "minecraft:stone".into(),
             properties: BTreeMap::new(),

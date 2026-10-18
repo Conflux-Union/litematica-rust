@@ -65,7 +65,7 @@ fn oracle_num_bits(palette_len: usize) -> u32 {
     n
 }
 
-fn sorted_props(state: &litematica::BlockState) -> Vec<(String, String)> {
+fn sorted_props(state: &litematica::mcdata::BlockState) -> Vec<(String, String)> {
     state
         .properties
         .iter()

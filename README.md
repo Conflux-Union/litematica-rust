@@ -62,36 +62,39 @@ the crate streams the file out with memory bounded by the palette, not the
 volume — suited to procedural generation and network sinks alike.
 
 ```rust
-use litematica::{write, BlockState, Layout, WriteOptions};
+use litematica::mcdata::util::BlockPos;
+use litematica::mcdata::BlockState;
+use litematica::{write, Layout, WriteOptions};
 
 struct MyLayout {
     stone: BlockState,
 }
 
 impl Layout for MyLayout {
-    fn size(&self) -> [u32; 3] {
-        [16, 16, 16]
+    fn size(&self) -> BlockPos {
+        BlockPos::new(16, 16, 16)
     }
 
-    fn block_at(&self, pos: [u32; 3]) -> Option<&BlockState> {
-        // None means air; return references to your own state storage.
-        (pos[1] == 0).then_some(&self.stone)
+    fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
+        // None means air; return your own state storage.
+        (pos.y == 0).then(|| self.stone.clone())
     }
 }
 
 # fn main() -> Result<(), litematica::Error> {
 let options = WriteOptions::new(4189, "my build"); // data version 4189 = 1.21.4
 let mut file = std::io::Cursor::new(Vec::new()); // any `std::io::Write` works
-write(&MyLayout { stone: BlockState { name: "minecraft:stone".into(), properties: vec![] } }, &options, &mut file)?;
+write(&MyLayout { stone: BlockState { name: "minecraft:stone".into(), properties: Default::default() } }, &options, &mut file)?;
 # Ok(())
 # }
 ```
 
 Design notes:
 
-- `Layout::block_at` may return `None` (air) or a reference to one of the
-  states `Layout::palette` declares; the default `palette` implementation
-  discovers it with one extra scan, and over-approximation is allowed.
+- `Layout::block_at` may return `None` (air) or one of the states
+  `Layout::block_palette` declares; the default `block_palette`
+  implementation discovers it with one extra scan, and over-approximation is
+  allowed.
 - The writer enforces the format invariants itself: air is pinned to palette
   index 0, duplicate states collapse, and the bit width matches the reader's
   rule. A state not covered by the declared palette fails with
@@ -128,8 +131,9 @@ the Litematica mod and rustmatica.
   `palette()`, `dims()`, `volume()`, `bits_per_entry()`, and
   `iter_blocks() -> impl Iterator<Item = u32> + ExactSizeIterator`.
 - `BlockState` — `name` plus `properties` in file order.
-- `Layout` — `size()` + `block_at(pos) -> Option<&BlockState>`, with a
-  default `palette()` discovery scan; the declarative source for writing.
+- `Layout` — `size()` + `block_at(pos) -> Option<BlockState>`, plus
+  `get_block`, `get_block_or_air`, `contains`, and a default `block_palette()`
+  discovery scan; the declarative source for writing.
 - `write(layout, &options, sink)` — single-region streaming serialization
   into any `Write`; `WriteOptions` carries name/author/description, the
   Minecraft data version, timestamps, and the gzip level.

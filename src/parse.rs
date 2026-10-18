@@ -5,14 +5,14 @@
 //! decoded; everything else (entities, tile entities, pending ticks, preview
 //! image data, ...) is skipped by length without allocation.
 
-use std::borrow::Cow;
-
 use crate::error::{Error, Result};
-use crate::mcdata::{BlockState, Properties};
+use crate::mcdata::BlockState;
 use crate::nbt::{Reader, TAG_COMPOUND, TAG_END, TAG_INT, TAG_LIST};
 use crate::nbt::{TAG_LONG, TAG_LONG_ARRAY, TAG_STRING};
 use crate::region::Region;
 use crate::Document;
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 // Nesting depths of the schema levels, used only for the depth limit.
 const ROOT_DEPTH: usize = 1;
@@ -381,7 +381,7 @@ fn parse_palette(r: &mut Reader<'_>) -> Result<Vec<BlockState>> {
 fn parse_palette_entry(r: &mut Reader<'_>) -> Result<BlockState> {
     let offset = r.pos();
     let mut name: Option<String> = None;
-    let mut properties = Properties::new();
+    let mut properties = BTreeMap::new();
     loop {
         let tag = r.tag_id()?;
         if tag == TAG_END {
@@ -405,7 +405,11 @@ fn parse_palette_entry(r: &mut Reader<'_>) -> Result<BlockState> {
 }
 
 /// Reads a `Properties` compound into `properties`.
-fn read_properties(r: &mut Reader<'_>, tag: u8, properties: &mut Properties) -> Result<()> {
+fn read_properties(
+    r: &mut Reader<'_>,
+    tag: u8,
+    properties: &mut BTreeMap<Cow<'static, str>, Cow<'static, str>>,
+) -> Result<()> {
     expect_tag(r, "palette entry Properties", tag, TAG_COMPOUND)?;
     loop {
         let value_tag = r.tag_id()?;

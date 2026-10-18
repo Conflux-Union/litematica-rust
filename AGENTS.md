@@ -15,6 +15,7 @@ Example: `fix: keep wrapped linear rows one fixed size`
 - Keep single-line `if` as `if`; only use `match { true/false }` when it spans multiple lines.
 - Do not split logic into many small helper methods; keep a routine cohesive.
 - A doc comment opens with a single summary paragraph describing purpose and use, without implementation detail.
+- Order declarations from abstract to concrete, so a reader meets an idea before the code that serves it; a section that only supports an earlier one comes after it.
 
 ## Import Statements
 

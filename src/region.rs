@@ -1,9 +1,8 @@
 //! Regions and the bit-unpacking block iterator.
 
-use std::fmt;
-
 use crate::error::{Error, Result};
 use crate::mcdata::BlockState;
+use std::fmt;
 
 /// Computes the litematica bit width for a palette of `len` entries: the
 /// smallest `n >= 2` with `2^n >= len`.

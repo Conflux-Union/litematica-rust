@@ -6,13 +6,11 @@
 //! a forward-only encoder that streams values to any `std::io::Write`
 //! without buffering a tree.
 
-use std::io::Write as IoWrite;
-
 use crate::error::{Error, Result};
+use std::io::Write as IoWrite;
 
 /// Maximum NBT nesting depth accepted by [`Reader::skip_value`].
 pub(crate) const MAX_DEPTH: usize = 64;
-
 pub(crate) const TAG_END: u8 = 0;
 pub(crate) const TAG_INT: u8 = 3;
 pub(crate) const TAG_LONG: u8 = 4;

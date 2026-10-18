@@ -55,21 +55,18 @@
 #![forbid(unsafe_code)]
 
 mod error;
-mod mcdata;
 mod nbt;
 mod parse;
 mod region;
 mod write;
-
-pub use error::{Error, Result};
-pub use flate2::Compression;
-pub use mcdata::{BlockState, Properties};
-pub use region::{BlockIter, Region};
-pub use write::{write, Layout, WriteOptions};
-
+use flate2::read::GzDecoder;
 use std::io::Read;
 
-use flate2::read::GzDecoder;
+pub mod mcdata;
+pub use error::{Error, Result};
+pub use flate2::Compression;
+pub use region::{BlockIter, Region};
+pub use write::{write, Layout, WriteOptions};
 
 /// Decompresses a single gzip member with a hard cap on the output size.
 ///

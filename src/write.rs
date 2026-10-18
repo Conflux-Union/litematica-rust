@@ -4,40 +4,90 @@
 //! declarative [`Layout`] in storage order and packed straight into the
 //! gzip-compressed NBT stream, so memory stays O(palette) no matter how
 //! large the schematic is. The palette must be known before block data is
-//! emitted (the litematic bit width depends on it); [`Layout::palette`] may
-//! over-approximate, and its default implementation discovers the palette
+//! emitted (the litematic bit width depends on it); [`Layout::block_palette`]
+//! may over-approximate, and its default implementation discovers the palette
 //! with one extra scan.
 
-use std::borrow::Cow;
-use std::cell::Cell;
-use std::collections::{BTreeMap, HashSet};
-use std::io::Write as IoWrite;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use self::encode::{empty_list, Encode};
-
-use flate2::write::GzEncoder;
-use flate2::Compression;
-
 use crate::error::{Error, Result};
+use crate::mcdata::util::BlockPos;
 use crate::nbt::{Writer, TAG_COMPOUND, TAG_END, TAG_INT, TAG_LIST};
 use crate::nbt::{TAG_LONG, TAG_LONG_ARRAY, TAG_STRING};
 use crate::{mcdata::BlockState, region::num_bits};
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use std::cell::Cell;
+use std::collections::HashSet;
+use std::io::Write as IoWrite;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Litematica format version written by this crate (`Version`).
 const FORMAT_VERSION: i32 = 6;
 /// Litematica format sub-version written by this crate (`SubVersion`).
 const FORMAT_SUB_VERSION: i32 = 1;
 
-// Palette
+// Layout
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
-/// True for the plain `minecraft:air` state, the palette entry the
-/// litematic format pins to index 0.
-fn is_air(state: &BlockState) -> bool {
-    state.name == "minecraft:air" && state.properties.is_empty()
+/// A declarative, query-based source of the blocks to serialize.
+///
+/// Instead of handing the writer a materialized volume, a layout answers
+/// point queries: what block sits at `pos`. This suits procedural
+/// generators (which can compute a block from its coordinates) and keeps
+/// memory at O(palette) for arbitrarily large schematics.
+pub trait Layout {
+    /// Absolute dimensions per axis, never negative. Every position handed to
+    /// [`Layout::block_at`] is contained by this box, as decided by
+    /// [`BlockPos::contains`].
+    fn size(&self) -> BlockPos;
+
+    /// The block state at `pos`, or `None` for air; `pos` is assumed in bounds.
+    ///
+    /// Every returned state must be structurally equal (name and properties)
+    /// to some entry of [`Layout::block_palette`]; a violation surfaces as
+    /// [`Error::BlockNotInPalette`] during serialization.
+    fn block_at(&self, pos: BlockPos) -> Option<BlockState>;
+
+    /// The block state at `pos`, or `None` when it misses the bounding box.
+    fn get_block(&self, pos: BlockPos) -> Option<BlockState> {
+        match self.contains(pos) {
+            true => self.block_at(pos),
+            false => None,
+        }
+    }
+
+    /// The block state at `pos`, or air where the layout is empty.
+    fn get_block_or_air(&self, pos: BlockPos) -> BlockState {
+        self.get_block(pos).unwrap_or(BlockState::AIR)
+    }
+
+    /// Whether `pos` is inside the bounding box.
+    fn contains(&self, pos: BlockPos) -> bool {
+        self.size().contains(pos)
+    }
+
+    /// Every state [`Layout::block_at`] may return, as a set, empty cells
+    /// counted as air.
+    ///
+    /// Returning a set lets composite layouts merge their children's
+    /// palettes with cheap unions instead of copying and deduplicating
+    /// sequences. Over-approximation is allowed: unused entries simply
+    /// travel along in the written file. Implementors that can derive their
+    /// state set analytically should override this: the default discovers it
+    /// with a full scan of the bounding box, which costs one extra pass over
+    /// every voxel.
+    fn block_palette(&self) -> HashSet<BlockState> {
+        self.size()
+            .cartesian_positions()
+            .map(|pos| self.get_block_or_air(pos))
+            .collect()
+    }
 }
+
+// Palette
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
 /// The file-side block state palette of a written schematic.
 ///
@@ -48,8 +98,6 @@ pub(crate) struct Palette {
     /// Non-air states in file order; plain `minecraft:air` is implicit at
     /// index 0 and never stored.
     states: Vec<BlockState>,
-    /// Bits per `BlockStates` entry for this palette length.
-    bits: u32,
 }
 
 impl Palette {
@@ -60,17 +108,19 @@ impl Palette {
     /// format pins plain `minecraft:air` to index 0, and the palette list is
     /// written with it first, as Litematica does.
     pub(crate) fn build(declared: impl IntoIterator<Item = BlockState>) -> Self {
-        let mut states: Vec<BlockState> = declared.into_iter().filter(|s| !is_air(s)).collect();
+        let mut states: Vec<BlockState> = declared
+            .into_iter()
+            .filter(|state| state != &BlockState::AIR)
+            .collect();
         states.sort();
         states.dedup();
-        let bits = num_bits(states.len() + 1);
-        Self { states, bits }
+        Self { states }
     }
 
     /// The file palette index of `state`, or `None` if the declared palette
     /// does not cover it.
     pub(crate) fn id_of(&self, state: &BlockState) -> Option<u32> {
-        if is_air(state) {
+        if state == &BlockState::AIR {
             return Some(0);
         }
         self.states.binary_search(state).ok().map(|i| i as u32 + 1)
@@ -87,8 +137,8 @@ impl Palette {
     }
 
     /// Bits per `BlockStates` entry, matching the reader's width rule.
-    pub(crate) fn bits(&self) -> u32 {
-        self.bits
+    pub(crate) fn num_bits(&self) -> u32 {
+        num_bits(self.len())
     }
 }
 
@@ -98,56 +148,8 @@ impl Encode for Palette {
     fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
         out.u8(TAG_COMPOUND)?;
         out.i32(self.len() as i32)?;
-        air().body(out)?;
+        BlockState::AIR.body(out)?;
         self.states().iter().try_for_each(|state| state.body(out))
-    }
-}
-
-/// The implicit air entry written at palette index 0.
-fn air() -> BlockState {
-    BlockState {
-        name: Cow::Borrowed("minecraft:air"),
-        properties: BTreeMap::new(),
-    }
-}
-
-// Layout
-//
-// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
-
-/// A declarative, query-based source of the blocks to serialize.
-///
-/// Instead of handing the writer a materialized volume, a layout answers
-/// point queries: what block sits at `pos`. This suits procedural
-/// generators (which can compute a block from its coordinates) and keeps
-/// memory at O(palette) for arbitrarily large schematics.
-pub trait Layout {
-    /// Absolute dimensions per axis. Every position handed to
-    /// [`Layout::block_at`] satisfies `pos[axis] < size()[axis]`.
-    fn size(&self) -> [u32; 3];
-
-    /// The block state at `pos`, or `None` for air.
-    ///
-    /// Every returned reference must be structurally equal (name and
-    /// properties) to some entry of [`Layout::palette`]; a violation surfaces
-    /// as [`Error::BlockNotInPalette`] during serialization.
-    fn block_at(&self, pos: [u32; 3]) -> Option<&BlockState>;
-
-    /// Every state [`Layout::block_at`] may return, as a set.
-    ///
-    /// Returning a set lets composite layouts merge their children's
-    /// palettes with cheap unions instead of copying and deduplicating
-    /// sequences. Over-approximation is allowed: unused entries simply
-    /// travel along in the written file. Implementors that can derive their
-    /// state set analytically should override this: the default discovers it
-    /// with a full scan of the bounding box, which costs one extra pass over
-    /// every voxel.
-    fn palette(&self) -> HashSet<BlockState> {
-        let [sx, sy, sz] = self.size();
-        (0..sy)
-            .flat_map(move |y| (0..sz).flat_map(move |z| (0..sx).map(move |x| [x, y, z])))
-            .filter_map(|pos| self.block_at(pos).cloned())
-            .collect()
     }
 }
 
@@ -220,8 +222,11 @@ impl WriteOptions {
 /// # use litematica::{Layout, WriteOptions, write};
 /// # struct MyLayout;
 /// # impl Layout for MyLayout {
-/// #     fn size(&self) -> [u32; 3] { [16, 16, 16] }
-/// #     fn block_at(&self, pos: [u32; 3]) -> Option<&litematica::BlockState> { None }
+/// #     fn size(&self) -> litematica::mcdata::util::BlockPos {
+/// #         litematica::mcdata::util::BlockPos::new(16, 16, 16)
+/// #     }
+/// #     fn block_at(&self, pos: litematica::mcdata::util::BlockPos)
+/// #         -> Option<litematica::mcdata::BlockState> { None }
 /// # }
 /// # fn main() -> Result<(), litematica::Error> {
 /// let layout = MyLayout;
@@ -233,21 +238,20 @@ impl WriteOptions {
 /// ```
 pub fn write<L: Layout, W: IoWrite>(layout: &L, options: &WriteOptions, sink: W) -> Result<()> {
     let size = layout.size();
-    if let Some(&d) = size.iter().find(|&&d| d > i32::MAX as u32) {
-        return Err(Error::DimensionOverflow {
-            what: "size axis",
-            value: u128::from(d),
-        });
+    let axes = [("x", size.x), ("y", size.y), ("z", size.z)];
+    if let Some((axis, value)) = axes.into_iter().find(|(_, v)| *v < 0) {
+        return Err(Error::NegativeSize { axis, value });
     }
-    let volume = u128::from(size[0]) * u128::from(size[1]) * u128::from(size[2]);
+    let volume = u128::from(size.x.unsigned_abs())
+        * u128::from(size.y.unsigned_abs())
+        * u128::from(size.z.unsigned_abs());
     let volume_i32 = i32::try_from(volume).map_err(|_| Error::DimensionOverflow {
         what: "volume",
         value: volume,
     })?;
-    let size_i32 = [size[0] as i32, size[1] as i32, size[2] as i32];
 
-    let palette = Palette::build(layout.palette());
-    let bits = palette.bits();
+    let palette = Palette::build(layout.block_palette());
+    let bits = palette.num_bits();
     // `volume <= i32::MAX` and `bits <= 32` bound this well below i32::MAX;
     // the checked conversion keeps the written length prefix honest.
     let longs = (volume * u128::from(bits)).div_ceil(64);
@@ -261,7 +265,7 @@ pub fn write<L: Layout, W: IoWrite>(layout: &L, options: &WriteOptions, sink: W)
         layout,
         options,
         palette,
-        size: size_i32,
+        size,
         volume: volume_i32,
         longs: longs_i32,
         total_blocks: &total_blocks,
@@ -283,7 +287,7 @@ struct Schematic<'a, L: Layout> {
     layout: &'a L,
     options: &'a WriteOptions,
     palette: Palette,
-    size: [i32; 3],
+    size: BlockPos,
     volume: i32,
     longs: i32,
     total_blocks: &'a Cell<i64>,
@@ -323,7 +327,7 @@ impl<L: Layout> Encode for Schematic<'_, L> {
 struct RegionNbt<'a, L: Layout> {
     layout: &'a L,
     palette: &'a Palette,
-    size: [i32; 3],
+    size: BlockPos,
     longs: i32,
     total_blocks: &'a Cell<i64>,
 }
@@ -332,7 +336,7 @@ impl<L: Layout> Encode for RegionNbt<'_, L> {
     const TAG: u8 = TAG_COMPOUND;
 
     fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
-        [0, 0, 0].encode("Position", out)?;
+        BlockPos::ORIGIN.encode("Position", out)?;
         self.size.encode("Size", out)?;
         self.palette.encode("BlockStatePalette", out)?;
         let states = BlockStates {
@@ -361,16 +365,9 @@ impl<L: Layout> Encode for BlockStates<'_, L> {
 
     fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
         out.i32(self.longs)?;
-        let [sx, sy, sz] = self.layout.size();
-        let sx = u64::from(sx);
-        let sz = u64::from(sz);
-        let mut packer = Packer::new(self.palette.bits());
-        for index in 0..sx * u64::from(sy) * sz {
-            let x = (index % sx) as u32;
-            let rest = index / sx;
-            let z = (rest % sz) as u32;
-            let y = (rest / sz) as u32;
-            let id = id_at(self.layout, self.palette, [x, y, z])?;
+        let mut packer = Packer::new(self.palette.num_bits());
+        for pos in self.layout.size().cartesian_positions() {
+            let id = id_at(self.layout, self.palette, pos)?;
             if id != 0 {
                 self.total_blocks.set(self.total_blocks.get() + 1);
             }
@@ -388,17 +385,17 @@ impl<L: Layout> Encode for BlockStates<'_, L> {
 /// Resolves the palette id written at `pos`, or the error to report.
 ///
 /// Air is id 0; every other state must be covered by `palette`.
-fn id_at<L: Layout>(layout: &L, palette: &Palette, [x, y, z]: [u32; 3]) -> Result<u32> {
-    let Some(state) = layout.block_at([x, y, z]) else {
+fn id_at<L: Layout>(layout: &L, palette: &Palette, pos: BlockPos) -> Result<u32> {
+    let Some(state) = layout.block_at(pos) else {
         return Ok(0);
     };
-    match palette.id_of(state) {
+    match palette.id_of(&state) {
         Some(id) => Ok(id),
         None => Err(Error::BlockNotInPalette {
             name: state.name.to_string(),
-            x,
-            y,
-            z,
+            x: pos.x,
+            y: pos.y,
+            z: pos.z,
         }),
     }
 }
@@ -406,7 +403,7 @@ fn id_at<L: Layout>(layout: &L, palette: &Palette, [x, y, z]: [u32; 3]) -> Resul
 /// The metadata compound of the written schematic.
 struct Header<'a> {
     options: &'a WriteOptions,
-    size: [i32; 3],
+    size: BlockPos,
     volume: i32,
     total_blocks: &'a Cell<i64>,
 }
@@ -432,11 +429,8 @@ impl Encode for Header<'_> {
         // The mod's enclosing-size formula reports `max(axis, 1)`: a zero-size
         // axis still spans one block. Match it so our files' declared bounds
         // agree with what readers compute from the region.
-        let enclosing = [
-            self.size[0].max(1),
-            self.size[1].max(1),
-            self.size[2].max(1),
-        ];
+        let size = self.size;
+        let enclosing = BlockPos::new(size.x.max(1), size.y.max(1), size.z.max(1));
         enclosing.encode("EnclosingSize", out)?;
         out.end()
     }
@@ -453,7 +447,7 @@ impl Encode for Header<'_> {
 /// document structure. The low-level sink stays in [`crate::nbt`], which is
 /// also why this module is named `encode` rather than `nbt`.
 mod encode {
-    use super::{BlockState, IoWrite, Result, Writer};
+    use super::{BlockPos, BlockState, IoWrite, Result, Writer};
     use super::{TAG_COMPOUND, TAG_END, TAG_INT, TAG_LIST, TAG_LONG, TAG_STRING};
 
     /// A value that writes itself as NBT under a given name.
@@ -508,13 +502,13 @@ mod encode {
         }
     }
 
-    impl Encode for [i32; 3] {
+    impl Encode for BlockPos {
         const TAG: u8 = TAG_COMPOUND;
 
         fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
-            self[0].encode("x", out)?;
-            self[1].encode("y", out)?;
-            self[2].encode("z", out)?;
+            self.x.encode("x", out)?;
+            self.y.encode("y", out)?;
+            self.z.encode("z", out)?;
             out.end()
         }
     }
@@ -679,7 +673,7 @@ mod tests {
         let p = Palette::build(declared);
         assert_eq!(p.len(), 3);
         assert_eq!(p.states(), [st("a", &[]), st("c", &[])]);
-        assert_eq!(p.bits(), 2);
+        assert_eq!(p.num_bits(), 2);
         assert_eq!(p.id_of(&air()), Some(0));
         assert_eq!(p.id_of(&st("a", &[])), Some(1));
         assert_eq!(p.id_of(&st("c", &[])), Some(2));
@@ -699,7 +693,7 @@ mod tests {
         let p = Palette::build(std::iter::empty());
         assert_eq!(p.len(), 1);
         assert!(p.states().is_empty());
-        assert_eq!(p.bits(), 2);
+        assert_eq!(p.num_bits(), 2);
     }
 
     #[test]
@@ -710,7 +704,7 @@ mod tests {
                 .collect();
             let p = Palette::build(declared);
             let expect = crate::region::num_bits(len + 1);
-            assert_eq!(p.bits(), expect, "palette of {len} entries + air");
+            assert_eq!(p.num_bits(), expect, "palette of {len} entries + air");
         }
     }
 
