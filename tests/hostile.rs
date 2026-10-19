@@ -4,11 +4,11 @@
 //! cases, an `Ok` without panic/OOM). No case may panic or allocate memory
 //! proportional to any claimed-but-absent size.
 
-use std::io::Write as _;
+use std::io::{Cursor, Write as _};
 
 use flate2::{write::GzEncoder, Compression};
 use litematica::mc::{BlockPos, BlockSize};
-use litematica::{decompress_gzip_with_limit, Document, Error};
+use litematica::{decompress_gzip_with_limit, Document, Error, StreamReader};
 
 // ---------------------------------------------------------------- builder
 
@@ -189,6 +189,16 @@ fn minimal_valid() -> Vec<u8> {
     root(&fields)
 }
 
+fn unit_region() -> RegionSpec<'static> {
+    RegionSpec {
+        name: "main",
+        position: BlockPos::new(0, 0, 0),
+        size: BlockPos::new(1, 1, 1),
+        palette: vec![("minecraft:air", &[])],
+        states: vec![0],
+    }
+}
+
 fn parse_err(bytes: &[u8]) -> Error {
     Document::parse(bytes).expect_err("expected parse error")
 }
@@ -248,25 +258,20 @@ fn every_truncated_prefix_fails() {
 }
 
 #[test]
-fn invalid_tag_ids_rejected() {
-    // Bogus root tag id.
+fn well_formedness_rejections() {
+    // Bogus tag ids at the root and inside a compound; a non-compound root.
     let err = Document::parse(&[13, 0, 0, 0]).expect_err("must fail");
     assert!(matches!(err, Error::InvalidTagId { id: 13, .. }), "{err:?}");
 
-    // Bogus tag id inside the root compound (200 as a named-tag header).
-    let bytes = {
-        let mut v = vec![10u8];
-        v.extend(name_bytes(""));
-        v.push(200); // invalid tag id
-        v
-    };
+    let mut bytes = vec![10u8];
+    bytes.extend(name_bytes(""));
+    bytes.push(200);
     let err = Document::parse(&bytes).expect_err("must fail");
     assert!(
         matches!(err, Error::InvalidTagId { id: 200, .. }),
         "{err:?}"
     );
 
-    // Non-compound root (an i32).
     let mut bytes = vec![3u8];
     bytes.extend(name_bytes(""));
     bytes.extend(i32b(7));
@@ -275,11 +280,9 @@ fn invalid_tag_ids_rejected() {
         matches!(err, Error::UnexpectedTag { field: "root", .. }),
         "{err:?}"
     );
-}
 
-#[test]
-fn negative_lengths_rejected() {
-    // BlockStates long array with a negative length.
+    // Negative lengths: a BlockStates array, an unknown byte array, and an
+    // unknown list count.
     let mut region = Vec::new();
     region.extend(field(10, "Position", &vec3_payload(0, 0, 0)));
     region.extend(field(10, "Size", &vec3_payload(4, 1, 1)));
@@ -300,99 +303,44 @@ fn negative_lengths_rejected() {
         "{err:?}"
     );
 
-    // Unknown byte-array field with a negative length.
-    let spec = RegionSpec {
-        name: "main",
-        position: BlockPos::new(0, 0, 0),
-        size: BlockPos::new(1, 1, 1),
-        palette: vec![("minecraft:air", &[])],
-        states: vec![0],
-    };
     let mut fields = standard_root_fields();
     fields.push(field(7, "EvilBytes", &i32b(-7)));
-    fields.push(regions_field(&[spec]));
+    fields.push(regions_field(&[unit_region()]));
     let err = parse_err(&root(&fields));
     assert!(
         matches!(err, Error::NegativeLength { length: -7, .. }),
         "{err:?}"
     );
 
-    // Unknown list field with a negative element count.
-    let spec = RegionSpec {
-        name: "main",
-        position: BlockPos::new(0, 0, 0),
-        size: BlockPos::new(1, 1, 1),
-        palette: vec![("minecraft:air", &[])],
-        states: vec![0],
-    };
     let mut fields = standard_root_fields();
     let mut list = vec![10u8];
     list.extend(i32b(-3));
     fields.push(field(9, "Entities", &list));
-    fields.push(regions_field(&[spec]));
+    fields.push(regions_field(&[unit_region()]));
     let err = parse_err(&root(&fields));
     assert!(
         matches!(err, Error::NegativeLength { length: -3, .. }),
         "{err:?}"
     );
-}
 
-#[test]
-fn huge_size_with_tiny_states_is_truncated() {
-    for size in [
-        BlockPos::new(1_000_000, 1_000_000, 1_000_000),
-        BlockPos::new(i32::MAX, i32::MAX, i32::MAX),
-        BlockPos::new(i32::MIN, i32::MIN, i32::MIN),
-    ] {
-        let spec = RegionSpec {
-            name: "main",
-            position: BlockPos::new(0, 0, 0),
-            size,
-            palette: vec![("minecraft:air", &[]), ("minecraft:stone", &[])],
-            states: vec![5], // one long, far too short
-        };
-        let mut fields = standard_root_fields();
-        fields.push(regions_field(&[spec]));
-        let err = parse_err(&root(&fields));
-        assert!(
-            matches!(err, Error::TruncatedBlockStates { have: 8, .. }),
-            "size {size:?}: {err:?}"
-        );
-        assert!(err.to_string().contains("truncated"), "{err}");
-    }
-}
-
-#[test]
-fn empty_palette_with_volume_rejected() {
+    // A region with volume but an empty palette can never resolve an index.
     let spec = RegionSpec {
-        name: "main",
-        position: BlockPos::new(0, 0, 0),
         size: BlockPos::new(2, 1, 1),
         palette: vec![],
-        states: vec![0],
+        ..unit_region()
     };
     let mut fields = standard_root_fields();
     fields.push(regions_field(&[spec]));
     let err = parse_err(&root(&fields));
     assert!(matches!(err, Error::EmptyPalette { .. }), "{err:?}");
-}
 
-#[test]
-fn missing_required_fields_rejected() {
-    let spec = RegionSpec {
-        name: "main",
-        position: BlockPos::new(0, 0, 0),
-        size: BlockPos::new(1, 1, 1),
-        palette: vec![("minecraft:air", &[])],
-        states: vec![0],
-    };
-
-    // Root without Metadata.
+    // Missing required fields: root Metadata, root Regions, then every
+    // required region member in turn.
     let mut fields = vec![
         field(3, "MinecraftDataVersion", &i32b(4189)),
         field(3, "Version", &i32b(6)),
     ];
-    fields.push(regions_field(&[spec]));
+    fields.push(regions_field(&[unit_region()]));
     let err = parse_err(&root(&fields));
     assert!(
         matches!(
@@ -405,9 +353,7 @@ fn missing_required_fields_rejected() {
         "{err:?}"
     );
 
-    // Root without Regions.
-    let fields = standard_root_fields();
-    let err = parse_err(&root(&fields));
+    let err = parse_err(&root(&standard_root_fields()));
     assert!(
         matches!(
             err,
@@ -419,7 +365,6 @@ fn missing_required_fields_rejected() {
         "{err:?}"
     );
 
-    // Region without each required field in turn.
     for missing in ["Position", "Size", "BlockStatePalette", "BlockStates"] {
         let mut region = Vec::new();
         if missing != "Position" {
@@ -449,54 +394,8 @@ fn missing_required_fields_rejected() {
             "missing {missing}: {err:?}"
         );
     }
-}
 
-#[test]
-fn corrupt_gzip_rejected() {
-    // Not gzip at all.
-    let err = decompress_gzip_with_limit(b"definitely not gzip", 1 << 20).expect_err("must fail");
-    assert!(matches!(err, Error::CorruptGzip(_)), "{err:?}");
-
-    // Corrupted body of an otherwise valid stream.
-    let mut gz = gzip(&minimal_valid());
-    let mid = gz.len() / 2;
-    gz[mid] ^= 0xff;
-    let err = decompress_gzip_with_limit(&gz, 1 << 20).expect_err("must fail");
-    assert!(matches!(err, Error::CorruptGzip(_)), "{err:?}");
-
-    // Truncated stream.
-    let gz = gzip(&minimal_valid());
-    let err = decompress_gzip_with_limit(&gz[..gz.len() / 2], 1 << 20).expect_err("must fail");
-    assert!(matches!(err, Error::CorruptGzip(_)), "{err:?}");
-}
-
-#[test]
-fn decompress_limit_enforced() {
-    let data = vec![0u8; 1000];
-    let gz = gzip(&data);
-
-    // Limit smaller than the output: fails, with the limit in the message.
-    let err = decompress_gzip_with_limit(&gz, 10).expect_err("must fail");
-    assert!(
-        matches!(err, Error::SizeLimitExceeded { limit: 10 },),
-        "{err:?}"
-    );
-    assert!(err.to_string().contains("10"), "{err}");
-
-    // Zero limit.
-    let err = decompress_gzip_with_limit(&gz, 0).expect_err("must fail");
-    assert!(
-        matches!(err, Error::SizeLimitExceeded { limit: 0 }),
-        "{err:?}"
-    );
-
-    // Limit exactly equal to the output is fine.
-    let out = decompress_gzip_with_limit(&gz, 1000).expect("must succeed");
-    assert_eq!(out.len(), 1000);
-}
-
-#[test]
-fn deep_nesting_rejected() {
+    // Nesting deeper than the 64-level limit.
     let mut payload = field(3, "leaf", &i32b(1));
     payload.push(0);
     for _ in 0..100 {
@@ -505,17 +404,116 @@ fn deep_nesting_rejected() {
         payload = outer;
     }
     let mut fields = standard_root_fields();
-    let spec = RegionSpec {
-        name: "main",
-        position: BlockPos::new(0, 0, 0),
-        size: BlockPos::new(1, 1, 1),
-        palette: vec![("minecraft:air", &[])],
-        states: vec![0],
-    };
-    fields.push(regions_field(&[spec]));
+    fields.push(regions_field(&[unit_region()]));
     fields.push(field(10, "Deep", &payload));
     let err = parse_err(&root(&fields));
     assert!(matches!(err, Error::DepthLimitExceeded { .. }), "{err:?}");
+}
+
+#[test]
+fn malicious_sizes_are_not_trusted() {
+    // Declared sizes far beyond the payload available: the short payload is
+    // reported as truncation rather than driving allocation.
+    for size in [
+        BlockPos::new(1_000_000, 1_000_000, 1_000_000),
+        BlockPos::new(i32::MAX, i32::MAX, i32::MAX),
+        BlockPos::new(i32::MIN, i32::MIN, i32::MIN),
+    ] {
+        let spec = RegionSpec {
+            size,
+            palette: vec![("minecraft:air", &[]), ("minecraft:stone", &[])],
+            states: vec![5], // one long, far too short
+            ..unit_region()
+        };
+        let mut fields = standard_root_fields();
+        fields.push(regions_field(&[spec]));
+        let err = parse_err(&root(&fields));
+        assert!(
+            matches!(err, Error::TruncatedBlockStates { have: 8, .. }),
+            "size {size:?}: {err:?}"
+        );
+        assert!(err.to_string().contains("truncated"), "{err}");
+    }
+
+    // Claimed lengths with nothing behind them must fail as EOF, not OOM.
+    let mut region = Vec::new();
+    region.extend(field(10, "Position", &vec3_payload(0, 0, 0)));
+    region.extend(field(10, "Size", &vec3_payload(1, 1, 1)));
+    region.extend(field(
+        9,
+        "BlockStatePalette",
+        &palette_payload(&[("minecraft:air", &[])]),
+    ));
+    region.extend(field(12, "BlockStates", &i32b(i32::MAX)));
+    let mut fields = standard_root_fields();
+    let mut regs = field(10, "main", &region);
+    regs.push(0);
+    fields.push(field(10, "Regions", &regs));
+    let bytes = root(&fields);
+    let err = Document::parse(&bytes[..bytes.len() - 1]).expect_err("must fail");
+    assert!(matches!(err, Error::UnexpectedEof { .. }), "{err:?}");
+
+    // A palette list claiming 2^31-1 compound entries with no payload.
+    let mut region = Vec::new();
+    region.extend(field(10, "Position", &vec3_payload(0, 0, 0)));
+    region.extend(field(10, "Size", &vec3_payload(1, 1, 1)));
+    let mut list = vec![10u8];
+    list.extend(i32b(i32::MAX));
+    region.extend(field(9, "BlockStatePalette", &list));
+    let mut fields = standard_root_fields();
+    let mut regs = field(10, "main", &region);
+    regs.push(0);
+    fields.push(field(10, "Regions", &regs));
+    let bytes = root(&fields);
+    // Strip the three trailing END tags (region, regions, root) so the buffer
+    // ends right after the palette list header.
+    let err = Document::parse(&bytes[..bytes.len() - 3]).expect_err("must fail");
+    assert!(matches!(err, Error::UnexpectedEof { .. }), "{err:?}");
+}
+
+#[test]
+fn decompression_guards() {
+    // Not gzip at all.
+    let err = decompress_gzip_with_limit(b"definitely not gzip", 1 << 20).expect_err("must fail");
+    assert!(matches!(err, Error::CorruptGzip(_)), "{err:?}");
+
+    // Corrupted body of an otherwise valid stream, and a truncated stream.
+    let mut gz = gzip(&minimal_valid());
+    let mid = gz.len() / 2;
+    gz[mid] ^= 0xff;
+    let err = decompress_gzip_with_limit(&gz, 1 << 20).expect_err("must fail");
+    assert!(matches!(err, Error::CorruptGzip(_)), "{err:?}");
+
+    let gz = gzip(&minimal_valid());
+    let err = decompress_gzip_with_limit(&gz[..gz.len() / 2], 1 << 20).expect_err("must fail");
+    assert!(matches!(err, Error::CorruptGzip(_)), "{err:?}");
+
+    // Output beyond the limit, including a zero limit; exactly the limit is
+    // allowed.
+    let data = vec![0u8; 1000];
+    let gz = gzip(&data);
+    let err = decompress_gzip_with_limit(&gz, 10).expect_err("must fail");
+    assert!(
+        matches!(err, Error::SizeLimitExceeded { limit: 10 },),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("10"), "{err}");
+
+    let err = decompress_gzip_with_limit(&gz, 0).expect_err("must fail");
+    assert!(
+        matches!(err, Error::SizeLimitExceeded { limit: 0 }),
+        "{err:?}"
+    );
+
+    let out = decompress_gzip_with_limit(&gz, 1000).expect("must succeed");
+    assert_eq!(out.len(), 1000);
+
+    // The streaming reader applies the same limit while opening.
+    let err = StreamReader::open(Cursor::new(gz), 0).expect_err("limit must bite");
+    assert!(
+        matches!(err, Error::SizeLimitExceeded { limit: 0 }),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -556,46 +554,6 @@ fn zero_volume_tolerates_empty_palette_and_states() {
     assert_eq!(doc.regions[0].iter_blocks().count(), 0);
     assert_eq!(doc.total_volume(), 0);
     assert_eq!(doc.enclosing_size(), Some(BlockSize::new(1, 3, 4)));
-}
-
-#[test]
-fn claimed_sizes_without_payload_are_eof_not_oom() {
-    // A long array claiming ~17 GiB of payload with nothing behind it must
-    // fail as EOF, not try to allocate.
-    let mut region = Vec::new();
-    region.extend(field(10, "Position", &vec3_payload(0, 0, 0)));
-    region.extend(field(10, "Size", &vec3_payload(1, 1, 1)));
-    region.extend(field(
-        9,
-        "BlockStatePalette",
-        &palette_payload(&[("minecraft:air", &[])]),
-    ));
-    region.extend(field(12, "BlockStates", &i32b(i32::MAX)));
-    // Deliberately no payload and no end tags: the buffer simply ends.
-    let mut fields = standard_root_fields();
-    let mut regs = field(10, "main", &region);
-    regs.push(0);
-    fields.push(field(10, "Regions", &regs));
-    let bytes = root(&fields);
-    let err = Document::parse(&bytes[..bytes.len() - 1]).expect_err("must fail");
-    assert!(matches!(err, Error::UnexpectedEof { .. }), "{err:?}");
-
-    // A palette list claiming 2^31-1 compound entries with no payload.
-    let mut region = Vec::new();
-    region.extend(field(10, "Position", &vec3_payload(0, 0, 0)));
-    region.extend(field(10, "Size", &vec3_payload(1, 1, 1)));
-    let mut list = vec![10u8];
-    list.extend(i32b(i32::MAX));
-    region.extend(field(9, "BlockStatePalette", &list));
-    let mut fields = standard_root_fields();
-    let mut regs = field(10, "main", &region);
-    regs.push(0);
-    fields.push(field(10, "Regions", &regs));
-    let bytes = root(&fields);
-    // Strip the three trailing END tags (region, regions, root) so the buffer
-    // ends right after the palette list header.
-    let err = Document::parse(&bytes[..bytes.len() - 3]).expect_err("must fail");
-    assert!(matches!(err, Error::UnexpectedEof { .. }), "{err:?}");
 }
 
 #[test]

@@ -440,11 +440,12 @@ fn dropping_an_unread_region_advances_the_stream() {
 }
 
 #[test]
-fn a_second_read_blocks_call_is_a_noop() {
+fn read_blocks_lifecycle() {
     let specs = three_regions();
     let mut reader = open(&gzip(&document_bytes(&specs, false, false)));
-    let mut region = reader.next_region().expect("header").expect("present");
 
+    // The payload is emitted exactly once; a second call is a no-op.
+    let mut region = reader.next_region().expect("header").expect("present");
     let mut first = Vec::new();
     region
         .read_blocks(|index| {
@@ -462,14 +463,10 @@ fn a_second_read_blocks_call_is_a_noop() {
         })
         .expect("second read");
     assert!(second.is_empty(), "payload is emitted exactly once");
-}
 
-#[test]
-fn callback_error_propagates_and_leaves_the_stream_usable() {
-    let specs = three_regions();
-    let mut reader = open(&gzip(&document_bytes(&specs, false, false)));
+    // A callback error escapes, yet the region counts as consumed so the
+    // stream stays usable.
     let mut region = reader.next_region().expect("header").expect("present");
-
     let err = region
         .read_blocks(|_| {
             Err(Error::MissingField {
@@ -491,19 +488,8 @@ fn callback_error_propagates_and_leaves_the_stream_usable() {
     );
     drop(region);
 
-    // The payload was already read, so the failure does not poison the reader.
     let next = reader.next_region().expect("stream continues");
-    assert_eq!(next.expect("second region present").name(), "negative");
-}
-
-#[test]
-fn decompressed_limit_is_enforced_while_opening() {
-    let bytes = gzip(&document_bytes(&three_regions(), false, false));
-    let err = StreamReader::open(Cursor::new(bytes), 0).expect_err("limit must bite");
-    assert!(
-        matches!(err, Error::SizeLimitExceeded { limit: 0 }),
-        "{err:?}"
-    );
+    assert_eq!(next.expect("third region present").name(), "empty");
 }
 
 #[test]

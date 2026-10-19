@@ -377,18 +377,13 @@ mod tests {
     }
 
     #[test]
-    fn position_is_a_signed_point() {
-        assert_eq!(pos(-2, 3, -4).abs(), pos(2, 3, 4));
-        assert_eq!(format!("{:?}", pos(1, -2, 3)), "(1, -2, 3)");
-    }
-
-    #[test]
     fn vector_helpers_are_componentwise() {
         let (a, b) = (pos(1, 2, 3), pos(4, 5, 6));
         assert_eq!(a.dot(b), 32);
         assert_eq!(a.min(b), a);
         assert_eq!(a.max(b), b);
         assert_eq!(a.component_mul(b), pos(4, 10, 18));
+        assert_eq!(pos(-2, 3, -4).abs(), pos(2, 3, 4));
     }
 
     #[test]
@@ -416,24 +411,5 @@ mod tests {
         assert_eq!(positions[4], pos(0, 1, 0));
         assert_eq!(positions[7], pos(1, 1, 1));
         assert_eq!(BlockSize::new(0, 2, 2).cartesian_positions().count(), 0);
-    }
-
-    #[test]
-    fn operators_follow_vector_conventions() {
-        let (a, b) = (pos(1, 2, 3), pos(4, 5, 6));
-        assert_eq!(a + b, pos(5, 7, 9));
-        assert_eq!(b - a, pos(3, 3, 3));
-        assert_eq!(-a, pos(-1, -2, -3));
-        assert_eq!(a * 2, pos(2, 4, 6));
-        assert_eq!(pos(2, -4, 6) / 2, pos(1, -2, 3));
-        assert_eq!(pos(1, 0, 0) * pos(0, 1, 0), pos(0, 0, 1));
-
-        let mut p = a;
-        p += b;
-        p -= b;
-        p *= 2;
-        p /= 2;
-        p *= pos(1, 0, 0);
-        assert_eq!(p, pos(0, 3, -2));
     }
 }

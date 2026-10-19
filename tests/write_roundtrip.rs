@@ -279,7 +279,9 @@ fn round_trip_over_approximated_palette_keeps_unused_entries() {
 }
 
 #[test]
-fn round_trip_zero_axis_writes_empty_block_states() {
+fn round_trip_degenerate_volumes() {
+    // A zero axis has no voxels; `EnclosingSize` mirrors `Region.Size`
+    // verbatim, zero axes included.
     let table = Table::filled(BlockPos::new(4, 0, 2), vec![], |_| AIR);
     let rt = RoundTrip::run(&table, &WriteOptions::new(4189, "flat"));
     let doc = rt.doc();
@@ -291,12 +293,9 @@ fn round_trip_zero_axis_writes_empty_block_states() {
     assert_eq!(region.iter_blocks().len(), 0);
     assert_eq!(doc.metadata.total_blocks, Some(0));
     assert_eq!(doc.metadata.total_volume, Some(0));
-    // `EnclosingSize` mirrors `Region.Size` verbatim, zero axes included.
     assert_eq!(doc.metadata.enclosing_size, Some(BlockPos::new(4, 0, 2)));
-}
 
-#[test]
-fn round_trip_all_air_uses_two_bit_entries() {
+    // All air still uses the 2-bit floor rather than a zero-width palette.
     let table = Table::filled(BlockPos::new(3, 3, 3), vec![], |_| AIR);
     let rt = RoundTrip::run(&table, &WriteOptions::new(4189, "air only"));
     let doc = rt.doc();
@@ -305,21 +304,6 @@ fn round_trip_all_air_uses_two_bit_entries() {
     assert_eq!(region.palette().len(), 1);
     assert_eq!(read_view(&region.palette()[0]), write_view(&air()));
     assert_eq!(doc.metadata.total_blocks, Some(0));
-}
-
-#[test]
-fn write_errors_when_block_not_in_declared_palette() {
-    let states = vec![st("minecraft:stone", &[]), st("litematica:missing", &[])];
-    let mut table = Table::filled(BlockPos::new(2, 1, 2), states, |pos| (pos.x % 2) as u8);
-    table.declared = Some(vec![st("minecraft:stone", &[])]); // misses index 1
-    let err = write(&table, &WriteOptions::new(4189, "bad palette"), Vec::new()).unwrap_err();
-    match err {
-        Error::BlockNotInPalette { name, x, y, z } => {
-            assert_eq!(name, "litematica:missing");
-            assert_eq!([x, y, z], [1, 0, 0]);
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
 }
 
 /// A lazy layout answering every query with one state; for overflow tests
@@ -351,7 +335,21 @@ fn sparse(size: BlockPos) -> Sparse {
 }
 
 #[test]
-fn write_errors_when_volume_exceeds_i32() {
+fn write_rejections() {
+    // A state outside the declared palette reports its position.
+    let states = vec![st("minecraft:stone", &[]), st("litematica:missing", &[])];
+    let mut table = Table::filled(BlockPos::new(2, 1, 2), states, |pos| (pos.x % 2) as u8);
+    table.declared = Some(vec![st("minecraft:stone", &[])]); // misses index 1
+    let err = write(&table, &WriteOptions::new(4189, "bad palette"), Vec::new()).unwrap_err();
+    match err {
+        Error::BlockNotInPalette { name, x, y, z } => {
+            assert_eq!(name, "litematica:missing");
+            assert_eq!([x, y, z], [1, 0, 0]);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    // A volume beyond the format's i32 limit and a negative axis.
     let err = write(
         &sparse(BlockPos::new(65536, 65536, 1)),
         &WriteOptions::new(4189, "huge"),
@@ -359,10 +357,7 @@ fn write_errors_when_volume_exceeds_i32() {
     )
     .unwrap_err();
     assert!(matches!(err, Error::DimensionOverflow { .. }));
-}
 
-#[test]
-fn write_errors_when_axis_is_negative() {
     let err = write(
         &sparse(BlockPos::new(-1, 1, 1)),
         &WriteOptions::new(4189, "negative"),

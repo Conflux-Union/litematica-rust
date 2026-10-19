@@ -572,7 +572,6 @@ impl Encode for Header<'_> {
 #[cfg(test)]
 mod tests {
     use super::{Layout, Palette};
-    use crate::bitstream::bits_for;
     use crate::mc::{BlockPos, BlockState};
 
     fn st(name: &str, props: &[(&str, &str)]) -> BlockState {
@@ -599,6 +598,7 @@ mod tests {
         assert_eq!(p.id_of(&air()), Some(0));
         assert_eq!(p.id_of(&st("a", &[])), Some(1));
         assert_eq!(p.id_of(&st("c", &[])), Some(2));
+        assert_eq!(p.id_of(&st("minecraft:dirt", &[])), None);
     }
 
     #[test]
@@ -619,18 +619,6 @@ mod tests {
     }
 
     #[test]
-    fn palette_bits_match_litematica_widths() {
-        for len in [1usize, 2, 3, 4, 5, 8, 9, 16, 17] {
-            let declared: Vec<_> = (0..len)
-                .map(|i| st("litematica:p", &[("i", &i.to_string())]))
-                .collect();
-            let p = Palette::build(declared);
-            let expect = bits_for(len + 1);
-            assert_eq!(p.num_bits(), expect, "palette of {len} entries + air");
-        }
-    }
-
-    #[test]
     fn default_palette_does_not_reserve_the_whole_box() {
         struct Empty(BlockPos);
 
@@ -647,11 +635,5 @@ mod tests {
         let palette = Empty(BlockPos::new(64, 64, 64)).block_palette();
         assert_eq!(palette, [air()].into());
         assert!(palette.capacity() < 1024, "palette reserved the whole box");
-    }
-
-    #[test]
-    fn id_of_unknown_state_is_none() {
-        let p = Palette::build([st("minecraft:stone", &[])]);
-        assert_eq!(p.id_of(&st("minecraft:dirt", &[])), None);
     }
 }

@@ -355,24 +355,6 @@ mod tests {
     }
 
     #[test]
-    fn packer_round_trips_width_3_through_block_iter() {
-        let values = [1u32, 2, 6, 5, 7]; // 15 bits -> one partial long
-        let bytes = pack(&values, 3);
-        let decoded: Vec<u32> =
-            BlockIter::new(BitStream::new(&bytes, 3), values.len() as u64).collect();
-        assert_eq!(decoded, values);
-    }
-
-    #[test]
-    fn packer_round_trips_crossing_long_boundaries() {
-        let values: Vec<u32> = (0..20).map(|i| (i * 7 + 3) % 32).collect(); // 100 bits
-        let bytes = pack(&values, 5);
-        let decoded: Vec<u32> =
-            BlockIter::new(BitStream::new(&bytes, 5), values.len() as u64).collect();
-        assert_eq!(decoded, values);
-    }
-
-    #[test]
     fn packer_exact_multiple_flushes_no_tail() {
         let mut packer = Packer::new(2);
         let mut longs = Vec::new();

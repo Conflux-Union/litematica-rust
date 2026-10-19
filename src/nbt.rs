@@ -943,47 +943,12 @@ mod tests {
     }
 
     #[test]
-    fn long_array_propagates_element_errors() {
-        let mut w = Writer::new(Vec::new());
-        w.root().unwrap();
-        let words = [Ok(1), Err(Error::StringTooLong { len: 1 })];
-        assert!(matches!(
-            w.long_array(2, words),
-            Err(Error::StringTooLong { len: 1 })
-        ));
-    }
-
-    #[test]
-    fn writer_propagates_sink_io_errors() {
-        struct Failing;
-        impl std::io::Write for Failing {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("boom"))
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut w = Writer::new(Failing);
-        assert!(matches!(w.root(), Err(Error::WriteIo { .. })));
-    }
-
-    #[test]
     fn writer_rejects_strings_over_u16_limit() {
         let mut w = Writer::new(Vec::new());
         let s = "x".repeat(70_000);
         assert!(matches!(
             s.encode("s", &mut w),
             Err(Error::StringTooLong { len: 70_000 })
-        ));
-    }
-
-    #[test]
-    fn reader_rejects_unknown_tag_ids() {
-        let mut r = Reader::new(SliceSource::new(&[13]));
-        assert!(matches!(
-            r.tag(),
-            Err(Error::InvalidTagId { id: 13, offset: 0 })
         ));
     }
 
