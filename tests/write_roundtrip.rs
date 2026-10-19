@@ -225,7 +225,7 @@ fn round_trip_full_layout() {
     let region = &doc.regions[0];
     assert_eq!(region.name, "多区域 schematic ✓");
     assert_eq!(region.position, BlockPos::new(0, 0, 0));
-    assert_eq!(region.declared_size, BlockPos::new(5, 3, 7));
+    assert_eq!(region.declared_size(), BlockPos::new(5, 3, 7));
     assert_eq!(region.volume(), 105);
     let expected_palette = expected_file_palette(&table);
     let got: Vec<_> = region.palette().states().iter().map(read_view).collect();

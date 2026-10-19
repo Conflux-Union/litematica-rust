@@ -9,8 +9,8 @@ use crate::error::{Error, Result};
 use crate::knowledge::mc::{BlockPos, BlockSize, BlockState};
 use crate::knowledge::nbt::{FieldEntry, FieldOutcome, FieldTable, Reader};
 use crate::knowledge::nbt::{SliceSource, Slot, Source, Tag};
-use crate::model::bitstream::{BitStream, PaletteIdIter};
-use crate::model::palette::{Palette, PaletteId};
+use crate::model::bitstream::{BitStream, PaletteIdIter, Payload};
+use crate::model::palette::{BitsPerEntry, Palette, PaletteId};
 use std::fmt;
 
 // Region header
@@ -103,7 +103,7 @@ pub(crate) struct RegionParts {
 /// disagree about what a well-formed region is.
 pub(crate) struct Geometry {
     pub(crate) size: BlockSize,
-    pub(crate) bits_per_entry: u32,
+    pub(crate) width: BitsPerEntry,
     pub(crate) volume: u64,
 }
 
@@ -120,17 +120,17 @@ impl Geometry {
     ) -> Result<Self> {
         let size = BlockSize::of(size);
         let volume128 = size.volume();
-        let bits_per_entry = palette.bits_per_entry();
+        let width = palette.width();
 
         if volume128 > 0 && palette.is_empty() {
             return Err(Error::EmptyPalette { offset });
         }
-        if (1u64 << bits_per_entry) < palette.len() as u64 {
+        if width.capacity() < palette.len() as u64 {
             return Err(Error::PaletteTooLarge { offset });
         }
         // Checked before the u64 overflow check so that a hostile file with a
         // huge claimed Size is always reported as truncated block data.
-        let required = (volume128 * u128::from(bits_per_entry)).div_ceil(8);
+        let required = (volume128 * u128::from(width.bits())).div_ceil(8);
         if u128::from(payload_bytes) < required {
             return Err(Error::TruncatedBlockStates {
                 have: payload_bytes,
@@ -141,7 +141,7 @@ impl Geometry {
         let volume = u64::try_from(volume128).map_err(|_| Error::VolumeOverflow { offset })?;
         Ok(Self {
             size,
-            bits_per_entry,
+            width,
             volume,
         })
     }
@@ -170,7 +170,7 @@ pub struct Region<'a> {
     /// Size of the region as declared in the file. Components may be negative,
     /// which means the region extends in the negative axis direction; the box
     /// actually addressed is [`Region::size`].
-    pub declared_size: BlockPos,
+    declared_size: BlockPos,
     size: BlockSize,
     palette: Palette,
     blocks: BitStream<'a>,
@@ -224,7 +224,7 @@ impl<'a> Region<'a> {
         block_states: &'a [u8],
         offset: usize,
     ) -> Result<Self> {
-        Self::assemble(name, parts, BitStream::borrowed(block_states, 0), offset)
+        Self::assemble(name, parts, Payload::borrowed(block_states), offset)
     }
 
     /// Assembles a region whose payload is owned by the region itself.
@@ -234,14 +234,14 @@ impl<'a> Region<'a> {
         block_states: Vec<u8>,
         offset: usize,
     ) -> Result<Self> {
-        Self::assemble(name, parts, BitStream::owned(block_states, 0), offset)
+        Self::assemble(name, parts, Payload::owned(block_states), offset)
     }
 
     /// Validates the payload against the header and fixes the bit width.
     fn assemble(
         name: String,
         parts: RegionParts,
-        blocks: BitStream<'a>,
+        payload: Payload<'a>,
         offset: usize,
     ) -> Result<Self> {
         let RegionParts {
@@ -249,14 +249,14 @@ impl<'a> Region<'a> {
             size,
             palette,
         } = parts;
-        let geometry = Geometry::new(size, &palette, blocks.byte_len() as u64, offset)?;
+        let geometry = Geometry::new(size, &palette, payload.len() as u64, offset)?;
         Ok(Self {
             name,
             position,
             declared_size: size,
             size: geometry.size,
             palette,
-            blocks: blocks.with_bits(geometry.bits_per_entry),
+            blocks: BitStream::new(payload, geometry.width),
             volume: geometry.volume,
         })
     }
@@ -270,6 +270,14 @@ impl<'a> Region<'a> {
     /// The absolute size per axis, with any negative direction folded away.
     pub fn size(&self) -> BlockSize {
         self.size
+    }
+
+    /// The size exactly as declared by the file, sign included.
+    ///
+    /// [`Region::size`] is this value with each direction folded away; the two
+    /// are derived from the same declaration, so they cannot disagree.
+    pub fn declared_size(&self) -> BlockPos {
+        self.declared_size
     }
 
     /// The number of voxels in this region, `size().volume()` narrowed to

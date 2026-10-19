@@ -117,7 +117,7 @@ pub mod document {
             let (mut lo, mut hi) = (BlockPos::ORIGIN, BlockPos::ORIGIN);
             for region in &self.regions {
                 let p = region.position;
-                let s = region.declared_size;
+                let s = region.declared_size();
                 lo = lo.min(p.min(p.saturating_add(s).saturating_add(BlockPos::UNIT)));
                 hi = hi.max(p.max(p.saturating_add(s).saturating_sub(BlockPos::UNIT)));
             }

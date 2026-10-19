@@ -71,9 +71,12 @@ impl Palette {
     /// Bits per packed identifier, matching the litematic width rule: the
     /// smallest `n >= 2` with `2^n >= len`.
     pub fn bits_per_entry(&self) -> u32 {
-        (2..32)
-            .find(|n| (1u64 << n) >= self.len() as u64)
-            .unwrap_or(32)
+        self.width().bits()
+    }
+
+    /// The width and mask the file format assigns to this palette.
+    pub(crate) fn width(&self) -> BitsPerEntry {
+        BitsPerEntry::of_len(self.len())
     }
 
     /// The state with identifier `id`, or `None` when the palette is shorter.
@@ -128,6 +131,45 @@ impl Deref for OrderedPalette {
 
     fn deref(&self) -> &Palette {
         &self.0
+    }
+}
+
+/// The packed width of one palette identifier, in bits, together with the mask
+/// that isolates it.
+///
+/// A litematic entry is never narrower than two bits, and is only as wide as
+/// the smallest power of two that can address every entry of its palette. The
+/// two values are constructed together, so a decoder can never read a stream
+/// with one width and mask it with another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BitsPerEntry {
+    bits: u32,
+    mask: u64,
+}
+
+impl BitsPerEntry {
+    /// The width the litematic format assigns to a palette of `len` entries.
+    pub(crate) fn of_len(len: usize) -> Self {
+        let bits = (2..32).find(|n| (1u64 << n) >= len as u64).unwrap_or(32);
+        Self {
+            bits,
+            mask: (1u64 << bits) - 1,
+        }
+    }
+
+    /// The number of bits one entry occupies.
+    pub(crate) const fn bits(self) -> u32 {
+        self.bits
+    }
+
+    /// The mask that isolates one entry.
+    pub(crate) const fn mask(self) -> u64 {
+        self.mask
+    }
+
+    /// How many distinct identifiers this width can carry.
+    pub(crate) const fn capacity(self) -> u64 {
+        self.mask + 1
     }
 }
 
@@ -187,5 +229,15 @@ mod tests {
         assert_eq!(palette.states(), [st("b"), st("minecraft:air"), st("a")]);
         assert_eq!(palette.state_at(2), Some(&st("a")));
         assert_eq!(palette.bits_per_entry(), 2);
+    }
+
+    #[test]
+    fn width_starts_at_two_bits_and_grows_at_powers_of_two() {
+        let width = |len| Palette::from_file(vec![st("x"); len]).bits_per_entry();
+        assert_eq!(width(0), 2);
+        assert_eq!(width(4), 2);
+        assert_eq!(width(5), 3);
+        assert_eq!(width(8), 3);
+        assert_eq!(width(9), 4);
     }
 }

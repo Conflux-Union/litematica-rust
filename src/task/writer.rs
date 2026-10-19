@@ -368,7 +368,7 @@ impl<'a, L: Layout> Packed<'a, L> {
             layout,
             palette,
             positions: size.cartesian_positions(),
-            packer: Packer::new(palette.bits_per_entry()),
+            packer: Packer::new(palette.width()),
             finished: false,
             total_blocks,
         }

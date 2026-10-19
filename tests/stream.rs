@@ -347,7 +347,7 @@ fn stream_matches_document_region_by_region() {
 
         assert_eq!(region.name, spec.name);
         assert_eq!(region.position, spec.position);
-        assert_eq!(region.declared_size, spec.size);
+        assert_eq!(region.declared_size(), spec.size);
         assert_eq!(region.size(), BlockSize::of(spec.size));
         assert_eq!(region.volume(), spec.volume());
         assert_eq!(region.bits_per_entry(), spec.bits());
@@ -398,7 +398,7 @@ fn field_order_is_irrelevant() {
         for (spec, doc_region) in specs.iter().zip(&doc.regions) {
             let region = reader.next_region().expect("region").expect("present");
             assert_eq!(region.position, spec.position);
-            assert_eq!(region.declared_size, spec.size);
+            assert_eq!(region.declared_size(), spec.size);
             assert_eq!(
                 palette_view(region.palette().states()),
                 palette_view(doc_region.palette().states())
