@@ -11,7 +11,8 @@
 //!   never builds a tree ([`Document::parse`]);
 //! - block state palettes are the only block data that is materialized;
 //!   the packed `BlockStates` payload is borrowed from the input buffer and
-//!   decoded voxel by voxel by [`Region::iter_blocks`].
+//!   decoded on demand, either voxel by voxel by [`Region::iter_blocks`] or
+//!   one entry at a time by [`Region::block_at`].
 //!
 //! Unknown fields (`Entities`, `TileEntities`, pending ticks, preview image
 //! data, ...) are skipped in O(length) without allocation, so parsing cost is
@@ -59,6 +60,7 @@ mod error;
 mod nbt;
 mod parse;
 mod region;
+use crate::mc::{BlockPos, BlockSize};
 use flate2::read::GzDecoder;
 use std::io::Read;
 
@@ -126,7 +128,7 @@ pub struct Metadata {
     /// (`Metadata.TimeModified`).
     pub time_modified: i64,
     /// Enclosing size claimed by the file (`Metadata.EnclosingSize`).
-    pub enclosing_size: Option<[i32; 3]>,
+    pub enclosing_size: Option<BlockPos>,
 }
 
 /// A parsed litematic document.
@@ -156,6 +158,10 @@ impl Document<'_> {
 
     /// Size of the axis-aligned box enclosing all regions, per axis.
     ///
+    /// The result is a span, so it is non-negative per axis even when regions
+    /// extend in negative directions. This is distinct from
+    /// [`Metadata::enclosing_size`], which mirrors the value a file declares.
+    ///
     /// This replicates the Litematica mod / rustmatica formula: for each
     /// region and axis, `mn = min(pos, pos + size + 1)` and
     /// `mx = max(pos, pos + size - 1)`; the document bounds start at the
@@ -163,23 +169,29 @@ impl Document<'_> {
     /// `|mx - mn + 1|`.
     ///
     /// Returns `None` if the document has no regions.
-    pub fn enclosing_size(&self) -> Option<[i32; 3]> {
+    pub fn enclosing_size(&self) -> Option<BlockSize> {
         if self.regions.is_empty() {
             return None;
         }
         let mut lo = [0i64; 3];
         let mut hi = [0i64; 3];
         for region in &self.regions {
+            let p = [
+                i64::from(region.position.x),
+                i64::from(region.position.y),
+                i64::from(region.position.z),
+            ];
+            let s = [
+                i64::from(region.size.x),
+                i64::from(region.size.y),
+                i64::from(region.size.z),
+            ];
             for axis in 0..3 {
-                let p = i64::from(region.position[axis]);
-                let s = i64::from(region.size[axis]);
-                lo[axis] = lo[axis].min(p.min(p + s + 1));
-                hi[axis] = hi[axis].max(p.max(p + s - 1));
+                lo[axis] = lo[axis].min(p[axis].min(p[axis] + s[axis] + 1));
+                hi[axis] = hi[axis].max(p[axis].max(p[axis] + s[axis] - 1));
             }
         }
-        let extent = |axis: usize| {
-            (hi[axis] - lo[axis] + 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-        };
-        Some([extent(0), extent(1), extent(2)])
+        let extent = |axis: usize| (hi[axis] - lo[axis] + 1).clamp(0, i64::from(u32::MAX)) as u32;
+        Some(BlockSize::new(extent(0), extent(1), extent(2)))
     }
 }

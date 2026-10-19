@@ -9,7 +9,7 @@
 //! with one extra scan.
 
 use crate::error::{Error, Result};
-use crate::mc::{BlockPos, BlockState};
+use crate::mc::{BlockPos, BlockSize, BlockState};
 use crate::nbt::{Encode, Tag, Writer};
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -34,9 +34,11 @@ const FORMAT_SUB_VERSION: i32 = 1;
 /// generators (which can compute a block from its coordinates) and keeps
 /// memory at O(palette) for arbitrarily large schematics.
 pub trait Layout {
-    /// Absolute dimensions per axis, never negative. Every position handed to
-    /// [`Layout::block_at`] is contained by this box, as decided by
-    /// [`BlockPos::contains`]. The value must stay stable throughout one
+    /// Absolute dimensions per axis, never negative. The signed [`BlockPos`]
+    /// shape mirrors the file's `Region.Size` field; the writer reads it as a
+    /// span through [`BlockSize::of`]. Every position handed to
+    /// [`Layout::block_at`] is contained by that span, as decided by
+    /// [`BlockSize::contains`]. The value must stay stable throughout one
     /// [`write()`] call: it defines both the declared `Region.Size` and the
     /// voxels that get packed.
     fn size(&self) -> BlockPos;
@@ -60,7 +62,7 @@ pub trait Layout {
     /// with a full scan of the bounding box, which costs one extra pass over
     /// every voxel.
     fn block_palette(&self) -> HashSet<BlockState> {
-        let positions = self.size().cartesian_positions();
+        let positions = BlockSize::of(self.size()).cartesian_positions();
         positions.fold(HashSet::new(), |mut palette, pos| {
             palette.insert(self.block_at(pos).unwrap_or(BlockState::AIR));
             palette
@@ -344,9 +346,7 @@ impl<'a, L: Layout> Schematic<'a, L> {
         if let Some((axis, value)) = axes.into_iter().find(|(_, value)| *value < 0) {
             return Err(Error::NegativeSize { axis, value });
         }
-        let volume = u128::from(size.x.unsigned_abs())
-            * u128::from(size.y.unsigned_abs())
-            * u128::from(size.z.unsigned_abs());
+        let volume = BlockSize::of(size).volume();
         i32::try_from(volume).map_err(|_| Error::DimensionOverflow {
             what: "volume",
             value: volume,
@@ -445,9 +445,9 @@ impl<L: Layout> Encode for BlockStates<'_, L> {
 struct Packed<'a, L: Layout> {
     layout: &'a L,
     palette: &'a Palette,
-    size: BlockPos,
-    index: u32,
-    volume: u32,
+    size: BlockSize,
+    cursor: BlockPos,
+    remaining: u64,
     packer: Packer,
     finished: bool,
     total_blocks: &'a Cell<i64>,
@@ -461,12 +461,13 @@ impl<'a, L: Layout> Packed<'a, L> {
         size: BlockPos,
         total_blocks: &'a Cell<i64>,
     ) -> Self {
+        let size = BlockSize::of(size);
         Self {
             layout,
             palette,
             size,
-            index: 0,
-            volume: size.volume(),
+            cursor: BlockPos::ORIGIN,
+            remaining: u64::try_from(size.volume()).unwrap_or(u64::MAX),
             packer: Packer::new(palette.num_bits()),
             finished: false,
             total_blocks,
@@ -475,13 +476,21 @@ impl<'a, L: Layout> Packed<'a, L> {
 }
 
 impl<L: Layout> Packed<'_, L> {
-    /// The position of the next voxel, in storage order: `x` fastest, then
-    /// `z`, then `y`. The size was validated non-negative, so every coordinate
-    /// lies inside the box.
-    fn next_position(&self) -> BlockPos {
-        let (sx, sz) = (self.size.x.unsigned_abs(), self.size.z.unsigned_abs());
-        let (x, rest) = (self.index % sx, self.index / sx);
-        BlockPos::new(x as i32, (rest / sz) as i32, (rest % sz) as i32)
+    /// Advances the cursor in storage order (`x` fastest, then `z`, then `y`)
+    /// and returns the position it just left. The size was validated
+    /// non-negative, so every coordinate lies inside the box.
+    fn next_position(&mut self) -> BlockPos {
+        let pos = self.cursor;
+        self.cursor.x += 1;
+        if self.cursor.x == self.size.x as i32 {
+            self.cursor.x = 0;
+            self.cursor.z += 1;
+            if self.cursor.z == self.size.z as i32 {
+                self.cursor.z = 0;
+                self.cursor.y += 1;
+            }
+        }
+        pos
     }
 }
 
@@ -495,12 +504,12 @@ impl<L: Layout> Iterator for Packed<'_, L> {
             return None;
         }
         loop {
-            if self.index == self.volume {
+            if self.remaining == 0 {
                 self.finished = true;
                 return self.packer.finish().map(|word| Ok(word as i64));
             }
+            self.remaining -= 1;
             let pos = self.next_position();
-            self.index += 1;
             let id = match self.palette.id_at(self.layout, pos) {
                 Ok(id) => id,
                 Err(error) => {
@@ -648,8 +657,11 @@ mod tests {
         }
         assert_eq!(longs.len(), 1); // ceil(15 / 64)
         let bytes: Vec<u8> = longs.iter().flat_map(|w| w.to_be_bytes()).collect();
-        let decoded: Vec<u32> =
-            crate::region::BlockIter::new(&bytes, 3, values.len() as u64).collect();
+        let decoded: Vec<u32> = crate::region::BlockIter::new(
+            crate::region::BitStream::new(&bytes, 3),
+            values.len() as u64,
+        )
+        .collect();
         assert_eq!(decoded, values);
     }
 
@@ -668,8 +680,11 @@ mod tests {
         }
         assert_eq!(longs.len(), 2); // ceil(100 / 64)
         let bytes: Vec<u8> = longs.iter().flat_map(|w| w.to_be_bytes()).collect();
-        let decoded: Vec<u32> =
-            crate::region::BlockIter::new(&bytes, 5, values.len() as u64).collect();
+        let decoded: Vec<u32> = crate::region::BlockIter::new(
+            crate::region::BitStream::new(&bytes, 5),
+            values.len() as u64,
+        )
+        .collect();
         assert_eq!(decoded, values);
     }
 

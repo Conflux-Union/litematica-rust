@@ -116,6 +116,9 @@ impl<'a> Decode<'a> for Document<'a> {
 impl<'a> Decode<'a> for BlockPos {
     /// Reads the `{x, y, z}` compound that `Position`, `Size`, and
     /// `EnclosingSize` are all written as. Unknown members are skipped.
+    ///
+    /// A `Size`-shaped field stays signed here, exactly as declared; use
+    /// [`crate::mc::BlockSize::of`] where it becomes a span.
     fn decode(r: &mut Reader<'a>, field: &'static str, enclosing: usize) -> Result<Self> {
         let depth = r.nested(enclosing)?;
         let mut values: [Option<i32>; 3] = [None, None, None];
@@ -198,7 +201,7 @@ impl MetadataFields {
             total_blocks: self.total_blocks,
             time_created: self.time_created,
             time_modified: self.time_modified,
-            enclosing_size: self.enclosing_size.map(|size| [size.x, size.y, size.z]),
+            enclosing_size: self.enclosing_size,
         }
     }
 }

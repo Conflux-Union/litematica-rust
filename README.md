@@ -122,8 +122,9 @@ the Litematica mod and rustmatica.
 - `decompress_gzip_with_limit(input, limit)` — single-member gzip inflation
   with an enforced output cap (fails *while* decompressing, not after).
 - `Document::parse(buf)` — one-pass scan; borrows `buf`.
-- `Document::total_volume()`, `Document::enclosing_size()` — computed with
-  the same formulas as Litematica/rustmatica.
+- `Document::total_volume()`, `Document::enclosing_size() -> Option<BlockSize>`
+  — computed with the same formulas as Litematica/rustmatica; the size is a
+  non-negative span, unlike the declared `Metadata::enclosing_size`.
 - `Metadata` — name/description/author, data and format versions, declared
   counts and sizes, timestamps.
 - `Region` — `name`, `position`, `size` as stored (possibly negative),

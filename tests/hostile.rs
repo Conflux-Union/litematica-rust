@@ -7,6 +7,7 @@
 use std::io::Write as _;
 
 use flate2::{write::GzEncoder, Compression};
+use litematica::mc::{BlockPos, BlockSize};
 use litematica::{decompress_gzip_with_limit, Document, Error};
 
 // ---------------------------------------------------------------- builder
@@ -104,8 +105,8 @@ fn pack(indices: &[u32], nbits: u32) -> Vec<i64> {
 
 struct RegionSpec<'p> {
     name: &'static str,
-    position: [i32; 3],
-    size: [i32; 3],
+    position: BlockPos,
+    size: BlockPos,
     palette: Vec<PaletteEntry<'p>>,
     states: Vec<i64>,
 }
@@ -115,12 +116,12 @@ fn region_bytes(spec: &RegionSpec<'_>) -> Vec<u8> {
     v.extend(field(
         10,
         "Position",
-        &vec3_payload(spec.position[0], spec.position[1], spec.position[2]),
+        &vec3_payload(spec.position.x, spec.position.y, spec.position.z),
     ));
     v.extend(field(
         10,
         "Size",
-        &vec3_payload(spec.size[0], spec.size[1], spec.size[2]),
+        &vec3_payload(spec.size.x, spec.size.y, spec.size.z),
     ));
     v.extend(field(
         9,
@@ -178,8 +179,8 @@ fn standard_root_fields() -> Vec<Vec<u8>> {
 fn minimal_valid() -> Vec<u8> {
     let spec = RegionSpec {
         name: "main",
-        position: [0, 0, 0],
-        size: [4, 1, 1],
+        position: BlockPos::new(0, 0, 0),
+        size: BlockPos::new(4, 1, 1),
         palette: vec![("minecraft:air", &[]), ("minecraft:stone", &[])],
         states: pack(&[0, 1, 0, 1], 2),
     };
@@ -215,12 +216,12 @@ fn control_minimal_file_parses() {
     assert_eq!(doc.metadata.region_count, Some(1));
     assert_eq!(doc.metadata.total_volume, Some(4));
     assert_eq!(doc.metadata.total_blocks, Some(2));
-    assert_eq!(doc.metadata.enclosing_size, Some([4, 1, 1]));
+    assert_eq!(doc.metadata.enclosing_size, Some(BlockPos::new(4, 1, 1)));
     assert_eq!(doc.regions.len(), 1);
     let region = &doc.regions[0];
     assert_eq!(region.name, "main");
-    assert_eq!(region.position, [0, 0, 0]);
-    assert_eq!(region.size, [4, 1, 1]);
+    assert_eq!(region.position, BlockPos::new(0, 0, 0));
+    assert_eq!(region.size, BlockPos::new(4, 1, 1));
     assert_eq!(region.volume(), 4);
     assert_eq!(region.bits_per_entry(), 2);
     assert_eq!(region.palette().len(), 2);
@@ -228,7 +229,7 @@ fn control_minimal_file_parses() {
     let stream: Vec<u32> = region.iter_blocks().collect();
     assert_eq!(stream, vec![0, 1, 0, 1]);
     assert_eq!(doc.total_volume(), 4);
-    assert_eq!(doc.enclosing_size(), Some([4, 1, 1]));
+    assert_eq!(doc.enclosing_size(), Some(BlockSize::new(4, 1, 1)));
 }
 
 #[test]
@@ -302,8 +303,8 @@ fn negative_lengths_rejected() {
     // Unknown byte-array field with a negative length.
     let spec = RegionSpec {
         name: "main",
-        position: [0, 0, 0],
-        size: [1, 1, 1],
+        position: BlockPos::new(0, 0, 0),
+        size: BlockPos::new(1, 1, 1),
         palette: vec![("minecraft:air", &[])],
         states: vec![0],
     };
@@ -319,8 +320,8 @@ fn negative_lengths_rejected() {
     // Unknown list field with a negative element count.
     let spec = RegionSpec {
         name: "main",
-        position: [0, 0, 0],
-        size: [1, 1, 1],
+        position: BlockPos::new(0, 0, 0),
+        size: BlockPos::new(1, 1, 1),
         palette: vec![("minecraft:air", &[])],
         states: vec![0],
     };
@@ -338,10 +339,14 @@ fn negative_lengths_rejected() {
 
 #[test]
 fn huge_size_with_tiny_states_is_truncated() {
-    for size in [[1_000_000i32; 3], [i32::MAX; 3], [i32::MIN; 3]] {
+    for size in [
+        BlockPos::new(1_000_000, 1_000_000, 1_000_000),
+        BlockPos::new(i32::MAX, i32::MAX, i32::MAX),
+        BlockPos::new(i32::MIN, i32::MIN, i32::MIN),
+    ] {
         let spec = RegionSpec {
             name: "main",
-            position: [0, 0, 0],
+            position: BlockPos::new(0, 0, 0),
             size,
             palette: vec![("minecraft:air", &[]), ("minecraft:stone", &[])],
             states: vec![5], // one long, far too short
@@ -361,8 +366,8 @@ fn huge_size_with_tiny_states_is_truncated() {
 fn empty_palette_with_volume_rejected() {
     let spec = RegionSpec {
         name: "main",
-        position: [0, 0, 0],
-        size: [2, 1, 1],
+        position: BlockPos::new(0, 0, 0),
+        size: BlockPos::new(2, 1, 1),
         palette: vec![],
         states: vec![0],
     };
@@ -376,8 +381,8 @@ fn empty_palette_with_volume_rejected() {
 fn missing_required_fields_rejected() {
     let spec = RegionSpec {
         name: "main",
-        position: [0, 0, 0],
-        size: [1, 1, 1],
+        position: BlockPos::new(0, 0, 0),
+        size: BlockPos::new(1, 1, 1),
         palette: vec![("minecraft:air", &[])],
         states: vec![0],
     };
@@ -502,8 +507,8 @@ fn deep_nesting_rejected() {
     let mut fields = standard_root_fields();
     let spec = RegionSpec {
         name: "main",
-        position: [0, 0, 0],
-        size: [1, 1, 1],
+        position: BlockPos::new(0, 0, 0),
+        size: BlockPos::new(1, 1, 1),
         palette: vec![("minecraft:air", &[])],
         states: vec![0],
     };
@@ -517,8 +522,8 @@ fn deep_nesting_rejected() {
 fn out_of_range_indices_yield_without_panic() {
     let spec = RegionSpec {
         name: "main",
-        position: [0, 0, 0],
-        size: [2, 1, 1],
+        position: BlockPos::new(0, 0, 0),
+        size: BlockPos::new(2, 1, 1),
         palette: vec![("minecraft:air", &[])], // palette len 1 -> nbits 2
         states: pack(&[3, 3], 2),              // index 3 >= palette len
     };
@@ -530,14 +535,16 @@ fn out_of_range_indices_yield_without_panic() {
     assert_eq!(stream, vec![3, 3]);
     // Bounds-checking is the caller's job.
     assert!(doc.regions[0].palette().get(3).is_none());
+    // The checked accessor treats the dangling index as absent.
+    assert_eq!(doc.regions[0].block_at(BlockPos::new(0, 0, 0)), None);
 }
 
 #[test]
 fn zero_volume_tolerates_empty_palette_and_states() {
     let spec = RegionSpec {
         name: "main",
-        position: [0, 0, 0],
-        size: [0, 3, 4],
+        position: BlockPos::new(0, 0, 0),
+        size: BlockPos::new(0, 3, 4),
         palette: vec![],
         states: vec![],
     };
@@ -548,7 +555,7 @@ fn zero_volume_tolerates_empty_palette_and_states() {
     assert_eq!(doc.regions[0].volume(), 0);
     assert_eq!(doc.regions[0].iter_blocks().count(), 0);
     assert_eq!(doc.total_volume(), 0);
-    assert_eq!(doc.enclosing_size(), Some([1, 3, 4]));
+    assert_eq!(doc.enclosing_size(), Some(BlockSize::new(1, 3, 4)));
 }
 
 #[test]
@@ -598,8 +605,8 @@ fn parse_error_messages_carry_offsets() {
             let mut fields = standard_root_fields();
             let spec = RegionSpec {
                 name: "main",
-                position: [0, 0, 0],
-                size: [1000, 1000, 1000],
+                position: BlockPos::new(0, 0, 0),
+                size: BlockPos::new(1000, 1000, 1000),
                 palette: vec![("minecraft:air", &[])],
                 states: vec![0],
             };

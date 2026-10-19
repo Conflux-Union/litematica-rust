@@ -1,18 +1,18 @@
 //! The Minecraft vocabulary a schematic is built from: where a block sits and
 //! what that block is.
 //!
-//! [`BlockState`] is the first half of the vocabulary: a namespaced block id
+//! [`BlockState`] is one half of that vocabulary: a namespaced block id
 //! together with its properties. It is cheap to clone and orders
 //! deterministically, which is what makes it usable as a palette key in both
 //! the writer and downstream layout combinators.
 //!
-//! Schematic code thinks in two quantities that happen to share one shape: a
-//! point in the world, and the span of a box. [`BlockPos`] gives both the same
-//! signed triple, so a value moves between the two roles without a conversion
-//! type, and a bounding box can be passed wherever a position is expected. The
-//! convention that keeps the roles readable is the origin anchor: extent
-//! operations measure from [`BlockPos::ORIGIN`], so a size is the corner
-//! opposite the origin rather than a free-floating vector.
+//! The other half is split by role. [`BlockPos`] is a point in the world, a
+//! signed coordinate on every axis; it answers "where". [`BlockSize`] is the
+//! span of a box, a non-negative cell count per axis; it answers "how much".
+//! A file declares both with the same signed triple, because a region may
+//! extend along a negative direction, so [`BlockSize::of`] is the single place
+//! where a declaration becomes a span. Keeping them apart means a position can
+//! never silently bound an index, and a span can never be mistaken for a point.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -49,23 +49,18 @@ impl BlockState {
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
-/// A Minecraft block coordinate, three signed components.
+/// A Minecraft block coordinate: a point in the world, signed per axis.
 ///
-/// Positions and sizes are deliberately the same type. A layout author can
-/// carry a value from a query into arithmetic and back without ceremony, and a
-/// schematic's bounding box can be handed to code that expects a position.
-/// Extent-oriented methods therefore document how they read the origin: a size
-/// is anchored at [`BlockPos::ORIGIN`], not a directionless vector.
-///
-/// Components are signed because Minecraft's coordinate space is signed and a
-/// region's declared size may run along a negative axis. The box queries pin
-/// down which combinations they accept, so invalid extents cannot silently
-/// masquerade as valid ones.
+/// This is the "where" of the vocabulary; the span of a box lives in
+/// [`BlockSize`] instead. Components are signed because Minecraft's coordinate
+/// space is signed and a region's declared size may run along a negative axis.
+/// The direction of that run is meaningful here, while [`BlockSize`] folds it
+/// away. A position therefore never acts as an index bound on its own.
 ///
 /// Arithmetic follows vector intuition: `+` and `-` are component-wise, `*` and
 /// `/` with an `i32` scale every axis, and `*` between two positions is the
-/// cross product. Use [`BlockPos::component_mul`] for the component-wise
-/// reading.
+/// cross product. [`BlockPos::min`], [`BlockPos::max`] and
+/// [`BlockPos::component_mul`] are the other, component-wise readings.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockPos {
     /// The horizontal axis, positive to the east.
@@ -79,32 +74,24 @@ pub struct BlockPos {
 impl BlockPos {
     /// The position at (0, 0, 0).
     ///
-    /// Every box extent is anchored here, so this constant is also the lower
-    /// corner shared by all sizes.
+    /// [`BlockSize`] anchors every box here, so this constant is also the
+    /// lower corner shared by all spans.
     pub const ORIGIN: Self = Self::new(0, 0, 0);
 
     /// Creates a position from its three components.
     ///
-    /// Any signed triple is accepted. Negative components are ordinary world
-    /// positions, and as an extent they describe a box that reaches into the
-    /// negative axes.
+    /// Any signed triple is a valid world position. When the value is meant as
+    /// the size a file declares, read it through [`BlockSize::of`] instead of
+    /// treating the position itself as a bound.
     pub const fn new(x: i32, y: i32, z: i32) -> Self {
         Self { x, y, z }
     }
 
-    /// Number of cells in the box between [`BlockPos::ORIGIN`] and `self`.
-    ///
-    /// Sign is ignored, so the result answers how many cells the span covers
-    /// even when it runs along a negative axis. A zero on any axis makes the
-    /// box empty.
-    pub const fn volume(&self) -> u32 {
-        self.x.unsigned_abs() * self.y.unsigned_abs() * self.z.unsigned_abs()
-    }
-
     /// A position with the absolute value of each component.
     ///
-    /// This is how a negative-direction extent becomes the size of the box it
-    /// spans: the result always lies in the positive octant.
+    /// The result always lies in the positive octant. This is a plain
+    /// coordinate operation, not the way to obtain a span; use
+    /// [`BlockSize::of`] to read a signed size as the box it covers.
     pub const fn abs(&self) -> Self {
         Self {
             x: self.x.abs(),
@@ -123,43 +110,10 @@ impl BlockPos {
         self.x * v.x + self.y * v.y + self.z * v.z
     }
 
-    /// Whether `pos` lies inside the box between [`BlockPos::ORIGIN`] and
-    /// `self`, with `self` treated as the box extent.
-    ///
-    /// The box is half-open: the origin is inside and the far corner is not.
-    /// Half-open bounds tile space cleanly — adjacent boxes of the same extent
-    /// neither overlap nor leave gaps — which is the convention every
-    /// coordinate walk in this crate shares.
-    pub const fn contains(&self, pos: Self) -> bool {
-        pos.x >= 0 && pos.x < self.x && pos.y >= 0 && pos.y < self.y && pos.z >= 0 && pos.z < self.z
-    }
-
-    /// Every position inside the box between [`BlockPos::ORIGIN`] and `self`,
-    /// in writing order: `x` fastest, then `z`, then `y`.
-    ///
-    /// The order is the one schematic storage uses, so a box can be walked
-    /// without maintaining a separate index-to-coordinate mapping. Items are
-    /// produced lazily, which keeps the helper usable for boxes far too large
-    /// to materialize.
-    ///
-    /// # Panics
-    ///
-    /// Panics if any component of `self` is negative, since such an extent
-    /// describes no box to enumerate.
-    pub fn cartesian_positions(self) -> impl Iterator<Item = Self> {
-        assert!(
-            self.x >= 0 && self.y >= 0 && self.z >= 0,
-            "box extent {self:?} has a negative component"
-        );
-        (0..self.y)
-            .flat_map(move |y| (0..self.z).map(move |z| (y, z)))
-            .flat_map(move |(y, z)| (0..self.x).map(move |x| Self::new(x, y, z)))
-    }
-
     /// Component-wise minimum of `self` and `other`.
     ///
-    /// Both roles support it: two boxes can be intersected corner by corner,
-    /// or two positions combined axis by axis, without unpacking the triple.
+    /// Two positions combine axis by axis without unpacking the triple; the
+    /// result is still a position.
     pub const fn min(self, other: Self) -> Self {
         Self {
             x: if self.x < other.x { self.x } else { other.x },
@@ -170,8 +124,7 @@ impl BlockPos {
 
     /// Component-wise maximum of `self` and `other`.
     ///
-    /// The natural companion to [`BlockPos::min`]: boxes are unioned by taking
-    /// the maximum corner and the minimum origin, again without unpacking the
+    /// The natural companion to [`BlockPos::min`], again without unpacking the
     /// triple.
     pub const fn max(self, other: Self) -> Self {
         Self {
@@ -184,8 +137,8 @@ impl BlockPos {
     /// Component-wise product of `self` and `other`.
     ///
     /// The `*` operator is the cross product, matching the geometry
-    /// convention; this method is the other reading, useful for scaling an
-    /// extent per axis.
+    /// convention; this method is the other reading, useful for scaling a
+    /// position per axis.
     pub const fn component_mul(self, other: Self) -> Self {
         Self {
             x: self.x * other.x,
@@ -303,45 +256,130 @@ impl Neg for BlockPos {
     }
 }
 
+// BlockSize
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
+/// The extent of a box: a non-negative cell count per axis.
+///
+/// A schematic declares sizes as signed triples, because a region may extend
+/// along a negative axis. What storage actually addresses is the box those
+/// signed values span, and every count in that box is non-negative. Making
+/// the distinction a type means a signed value cannot silently be used as an
+/// index bound, and a span cannot be misread as a world position.
+///
+/// The box is anchored at [`BlockPos::ORIGIN`] and half-open, the same
+/// convention every coordinate walk in this crate shares. Storage order is
+/// `x` fastest, then `z`, then `y`, matching the litematic bit stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockSize {
+    /// Number of cells along the x axis.
+    pub x: u32,
+    /// Number of cells along the y axis.
+    pub y: u32,
+    /// Number of cells along the z axis.
+    pub z: u32,
+}
+
+impl BlockSize {
+    /// Creates an extent from its three cell counts.
+    pub const fn new(x: u32, y: u32, z: u32) -> Self {
+        Self { x, y, z }
+    }
+
+    /// The extent of the box a signed size spans, sign folded away per axis.
+    ///
+    /// This is the bridge from a file's declared `Size` to the range storage
+    /// indexes: the direction a negative component describes is irrelevant
+    /// once the cell count is known.
+    pub const fn of(pos: BlockPos) -> Self {
+        Self {
+            x: pos.x.unsigned_abs(),
+            y: pos.y.unsigned_abs(),
+            z: pos.z.unsigned_abs(),
+        }
+    }
+
+    /// Number of cells in the box.
+    ///
+    /// The result is exact even for triples near `i32::MAX`, whose product
+    /// does not fit a `u64`; callers that need a smaller type must convert
+    /// explicitly and decide what overflow means for them.
+    pub const fn volume(self) -> u128 {
+        self.x as u128 * self.y as u128 * self.z as u128
+    }
+
+    /// Whether `pos` lies inside the box, half-open from the origin.
+    ///
+    /// The origin is inside and the far corner is not, so adjacent boxes of
+    /// the same extent neither overlap nor leave gaps. A negative component
+    /// is outside by construction.
+    pub const fn contains(self, pos: BlockPos) -> bool {
+        pos.x >= 0
+            && (pos.x as u32) < self.x
+            && pos.y >= 0
+            && (pos.y as u32) < self.y
+            && pos.z >= 0
+            && (pos.z as u32) < self.z
+    }
+
+    /// The storage index of `pos`, or `None` when it lies outside the box.
+    ///
+    /// The formula `(y * sz + z) * sx + x` is the litematic stream order.
+    pub const fn index_of(self, pos: BlockPos) -> Option<u64> {
+        if !self.contains(pos) {
+            return None;
+        }
+        let index =
+            (pos.y as u128 * self.z as u128 + pos.z as u128) * self.x as u128 + pos.x as u128;
+        if index > u64::MAX as u128 {
+            return None;
+        }
+        Some(index as u64)
+    }
+
+    /// The position stored at `index`, or `None` when the index is past the
+    /// last cell or any axis is empty. The inverse of [`BlockSize::index_of`].
+    pub const fn position_at(self, index: u64) -> Option<BlockPos> {
+        let (sx, sz) = (self.x as u64, self.z as u64);
+        if sx == 0 || sz == 0 {
+            return None;
+        }
+        let (x, rest) = (index % sx, index / sx);
+        let (y, z) = (rest / sz, rest % sz);
+        if y >= self.y as u64 {
+            return None;
+        }
+        Some(BlockPos::new(x as i32, y as i32, z as i32))
+    }
+
+    /// Every position in the box, in storage order: `x` fastest, then `z`,
+    /// then `y`. An empty axis yields no items. Items are produced lazily.
+    pub fn cartesian_positions(self) -> impl Iterator<Item = BlockPos> {
+        (0..self.y)
+            .flat_map(move |y| (0..self.z).map(move |z| (y, z)))
+            .flat_map(move |(y, z)| {
+                (0..self.x).map(move |x| BlockPos::new(x as i32, y as i32, z as i32))
+            })
+    }
+}
+
 // Tests
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
 #[cfg(test)]
 mod tests {
-    use super::BlockPos;
+    use super::{BlockPos, BlockSize};
 
     fn pos(x: i32, y: i32, z: i32) -> BlockPos {
         BlockPos::new(x, y, z)
     }
 
     #[test]
-    fn extent_methods_anchor_at_the_origin() {
-        let size = pos(2, 3, 4);
-        assert_eq!(size.volume(), 24);
+    fn position_is_a_signed_point() {
         assert_eq!(pos(-2, 3, -4).abs(), pos(2, 3, 4));
-        assert!(size.contains(pos(0, 0, 0)));
-        assert!(size.contains(pos(1, 2, 3)));
-        assert!(!size.contains(pos(2, 0, 0)));
-        assert!(!size.contains(pos(-1, 0, 0)));
         assert_eq!(format!("{:?}", pos(1, -2, 3)), "(1, -2, 3)");
-    }
-
-    #[test]
-    fn cartesian_positions_walk_x_fastest_then_z_then_y() {
-        let positions: Vec<BlockPos> = pos(2, 2, 2).cartesian_positions().collect();
-        assert_eq!(positions.len(), 8);
-        assert_eq!(positions[0], pos(0, 0, 0));
-        assert_eq!(positions[1], pos(1, 0, 0));
-        assert_eq!(positions[2], pos(0, 0, 1));
-        assert_eq!(positions[4], pos(0, 1, 0));
-        assert_eq!(BlockPos::ORIGIN.cartesian_positions().count(), 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "negative component")]
-    fn cartesian_positions_rejects_negative_extent() {
-        let _ = pos(-1, 2, 3).cartesian_positions();
     }
 
     #[test]
@@ -351,6 +389,33 @@ mod tests {
         assert_eq!(a.min(b), a);
         assert_eq!(a.max(b), b);
         assert_eq!(a.component_mul(b), pos(4, 10, 18));
+    }
+
+    #[test]
+    fn block_size_folds_sign_and_indexes_in_storage_order() {
+        let size = BlockSize::of(pos(-2, 3, -4));
+        assert_eq!(size.volume(), 24);
+        assert!(size.contains(pos(0, 0, 0)));
+        assert!(size.contains(pos(1, 2, 3)));
+        assert!(!size.contains(pos(2, 0, 0)));
+        assert!(!size.contains(pos(-1, 0, 0)));
+        assert_eq!(size.index_of(pos(1, 2, 3)), Some(1 + (2 * 4 + 3) * 2));
+        assert_eq!(size.index_of(pos(2, 0, 0)), None);
+        assert_eq!(size.position_at(23), Some(pos(1, 2, 3)));
+        assert_eq!(size.position_at(24), None);
+    }
+
+    #[test]
+    fn block_size_enumerates_x_fastest_then_z_then_y() {
+        let size = BlockSize::new(2, 2, 2);
+        let positions: Vec<BlockPos> = size.cartesian_positions().collect();
+        assert_eq!(positions.len(), 8);
+        assert_eq!(positions[0], pos(0, 0, 0));
+        assert_eq!(positions[1], pos(1, 0, 0));
+        assert_eq!(positions[2], pos(0, 0, 1));
+        assert_eq!(positions[4], pos(0, 1, 0));
+        assert_eq!(positions[7], pos(1, 1, 1));
+        assert_eq!(BlockSize::new(0, 2, 2).cartesian_positions().count(), 0);
     }
 
     #[test]

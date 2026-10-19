@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use litematica::mc::{BlockPos, BlockState};
+use litematica::mc::{BlockPos, BlockSize, BlockState};
 use litematica::write::{write, Layout, WriteOptions};
 use litematica::{decompress_gzip_with_limit, Document, Error};
 
@@ -54,7 +54,7 @@ struct Table {
 impl Table {
     /// Builds a table filled by `fill(pos)` returning a state index or AIR.
     fn filled(size: BlockPos, states: Vec<BlockState>, fill: impl Fn(BlockPos) -> u8) -> Self {
-        let mut grid = Vec::with_capacity(size.volume() as usize);
+        let mut grid = Vec::with_capacity(BlockSize::of(size).volume() as usize);
         for y in 0..size.y {
             for z in 0..size.z {
                 for x in 0..size.x {
@@ -71,8 +71,7 @@ impl Table {
     }
 
     fn voxel_index(&self, pos: BlockPos) -> usize {
-        let size = self.size;
-        ((pos.y * size.z + pos.z) * size.x + pos.x) as usize
+        BlockSize::of(self.size).index_of(pos).unwrap() as usize
     }
 }
 
@@ -160,6 +159,20 @@ fn assert_voxels_match(table: &Table, doc: &Document<'_>) {
         .collect();
     let got: Vec<u32> = region.iter_blocks().collect();
     assert_eq!(got, expect, "voxel stream");
+
+    // Random access must agree with the sequential stream entry by entry.
+    let positions = BlockSize::of(table.size).cartesian_positions();
+    for (i, pos) in positions.enumerate() {
+        assert_eq!(region.index_at(pos), Some(expect[i]), "index at {pos:?}");
+        assert_eq!(
+            read_view(region.block_at(pos).expect("in-bounds position")),
+            write_view(&expected_palette[expect[i] as usize]),
+            "state at {pos:?}"
+        );
+    }
+    let outside = BlockPos::new(table.size.x, 0, 0);
+    assert_eq!(region.index_at(outside), None);
+    assert_eq!(region.block_at(outside), None);
 }
 
 #[test]
@@ -201,13 +214,13 @@ fn round_trip_full_layout() {
     assert_eq!(m.total_blocks, Some(non_air));
     assert_eq!(m.time_created, 1_700_000_000_123);
     assert_eq!(m.time_modified, 1_700_000_000_456);
-    assert_eq!(m.enclosing_size, Some([5, 3, 7]));
+    assert_eq!(m.enclosing_size, Some(BlockPos::new(5, 3, 7)));
 
     assert_eq!(doc.regions.len(), 1);
     let region = &doc.regions[0];
     assert_eq!(region.name, "多区域 schematic ✓");
-    assert_eq!(region.position, [0, 0, 0]);
-    assert_eq!(region.size, [5, 3, 7]);
+    assert_eq!(region.position, BlockPos::new(0, 0, 0));
+    assert_eq!(region.size, BlockPos::new(5, 3, 7));
     assert_eq!(region.volume(), 105);
     let expected_palette = expected_file_palette(&table);
     let got: Vec<_> = region.palette().iter().map(read_view).collect();
@@ -279,7 +292,7 @@ fn round_trip_zero_axis_writes_empty_block_states() {
     assert_eq!(doc.metadata.total_blocks, Some(0));
     assert_eq!(doc.metadata.total_volume, Some(0));
     // `EnclosingSize` mirrors `Region.Size` verbatim, zero axes included.
-    assert_eq!(doc.metadata.enclosing_size, Some([4, 0, 2]));
+    assert_eq!(doc.metadata.enclosing_size, Some(BlockPos::new(4, 0, 2)));
 }
 
 #[test]

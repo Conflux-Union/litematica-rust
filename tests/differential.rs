@@ -12,6 +12,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use litematica::mc::{BlockPos as McBlockPos, BlockSize as McBlockSize};
 use litematica::{decompress_gzip_with_limit, Document};
 use mcdata::util::BlockPos;
 use mcdata::{GenericBlockEntity, GenericBlockState, GenericEntity};
@@ -132,7 +133,7 @@ fn assert_matches_oracle(schem: &Schematic) {
         Some(i64::from(oracle.total_volume()))
     );
     let enclosing = oracle.enclosing_size();
-    let enclosing = [enclosing.x, enclosing.y, enclosing.z];
+    let enclosing = McBlockPos::new(enclosing.x, enclosing.y, enclosing.z);
     assert_eq!(doc.metadata.enclosing_size, Some(enclosing));
 
     // Computed document values must match the oracle's formulas.
@@ -144,7 +145,14 @@ fn assert_matches_oracle(schem: &Schematic) {
             .map(|r| u64::from(r.size.volume()))
             .sum::<u64>()
     );
-    assert_eq!(doc.enclosing_size(), Some(enclosing));
+    assert_eq!(
+        doc.enclosing_size(),
+        Some(McBlockSize::new(
+            enclosing.x as u32,
+            enclosing.y as u32,
+            enclosing.z as u32
+        ))
+    );
 
     // Regions: same set of names, same layout, same palettes, same streams.
     assert_eq!(doc.regions.len(), oracle.regions.len());
@@ -159,12 +167,12 @@ fn assert_matches_oracle(schem: &Schematic) {
             .unwrap_or_else(|| panic!("region {name} missing in our parse"));
         assert_eq!(
             mregion.position,
-            [oregion.position.x, oregion.position.y, oregion.position.z],
+            McBlockPos::new(oregion.position.x, oregion.position.y, oregion.position.z),
             "position of {name}"
         );
         assert_eq!(
             mregion.size,
-            [oregion.size.x, oregion.size.y, oregion.size.z],
+            McBlockPos::new(oregion.size.x, oregion.size.y, oregion.size.z),
             "size of {name}"
         );
 
