@@ -197,7 +197,11 @@ fn assert_written_file_matches(table: &Table, options: &WriteOptions) {
     let size = table.size;
     let (sx, sy, sz) = (size.x, size.y, size.z);
     let volume = i64::from(sx) * i64::from(sy) * i64::from(sz);
-    assert_eq!(doc.metadata.total_volume, Some(volume), "total volume");
+    assert_eq!(
+        doc.metadata.total_volume,
+        Some(i32::try_from(volume).expect("volume fits an i32")),
+        "total volume"
+    );
     assert_eq!(doc.metadata.total_blocks, Some(non_air));
     // The oracle recomputes the bounding box and clamps zero axes to 1.
     let enclosing = oracle.enclosing_size();

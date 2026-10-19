@@ -1,6 +1,6 @@
 //! Error types for this crate.
 
-use crate::knowledge::mc::{BlockPos, BlockState};
+use crate::knowledge::mc::{BlockPos, BlockSize, BlockState};
 use std::fmt;
 use std::io;
 
@@ -23,12 +23,24 @@ pub enum Error {
         limit: u64,
     },
 
-    /// The gzip stream is corrupt or truncated. The underlying I/O error is
-    /// preserved as the source.
+    /// An I/O operation on the caller's reader, writer, or file failed.
+    ///
+    /// This is deliberately distinct from [`Error::CorruptGzip`]: a missing
+    /// file or a broken pipe is not evidence that the litematic data is bad.
+    #[error("I/O error: {source}")]
+    Io {
+        /// The wrapped I/O error.
+        #[from]
+        source: io::Error,
+    },
+
+    /// The gzip stream is corrupt or truncated.
+    ///
+    /// Only the decompressor produces this variant. Use [`Error::Io`] for
+    /// failures reported by the caller's own stream.
     #[error("corrupt gzip stream: {source}")]
     CorruptGzip {
         /// The wrapped I/O error.
-        #[from]
         source: io::Error,
     },
 
@@ -84,6 +96,18 @@ pub enum Error {
         offset: usize,
     },
 
+    /// A member that the litematic schema allows at most once appeared again.
+    ///
+    /// This covers both root-level fields such as `Regions` and duplicate
+    /// region names, so every reader applies the same map semantics.
+    #[error("duplicate field `{field}` at byte offset {offset}")]
+    DuplicateField {
+        /// The repeated name.
+        field: String,
+        /// Byte offset of the repeated member.
+        offset: usize,
+    },
+
     /// The `BlockStates` payload is shorter than required by the region volume
     /// and palette width.
     #[error(
@@ -114,14 +138,6 @@ pub enum Error {
         offset: usize,
     },
 
-    /// Serializing the schematic to the output stream failed. The underlying
-    /// I/O error is preserved as the source.
-    #[error("writing schematic output failed: {source}")]
-    WriteIo {
-        /// The wrapped I/O error.
-        source: io::Error,
-    },
-
     /// A `Layout::block_at` result is not covered by the layout's declared
     /// palette.
     #[error(
@@ -144,6 +160,24 @@ pub enum Error {
         quantity: Quantity,
         /// The overflowing value.
         value: u128,
+    },
+
+    /// A layout's stored span and its signed declaration disagree.
+    ///
+    /// [`crate::task::writer::Layout::declared_size`] may preserve a signed
+    /// file size, but folding its sign must reproduce
+    /// [`crate::task::writer::Layout::size`]; otherwise the writer would pack
+    /// a different box from the one it declares.
+    #[error(
+        "layout declared size {declared:?} spans {span:?}, which disagrees with size() {size:?}"
+    )]
+    LayoutExtentMismatch {
+        /// The signed size the layout declared.
+        declared: BlockPos,
+        /// The span obtained by folding the declaration's signs.
+        span: BlockSize,
+        /// The span the layout reports for its voxels.
+        size: BlockSize,
     },
 
     /// A string value exceeds the u16 byte-length limit of the NBT format.

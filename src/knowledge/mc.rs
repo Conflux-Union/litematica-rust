@@ -356,6 +356,18 @@ impl BlockSize {
         }
     }
 
+    /// The non-negative signed triple that declares this span in a file, or
+    /// the first axis count that does not fit an `i32`.
+    ///
+    /// A litematic `Size` is signed, while a [`BlockSize`] is always a count.
+    /// This is the only bridge in that direction: callers that write a size
+    /// either accept the result or report the returned axis through their own
+    /// error vocabulary.
+    pub fn to_declared(self) -> std::result::Result<BlockPos, u32> {
+        let axis = |value: u32| i32::try_from(value).map_err(|_| value);
+        Ok(BlockPos::new(axis(self.x)?, axis(self.y)?, axis(self.z)?))
+    }
+
     /// Number of cells in the box.
     ///
     /// The result is exact even for triples near `i32::MAX`, whose product
@@ -379,9 +391,12 @@ impl BlockSize {
             && (pos.z as u32) < self.z
     }
 
-    /// The storage index of `pos`, or `None` when it lies outside the box.
+    /// The storage index of `pos`, or `None` when it lies outside the box or
+    /// the index does not fit a `u64`.
     ///
-    /// The formula `(y * sz + z) * sx + x` is the litematic stream order.
+    /// The formula `(y * sz + z) * sx + x` is the litematic stream order. The
+    /// overflow case needs a box whose cell count exceeds `u64`, far beyond
+    /// any addressable file; it is reported rather than wrapped.
     pub const fn index_of(self, pos: BlockPos) -> Option<u64> {
         if !self.contains(pos) {
             return None;
@@ -395,8 +410,9 @@ impl BlockSize {
     }
 
     /// The position stored at `index`, or `None` when the index is past the
-    /// last cell or any axis is empty. The inverse of [`BlockSize::index_of`].
-    pub const fn position_at(self, index: u64) -> Option<BlockPos> {
+    /// last cell, any axis is empty, or a coordinate does not fit a
+    /// [`BlockPos`]. The inverse of [`BlockSize::index_of`].
+    pub fn position_at(self, index: u64) -> Option<BlockPos> {
         let (sx, sz) = (self.x as u64, self.z as u64);
         if sx == 0 || sz == 0 {
             return None;
@@ -406,53 +422,79 @@ impl BlockSize {
         if y >= self.y as u64 {
             return None;
         }
-        Some(BlockPos::new(x as i32, y as i32, z as i32))
+        Some(BlockPos::new(
+            i32::try_from(x).ok()?,
+            i32::try_from(y).ok()?,
+            i32::try_from(z).ok()?,
+        ))
     }
 
     /// Every position in the box, in storage order: `x` fastest, then `z`,
     /// then `y`. An empty axis yields no items.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an axis exceeds `i32::MAX + 1`, the largest cell count whose
+    /// coordinates still fit a [`BlockPos`]. Writing such a span is rejected
+    /// earlier by [`BlockSize::to_declared`]; enumeration cannot name its
+    /// positions.
     pub fn cartesian_positions(self) -> PositionIter {
-        let end = u64::try_from(self.volume()).unwrap_or(u64::MAX);
+        let max = i32::MAX as u32 + 1;
+        assert!(
+            self.x <= max && self.y <= max && self.z <= max,
+            "extent {self:?} exceeds the coordinates a BlockPos can name"
+        );
         PositionIter {
             size: self,
-            next: 0,
-            end,
+            x: 0,
+            y: 0,
+            z: 0,
+            remaining: self.volume(),
         }
     }
 }
 
 /// A lazy walk over the positions of a [`BlockSize`] in storage order.
 ///
-/// The iterator carries only the size and a cursor, so walking a huge box
-/// costs the same as walking a small one.
+/// The iterator carries the size and three coordinates, so advancing costs a
+/// few increments rather than a division per voxel. The count is kept as
+/// `u128`: a box may contain more cells than `usize`, and the walk still has
+/// to end at the right place.
 #[derive(Debug, Clone)]
 pub struct PositionIter {
     size: BlockSize,
-    next: u64,
-    end: u64,
+    x: u32,
+    y: u32,
+    z: u32,
+    remaining: u128,
 }
 
 impl Iterator for PositionIter {
     type Item = BlockPos;
 
     fn next(&mut self) -> Option<BlockPos> {
-        if self.next >= self.end {
+        if self.remaining == 0 {
             return None;
         }
-        let pos = self.size.position_at(self.next)?;
-        self.next += 1;
+        let pos = BlockPos::new(self.x as i32, self.y as i32, self.z as i32);
+        self.remaining -= 1;
+        self.x += 1;
+        if self.x == self.size.x {
+            self.x = 0;
+            self.z += 1;
+            if self.z == self.size.z {
+                self.z = 0;
+                self.y += 1;
+            }
+        }
         Some(pos)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.len();
-        (len, Some(len))
-    }
-}
-
-impl ExactSizeIterator for PositionIter {
-    fn len(&self) -> usize {
-        usize::try_from(self.end - self.next).unwrap_or(usize::MAX)
+        match usize::try_from(self.remaining) {
+            Ok(len) => (len, Some(len)),
+            Err(_) => (usize::MAX, None),
+        }
     }
 }
 
@@ -490,6 +532,15 @@ mod tests {
         assert_eq!(size.index_of(pos(2, 0, 0)), None);
         assert_eq!(size.position_at(23), Some(pos(1, 2, 3)));
         assert_eq!(size.position_at(24), None);
+
+        // The largest addressable axis has exactly `i32::MAX + 1` cells; the
+        // last one is still a valid position, and nothing follows it.
+        let widest = BlockSize::new(i32::MAX as u32 + 1, 1, 1);
+        assert_eq!(
+            widest.position_at(i32::MAX as u64),
+            Some(pos(i32::MAX, 0, 0))
+        );
+        assert_eq!(widest.position_at(i32::MAX as u64 + 1), None);
     }
 
     #[test]

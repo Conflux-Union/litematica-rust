@@ -54,8 +54,15 @@ pub mod document {
         /// Region count claimed by the file (`Metadata.RegionCount`).
         pub region_count: Option<i32>,
         /// Total volume claimed by the file (`Metadata.TotalVolume`).
-        pub total_volume: Option<i64>,
+        ///
+        /// The field is an NBT `Int`, so the value keeps that width; use
+        /// [`Document::volume`] for the voxel count the regions actually
+        /// contain.
+        pub total_volume: Option<i32>,
         /// Non-air block count claimed by the file (`Metadata.TotalBlocks`).
+        ///
+        /// Readers accept both the `Int` Litematica writes and the `Long`
+        /// rustmatica writes, so the value is widened to `i64`.
         pub total_blocks: Option<i64>,
         /// Creation time in milliseconds since the Unix epoch
         /// (`Metadata.TimeCreated`).

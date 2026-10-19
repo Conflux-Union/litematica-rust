@@ -163,7 +163,8 @@ impl Geometry {
 /// behaves identically.
 #[derive(Clone)]
 pub struct Region<'a> {
-    /// Name of the region, unique within a schematic.
+    /// Name of the region. Readers reject a schematic that repeats a name,
+    /// because `Regions` is a map.
     pub name: String,
     /// Position of the region in schematic coordinates.
     pub position: BlockPos,

@@ -81,9 +81,13 @@ impl<'a> BitStream<'a> {
         PaletteIdIter::new(self, volume)
     }
 
-    /// Entry `index`, or `None` when the payload does not reach it.
+    /// Entry `index`, or `None` when the payload does not contain every bit
+    /// of it. A partial trailing entry is absent, never zero-filled.
     pub(crate) fn entry(&self, index: u64) -> Option<PaletteId> {
         let bit = u128::from(index) * u128::from(self.width.bits());
+        if bit + u128::from(self.width.bits()) > self.byte_len() as u128 * 8 {
+            return None;
+        }
         let long = usize::try_from(bit / 64).ok()?;
         let shift = (bit % 64) as u32;
         let first = self.long(long)?;
@@ -95,7 +99,7 @@ impl<'a> BitStream<'a> {
         Some(cursor.next(self.width, &mut source))
     }
 
-    /// The `index`th long, zero-filled when the payload is shorter.
+    /// The `index`th long, or `None` when the payload ends before it.
     fn long(&self, index: usize) -> Option<u64> {
         let start = index.checked_mul(8)?;
         let word = self.payload.as_slice().get(start..start + 8)?;
@@ -234,15 +238,10 @@ impl Iterator for PaletteIdIter<'_> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.len();
-        (n, Some(n))
-    }
-}
-
-impl ExactSizeIterator for PaletteIdIter<'_> {
-    #[inline]
-    fn len(&self) -> usize {
-        usize::try_from(self.remaining).unwrap_or(usize::MAX)
+        match usize::try_from(self.remaining) {
+            Ok(n) => (n, Some(n)),
+            Err(_) => (usize::MAX, None),
+        }
     }
 }
 
@@ -273,8 +272,12 @@ impl Packer {
     }
 
     /// Packs one palette index, returning a completed long when one fills.
+    ///
+    /// The identifier must fit this packer's width; the writer obtains it from
+    /// the same palette that supplied the width.
     #[inline]
     pub(crate) fn push(&mut self, id: u32) -> Option<u64> {
+        debug_assert!(u64::from(id) <= self.width.mask(), "id {id} does not fit");
         self.acc |= u128::from(id) << self.have;
         self.have += self.width.bits();
         if self.have >= 64 {
@@ -326,7 +329,7 @@ mod tests {
             BitStream::new(Payload::borrowed(&bytes), width),
             values.len() as u64,
         );
-        assert_eq!(iter.len(), values.len());
+        assert_eq!(iter.size_hint(), (values.len(), Some(values.len())));
         let decoded: Vec<u32> = iter.collect();
         assert_eq!(decoded, values);
     }
@@ -358,6 +361,15 @@ mod tests {
     }
 
     #[test]
+    fn entry_rejects_a_partial_trailing_entry() {
+        let width = BitsPerEntry::of_len(1000); // 10 bits per entry
+        let word = [0u8; 8];
+        let stream = BitStream::new(Payload::borrowed(&word), width);
+        assert_eq!(stream.entry(5), Some(0), "entry 5 ends at bit 60");
+        assert_eq!(stream.entry(6), None, "entry 6 needs bits past the payload");
+    }
+
+    #[test]
     fn packer_exact_multiple_flushes_no_tail() {
         let mut packer = Packer::new(BitsPerEntry::of_len(3));
         let mut longs = Vec::new();
@@ -373,7 +385,7 @@ mod tests {
     #[test]
     fn iter_zero_volume_is_empty() {
         let mut iter = BitStream::new(Payload::borrowed(&[]), BitsPerEntry::of_len(0)).iter(0);
-        assert_eq!(iter.len(), 0);
+        assert_eq!(iter.size_hint().0, 0);
         assert!(iter.next().is_none());
     }
 
