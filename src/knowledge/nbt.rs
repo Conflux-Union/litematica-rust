@@ -11,10 +11,9 @@
 //! bytes. An id read from a file is validated once, at [`Tag::from_id`], and
 //! from then on every comparison and dispatch is spelled by name.
 
+use crate::error::{Error, Result};
 use std::io::Read as IoRead;
 use std::io::Write as IoWrite;
-
-use crate::error::{Error, Result};
 
 /// Maximum NBT nesting depth accepted by [`Reader::skip_value`].
 pub(crate) const MAX_DEPTH: usize = 64;
@@ -542,10 +541,16 @@ impl<R: IoRead> IoSource<R> {
 }
 
 /// Maps an I/O failure to the NBT-level error that describes it.
+///
+/// The source sits behind a gzip decoder, so the error can describe either the
+/// compressed stream or the caller's underlying reader. Invalid data is the
+/// decoder's report of a corrupt member; any other kind is handed back as
+/// caller I/O instead of being blamed on the file.
 fn map_io(error: std::io::Error, offset: usize) -> Error {
     match error.kind() {
         std::io::ErrorKind::UnexpectedEof => Error::UnexpectedEof { offset },
-        _ => Error::CorruptGzip { source: error },
+        std::io::ErrorKind::InvalidData => Error::CorruptGzip { source: error },
+        _ => Error::Io { source: error },
     }
 }
 
@@ -769,11 +774,11 @@ impl<W: IoWrite> Writer<W> {
         Self { out }
     }
 
-    /// Writes all bytes, mapping sink failures to [`Error::WriteIo`].
+    /// Writes all bytes, mapping sink failures to [`Error::Io`].
     fn put(&mut self, bytes: &[u8]) -> Result<()> {
         self.out
             .write_all(bytes)
-            .map_err(|source| Error::WriteIo { source })
+            .map_err(|source| Error::Io { source })
     }
 
     /// Writes one tag id byte.
@@ -804,7 +809,11 @@ impl<W: IoWrite> Writer<W> {
     }
 
     /// Writes a list payload header: its element tag and element count.
+    ///
+    /// A negative count is not representable; callers validate the length of
+    /// the collection they are about to write.
     pub(crate) fn list(&mut self, element: Tag, len: i32) -> Result<()> {
+        debug_assert!(len >= 0, "negative list length {len}");
         self.tag_id(element)?;
         self.put_i32(len)
     }
@@ -840,10 +849,17 @@ impl<W: IoWrite> Writer<W> {
     where
         I: IntoIterator<Item = Result<i64>>,
     {
+        debug_assert!(len >= 0, "negative long-array length {len}");
         self.put_i32(len)?;
+        let mut written = 0i32;
         for word in words {
             self.put_i64(word?)?;
+            written += 1;
         }
+        debug_assert_eq!(
+            written, len,
+            "long-array length prefix disagrees with words"
+        );
         Ok(())
     }
 

@@ -20,15 +20,14 @@
 //! geometry validation, and bit-level cursor, so they agree on every decoded
 //! value; only the storage strategy differs.
 
-use std::io::{BufReader, Read};
-
-use flate2::read::GzDecoder;
-
 use crate::error::{Error, Result};
 use crate::knowledge::nbt::{FieldOutcome, IoSource, Reader as NbtReader, Slot, Source, Tag};
 use crate::model::document::Metadata;
 use crate::model::region::{Region, RegionHeader, RegionParts};
 use crate::model::schema::RootFields;
+use flate2::read::GzDecoder;
+use std::collections::HashSet;
+use std::io::{BufReader, Read};
 
 /// A buffered gzip stream, the byte source a [`Reader`] consumes.
 type GzipSource<R> = IoSource<BufReader<GzDecoder<R>>>;
@@ -49,6 +48,7 @@ pub struct Reader<R: Read> {
     root_depth: usize,
     regions_depth: usize,
     header: RootFields,
+    seen: HashSet<String>,
     done: bool,
 }
 
@@ -83,17 +83,19 @@ impl<R: Read> Reader<R> {
             root_depth,
             regions_depth: 0,
             header: RootFields::new(),
+            seen: HashSet::new(),
             done: false,
         };
         stream.scan_to_regions()?;
         Ok(stream)
     }
 
-    /// The header as declared by the file, once its `Metadata` compound has
-    /// been scanned.
+    /// The header as declared by the file, once `Metadata`,
+    /// `MinecraftDataVersion`, and `Version` have all been scanned.
     ///
-    /// Files may place `Metadata` before or after `Regions`; when it trails
-    /// the regions, this returns `None` until the stream is exhausted.
+    /// Files may place those fields before or after `Regions`; when any of
+    /// them trails the regions, this returns `None` until the stream is
+    /// exhausted. A partial header is never reported with defaulted versions.
     pub fn metadata(&self) -> Option<&Metadata> {
         self.header.metadata()
     }
@@ -106,6 +108,15 @@ impl<R: Read> Reader<R> {
     /// the end of `Regions`, the remaining root fields are scanned so that a
     /// trailing `Metadata` is still collected.
     pub fn next_region(&mut self) -> Result<Option<Region<'static>>> {
+        let outcome = self.read_next_region();
+        if outcome.is_err() {
+            self.done = true;
+        }
+        outcome
+    }
+
+    /// The body of [`Reader::next_region`], with no error-state side effects.
+    fn read_next_region(&mut self) -> Result<Option<Region<'static>>> {
         if self.done {
             return Ok(None);
         }
@@ -114,6 +125,13 @@ impl<R: Read> Reader<R> {
             self.done = true;
             return Ok(None);
         };
+        let offset = self.reader.pos();
+        if !self.seen.insert(name.clone()) {
+            return Err(Error::DuplicateField {
+                field: name,
+                offset,
+            });
+        }
         self.reader.expect("region", tag, Tag::Compound)?;
         let region_depth = self.reader.nested(self.regions_depth)?;
         self.read_region(name, region_depth).map(Some)
@@ -165,10 +183,15 @@ impl<R: Read> Reader<R> {
     fn finish_root(&mut self) -> Result<()> {
         loop {
             match self.read_root_field()? {
-                None => return Ok(()),
+                None => {
+                    self.header.ensure_complete(self.reader.pos())?;
+                    return Ok(());
+                }
                 Some(FieldOutcome::Deferred) => {
-                    // A duplicate `Regions` is not part of the schema; skip it.
-                    self.reader.skip_value(Tag::Compound, self.root_depth)?;
+                    return Err(Error::DuplicateField {
+                        field: "Regions".into(),
+                        offset: self.reader.pos(),
+                    });
                 }
                 Some(FieldOutcome::Value) => {}
             }
@@ -196,11 +219,7 @@ impl<R: Read> Iterator for Reader<R> {
     /// `Metadata` has been scanned and is available through
     /// [`Reader::metadata`].
     fn next(&mut self) -> Option<Self::Item> {
-        let region = self.next_region();
-        if region.is_err() {
-            self.done = true;
-        }
-        region.transpose()
+        self.next_region().transpose()
     }
 }
 

@@ -7,26 +7,42 @@
 //! `BitStream` and `Packer` implement the two directions. Keeping both
 //! directions here means the word layout is stated once, next to itself.
 
+use crate::model::palette::{BitsPerEntry, PaletteId};
 use std::sync::Arc;
-
-use crate::model::palette::PaletteId;
 
 // Unpacking
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
-/// The bytes behind a [`BitStream`].
+/// The packed `BlockStates` bytes behind a [`BitStream`].
 ///
 /// The random-access reader borrows the decompressed file; the streaming
 /// reader owns the one region payload it is decoding. `Arc` keeps a clone of
 /// the owning form cheap, so an iterator never copies the payload.
 #[derive(Debug, Clone)]
-enum Bytes<'a> {
+pub(crate) enum Payload<'a> {
+    /// Bytes borrowed from a buffer that outlives the region.
     Borrowed(&'a [u8]),
+    /// Bytes owned by the region that decodes them.
     Owned(Arc<[u8]>),
 }
 
-impl Bytes<'_> {
+impl<'a> Payload<'a> {
+    /// Borrows a payload from a buffer the caller keeps alive.
+    pub(crate) fn borrowed(bytes: &'a [u8]) -> Self {
+        Self::Borrowed(bytes)
+    }
+
+    /// Takes ownership of a payload.
+    pub(crate) fn owned(bytes: Vec<u8>) -> Self {
+        Self::Owned(Arc::from(bytes))
+    }
+
+    /// Number of payload bytes.
+    pub(crate) fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
     fn as_slice(&self) -> &[u8] {
         match self {
             Self::Borrowed(bytes) => bytes,
@@ -35,7 +51,7 @@ impl Bytes<'_> {
     }
 }
 
-impl AsRef<[u8]> for Bytes<'_> {
+impl AsRef<[u8]> for Payload<'_> {
     fn as_ref(&self) -> &[u8] {
         self.as_slice()
     }
@@ -50,36 +66,14 @@ impl AsRef<[u8]> for Bytes<'_> {
 /// stream is stated once.
 #[derive(Debug, Clone)]
 pub(crate) struct BitStream<'a> {
-    bytes: Bytes<'a>,
-    bits: u32,
-    mask: u64,
+    payload: Payload<'a>,
+    width: BitsPerEntry,
 }
 
 impl<'a> BitStream<'a> {
-    /// Views `bytes` borrowed from the file as `bits`-wide entries.
-    pub(crate) fn borrowed(bytes: &'a [u8], bits: u32) -> Self {
-        Self::with_bytes(Bytes::Borrowed(bytes), bits)
-    }
-
-    /// Takes ownership of a region payload and views it as `bits`-wide
-    /// entries.
-    pub(crate) fn owned(bytes: Vec<u8>, bits: u32) -> Self {
-        Self::with_bytes(Bytes::Owned(Arc::from(bytes)), bits)
-    }
-
-    /// Sets the width once the palette that defines it has been read.
-    pub(crate) fn with_bits(mut self, bits: u32) -> Self {
-        self.bits = bits;
-        self.mask = (1u64 << bits) - 1;
-        self
-    }
-
-    fn with_bytes(bytes: Bytes<'a>, bits: u32) -> Self {
-        Self {
-            bytes,
-            bits,
-            mask: (1u64 << bits) - 1,
-        }
+    /// Views `payload` as entries of `width` bits.
+    pub(crate) fn new(payload: Payload<'a>, width: BitsPerEntry) -> Self {
+        Self { payload, width }
     }
 
     /// Iterates over `volume` entries in storage order.
@@ -87,30 +81,34 @@ impl<'a> BitStream<'a> {
         PaletteIdIter::new(self, volume)
     }
 
-    /// Entry `index`, or `None` when the payload does not reach it.
+    /// Entry `index`, or `None` when the payload does not contain every bit
+    /// of it. A partial trailing entry is absent, never zero-filled.
     pub(crate) fn entry(&self, index: u64) -> Option<PaletteId> {
-        let bit = u128::from(index) * u128::from(self.bits);
+        let bit = u128::from(index) * u128::from(self.width.bits());
+        if bit + u128::from(self.width.bits()) > self.byte_len() as u128 * 8 {
+            return None;
+        }
         let long = usize::try_from(bit / 64).ok()?;
         let shift = (bit % 64) as u32;
         let first = self.long(long)?;
         let mut source = Longs {
-            bytes: self.bytes.as_slice(),
+            bytes: self.payload.as_slice(),
             next: long + 1,
         };
         let mut cursor = BitCursor::with_remainder(first >> shift, 64 - shift);
-        Some(cursor.next(self.bits, self.mask, &mut source))
+        Some(cursor.next(self.width, &mut source))
     }
 
-    /// The `index`th long, zero-filled when the payload is shorter.
+    /// The `index`th long, or `None` when the payload ends before it.
     fn long(&self, index: usize) -> Option<u64> {
         let start = index.checked_mul(8)?;
-        let word = self.bytes.as_slice().get(start..start + 8)?;
+        let word = self.payload.as_slice().get(start..start + 8)?;
         Some(u64::from_be_bytes(word.try_into().ok()?))
     }
 
     /// Number of payload bytes this stream windows, longs only.
     pub(crate) fn byte_len(&self) -> usize {
-        self.bytes.as_slice().len() / 8 * 8
+        self.payload.len() / 8 * 8
     }
 }
 
@@ -146,7 +144,8 @@ impl BitCursor {
 
     /// Decodes one entry, pulling words from `source` as needed.
     #[inline]
-    pub(crate) fn next(&mut self, bits: u32, mask: u64, source: &mut impl LongSource) -> PaletteId {
+    pub(crate) fn next(&mut self, width: BitsPerEntry, source: &mut impl LongSource) -> PaletteId {
+        let (bits, mask) = (width.bits(), width.mask());
         if self.cur_bits >= bits {
             // Fast path: enough buffered bits for this entry.
             let value = (self.cur & mask) as PaletteId;
@@ -206,9 +205,8 @@ impl<B: AsRef<[u8]>> LongSource for Longs<B> {
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct PaletteIdIter<'a> {
     cursor: BitCursor,
-    source: Longs<Bytes<'a>>,
-    bits: u32,
-    mask: u64,
+    source: Longs<Payload<'a>>,
+    width: BitsPerEntry,
     remaining: u64,
 }
 
@@ -217,11 +215,10 @@ impl<'a> PaletteIdIter<'a> {
         Self {
             cursor: BitCursor::new(),
             source: Longs {
-                bytes: stream.bytes,
+                bytes: stream.payload,
                 next: 0,
             },
-            bits: stream.bits,
-            mask: stream.mask,
+            width: stream.width,
             remaining: volume,
         }
     }
@@ -236,20 +233,15 @@ impl Iterator for PaletteIdIter<'_> {
             return None;
         }
         self.remaining -= 1;
-        Some(self.cursor.next(self.bits, self.mask, &mut self.source))
+        Some(self.cursor.next(self.width, &mut self.source))
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.len();
-        (n, Some(n))
-    }
-}
-
-impl ExactSizeIterator for PaletteIdIter<'_> {
-    #[inline]
-    fn len(&self) -> usize {
-        usize::try_from(self.remaining).unwrap_or(usize::MAX)
+        match usize::try_from(self.remaining) {
+            Ok(n) => (n, Some(n)),
+            Err(_) => (usize::MAX, None),
+        }
     }
 }
 
@@ -266,24 +258,28 @@ impl ExactSizeIterator for PaletteIdIter<'_> {
 pub(crate) struct Packer {
     acc: u128,
     have: u32,
-    bits: u32,
+    width: BitsPerEntry,
 }
 
 impl Packer {
-    /// Creates a packer emitting `bits`-wide entries.
-    pub(crate) fn new(bits: u32) -> Self {
+    /// Creates a packer emitting entries of `width` bits.
+    pub(crate) fn new(width: BitsPerEntry) -> Self {
         Self {
             acc: 0,
             have: 0,
-            bits,
+            width,
         }
     }
 
     /// Packs one palette index, returning a completed long when one fills.
+    ///
+    /// The identifier must fit this packer's width; the writer obtains it from
+    /// the same palette that supplied the width.
     #[inline]
     pub(crate) fn push(&mut self, id: u32) -> Option<u64> {
+        debug_assert!(u64::from(id) <= self.width.mask(), "id {id} does not fit");
         self.acc |= u128::from(id) << self.have;
-        self.have += self.bits;
+        self.have += self.width.bits();
         if self.have >= 64 {
             let word = self.acc as u64;
             self.acc >>= 64;
@@ -312,8 +308,8 @@ impl Packer {
 
 #[cfg(test)]
 mod tests {
-    use super::{BitStream, Packer, PaletteIdIter};
-    use crate::model::palette::PaletteId;
+    use super::{BitStream, Packer, PaletteIdIter, Payload};
+    use crate::model::palette::{BitsPerEntry, PaletteId};
 
     #[test]
     fn iter_decodes_lsb_first_stream() {
@@ -328,8 +324,12 @@ mod tests {
             }
         }
         let bytes = acc.to_be_bytes();
-        let iter = PaletteIdIter::new(BitStream::borrowed(&bytes, 3), values.len() as u64);
-        assert_eq!(iter.len(), values.len());
+        let width = BitsPerEntry::of_len(values.len());
+        let iter = PaletteIdIter::new(
+            BitStream::new(Payload::borrowed(&bytes), width),
+            values.len() as u64,
+        );
+        assert_eq!(iter.size_hint(), (values.len(), Some(values.len())));
         let decoded: Vec<u32> = iter.collect();
         assert_eq!(decoded, values);
     }
@@ -338,17 +338,22 @@ mod tests {
     fn iter_entries_crossing_long_boundaries() {
         // 5 bits per entry, 20 entries -> 100 bits, crossing 64-bit borders.
         let values: Vec<u32> = (0..20).map(|i| (i * 7 + 3) % 32).collect();
-        let bytes = pack(&values, 5);
-        let decoded: Vec<PaletteId> =
-            PaletteIdIter::new(BitStream::borrowed(&bytes, 5), values.len() as u64).collect();
+        let width = BitsPerEntry::of_len(values.len());
+        let bytes = pack(&values, width);
+        let decoded: Vec<PaletteId> = PaletteIdIter::new(
+            BitStream::new(Payload::borrowed(&bytes), width),
+            values.len() as u64,
+        )
+        .collect();
         assert_eq!(decoded, values);
     }
 
     #[test]
     fn random_entries_match_the_sequential_stream() {
         let values: Vec<u32> = (0..20).map(|i| (i * 7 + 3) % 32).collect();
-        let bytes = pack(&values, 5);
-        let stream = BitStream::borrowed(&bytes, 5);
+        let width = BitsPerEntry::of_len(values.len());
+        let bytes = pack(&values, width);
+        let stream = BitStream::new(Payload::borrowed(&bytes), width);
         for (i, &want) in values.iter().enumerate() {
             assert_eq!(stream.entry(i as u64), Some(want), "entry {i}");
         }
@@ -356,8 +361,17 @@ mod tests {
     }
 
     #[test]
+    fn entry_rejects_a_partial_trailing_entry() {
+        let width = BitsPerEntry::of_len(1000); // 10 bits per entry
+        let word = [0u8; 8];
+        let stream = BitStream::new(Payload::borrowed(&word), width);
+        assert_eq!(stream.entry(5), Some(0), "entry 5 ends at bit 60");
+        assert_eq!(stream.entry(6), None, "entry 6 needs bits past the payload");
+    }
+
+    #[test]
     fn packer_exact_multiple_flushes_no_tail() {
-        let mut packer = Packer::new(2);
+        let mut packer = Packer::new(BitsPerEntry::of_len(3));
         let mut longs = Vec::new();
         for _ in 0..32 {
             if let Some(word) = packer.push(3) {
@@ -370,14 +384,14 @@ mod tests {
 
     #[test]
     fn iter_zero_volume_is_empty() {
-        let mut iter = BitStream::borrowed(&[], 2).iter(0);
-        assert_eq!(iter.len(), 0);
+        let mut iter = BitStream::new(Payload::borrowed(&[]), BitsPerEntry::of_len(0)).iter(0);
+        assert_eq!(iter.size_hint().0, 0);
         assert!(iter.next().is_none());
     }
 
-    /// Packs `values` with `bits`-wide entries into big-endian bytes.
-    fn pack(values: &[u32], bits: u32) -> Vec<u8> {
-        let mut packer = Packer::new(bits);
+    /// Packs `values` with entries of `width` bits into big-endian bytes.
+    fn pack(values: &[u32], width: BitsPerEntry) -> Vec<u8> {
+        let mut packer = Packer::new(width);
         let mut bytes = Vec::new();
         for &value in values {
             if let Some(word) = packer.push(value) {

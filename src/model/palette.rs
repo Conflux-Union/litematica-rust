@@ -4,10 +4,14 @@
 //! A schematic has two readings of the same data: as a file it names blocks,
 //! and as storage it carries small integers. A [`Palette`] is the join between
 //! them, and its order is the authority — every packed identifier is an index
-//! into it. The two directions are not symmetric: decoding always follows the
-//! file's order, while encoding needs a canonical order that can be searched.
-//! The constructor that builds a palette decides which of the two readings it
-//! supports.
+//! into it.
+//!
+//! The two readings are not symmetric, so they get two types. A file palette
+//! preserves the order it was read in and only translates identifiers into
+//! states. An [`OrderedPalette`] is a file palette that additionally promises a
+//! canonical order, which makes the reverse lookup possible. Keeping the
+//! promise in the type means a lookup cannot be attempted on an order that
+//! was never sorted.
 //!
 //! This module owns the format's naming conventions: plain air occupies
 //! identifier zero in a written palette, and the bit width an identifier needs
@@ -15,8 +19,9 @@
 //! vocabulary; both belong to the file format.
 
 use crate::knowledge::mc::BlockState;
+use std::ops::Deref;
 
-// Palette
+// Palette & Ordered palette
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
@@ -28,48 +33,24 @@ use crate::knowledge::mc::BlockState;
 pub type PaletteId = u32;
 
 /// The block states a region stores, in the order its packed identifiers refer
-/// to, together with the bit width that order implies.
+/// to.
 ///
-/// The format has two orderings, and one type serves both: a file palette
-/// preserves the order of the file so decoded identifiers keep their meaning,
-/// while a palette being written pins plain air to id 0 and sorts the rest so
-/// an identifier can be resolved by binary search. The constructor that
-/// produced the palette decides which reading applies.
+/// A palette is a reading of an existing file: the order is part of the data,
+/// so it is never sorted or deduplicated. Lookups therefore run one way only,
+/// from identifier to state. A palette that can also answer the reverse
+/// direction is an [`OrderedPalette`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Palette {
     states: Vec<BlockState>,
-    bits_per_entry: u32,
-    /// Whether the states after index 0 are sorted, and therefore whether a
-    /// state can be resolved back to an identifier.
-    searchable: bool,
 }
 
 impl Palette {
     /// Wraps the states read from a file, in file order.
     ///
     /// The order is part of the data: every decoded identifier indexes this
-    /// slice, so it must never be sorted or deduplicated. A file palette is
-    /// translated identifier to state, never the other way.
+    /// slice, so it must never be sorted or deduplicated.
     pub fn from_file(states: Vec<BlockState>) -> Self {
-        Self::with_states(states, false)
-    }
-
-    /// Builds the palette a writer emits: air at 0, the remaining states
-    /// sorted and deduplicated.
-    ///
-    /// Filtering air first and sorting the rest makes identifier resolution a
-    /// binary search, and gives a byte-for-byte deterministic file for a given
-    /// set of states. Over-approximating the declared set is harmless: unused
-    /// entries simply travel along.
-    pub fn from_declared(declared: impl IntoIterator<Item = BlockState>) -> Self {
-        let mut states: Vec<BlockState> = declared
-            .into_iter()
-            .filter(|state| state != &BlockState::AIR)
-            .collect();
-        states.sort();
-        states.dedup();
-        states.insert(0, BlockState::AIR);
-        Self::with_states(states, true)
+        Self { states }
     }
 
     /// The states in palette order; identifiers index this slice.
@@ -77,7 +58,7 @@ impl Palette {
         &self.states
     }
 
-    /// Number of entries, air included when the palette is a written one.
+    /// Number of entries.
     pub fn len(&self) -> usize {
         self.states.len()
     }
@@ -90,42 +71,105 @@ impl Palette {
     /// Bits per packed identifier, matching the litematic width rule: the
     /// smallest `n >= 2` with `2^n >= len`.
     pub fn bits_per_entry(&self) -> u32 {
-        self.bits_per_entry
+        self.width().bits()
+    }
+
+    /// The width and mask the file format assigns to this palette.
+    pub(crate) fn width(&self) -> BitsPerEntry {
+        BitsPerEntry::of_len(self.len())
     }
 
     /// The state with identifier `id`, or `None` when the palette is shorter.
     pub fn state_at(&self, id: PaletteId) -> Option<&BlockState> {
         self.states.get(id as usize)
     }
+}
 
-    /// The identifier of `state` in a palette built by
-    /// [`Palette::from_declared`], or `None` when it is not covered.
+/// A palette whose order is canonical: air first, then the remaining states
+/// sorted and deduplicated.
+///
+/// This is the palette a writer emits. The canonical order makes reverse
+/// lookup a binary search, and gives a byte-for-byte deterministic file for a
+/// given set of states. Over-approximating the declared set is harmless:
+/// unused entries simply travel along.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderedPalette(Palette);
+
+impl OrderedPalette {
+    /// Builds the palette a writer emits: air at 0, the remaining states
+    /// sorted and deduplicated.
+    pub fn new(declared: impl IntoIterator<Item = BlockState>) -> Self {
+        let mut states: Vec<BlockState> = declared
+            .into_iter()
+            .filter(|state| state != &BlockState::AIR)
+            .collect();
+        states.sort();
+        states.dedup();
+        states.insert(0, BlockState::AIR);
+        Self(Palette::from_file(states))
+    }
+
+    /// The identifier of `state`, or `None` when it is not covered.
     ///
-    /// A file palette answers `None` for every state: its order serves
-    /// decoding, and identifiers are resolved by the other direction.
+    /// The search relies on the canonical order this type promises, so it is
+    /// a binary search rather than a scan.
     pub fn id_of(&self, state: &BlockState) -> Option<PaletteId> {
-        if !self.searchable {
-            return None;
-        }
         if state == &BlockState::AIR {
             return Some(0);
         }
-        let rest = self.states.get(1..)?;
+        let rest = self.states().get(1..)?;
         rest.binary_search(state)
             .ok()
             .map(|index| index as PaletteId + 1)
     }
+}
 
-    /// The one place the width rule is stated.
-    fn with_states(states: Vec<BlockState>, searchable: bool) -> Self {
-        let bits_per_entry = (2..32)
-            .find(|n| (1u64 << n) >= states.len() as u64)
-            .unwrap_or(32);
+/// An ordered palette is readable as a plain palette: every lookup that only
+/// follows the file order is available without a conversion.
+impl Deref for OrderedPalette {
+    type Target = Palette;
+
+    fn deref(&self) -> &Palette {
+        &self.0
+    }
+}
+
+/// The packed width of one palette identifier, in bits, together with the mask
+/// that isolates it.
+///
+/// A litematic entry is never narrower than two bits, and is only as wide as
+/// the smallest power of two that can address every entry of its palette. The
+/// two values are constructed together, so a decoder can never read a stream
+/// with one width and mask it with another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BitsPerEntry {
+    bits: u32,
+    mask: u64,
+}
+
+impl BitsPerEntry {
+    /// The width the litematic format assigns to a palette of `len` entries.
+    pub(crate) fn of_len(len: usize) -> Self {
+        let bits = (2..32).find(|n| (1u64 << n) >= len as u64).unwrap_or(32);
         Self {
-            states,
-            bits_per_entry,
-            searchable,
+            bits,
+            mask: (1u64 << bits) - 1,
         }
+    }
+
+    /// The number of bits one entry occupies.
+    pub(crate) const fn bits(self) -> u32 {
+        self.bits
+    }
+
+    /// The mask that isolates one entry.
+    pub(crate) const fn mask(self) -> u64 {
+        self.mask
+    }
+
+    /// How many distinct identifiers this width can carry.
+    pub(crate) const fn capacity(self) -> u64 {
+        self.mask + 1
     }
 }
 
@@ -135,7 +179,7 @@ impl Palette {
 
 #[cfg(test)]
 mod tests {
-    use super::Palette;
+    use super::{OrderedPalette, Palette};
     use crate::knowledge::mc::BlockState;
 
     fn st(name: &str) -> BlockState {
@@ -146,9 +190,9 @@ mod tests {
     }
 
     #[test]
-    fn layout_palette_pins_air_to_zero_and_sorts_rest() {
+    fn ordered_palette_pins_air_to_zero_and_sorts_rest() {
         let declared = [st("c"), st("minecraft:air"), st("a"), st("c")];
-        let palette = Palette::from_declared(declared);
+        let palette = OrderedPalette::new(declared);
         let air = st("minecraft:air");
         assert_eq!(palette.len(), 3);
         assert_eq!(palette.states(), [air.clone(), st("a"), st("c")]);
@@ -160,9 +204,9 @@ mod tests {
     }
 
     #[test]
-    fn layout_palette_keeps_cave_air_as_regular_entry() {
+    fn ordered_palette_keeps_cave_air_as_regular_entry() {
         let declared = [st("minecraft:cave_air"), st("minecraft:air")];
-        let palette = Palette::from_declared(declared);
+        let palette = OrderedPalette::new(declared);
         assert_eq!(palette.len(), 2);
         assert_eq!(
             palette.states(),
@@ -172,18 +216,28 @@ mod tests {
     }
 
     #[test]
-    fn empty_layout_palette_is_air_only() {
-        let palette = Palette::from_declared(std::iter::empty());
+    fn empty_ordered_palette_is_air_only() {
+        let palette = OrderedPalette::new(std::iter::empty());
         assert_eq!(palette.len(), 1);
         assert_eq!(palette.states(), [st("minecraft:air")]);
         assert_eq!(palette.bits_per_entry(), 2);
     }
 
     #[test]
-    fn file_palette_keeps_order_and_is_not_searchable() {
+    fn file_palette_keeps_order_and_only_decodes() {
         let palette = Palette::from_file(vec![st("b"), st("minecraft:air"), st("a")]);
         assert_eq!(palette.states(), [st("b"), st("minecraft:air"), st("a")]);
-        assert_eq!(palette.id_of(&st("b")), None);
         assert_eq!(palette.state_at(2), Some(&st("a")));
+        assert_eq!(palette.bits_per_entry(), 2);
+    }
+
+    #[test]
+    fn width_starts_at_two_bits_and_grows_at_powers_of_two() {
+        let width = |len| Palette::from_file(vec![st("x"); len]).bits_per_entry();
+        assert_eq!(width(0), 2);
+        assert_eq!(width(4), 2);
+        assert_eq!(width(5), 3);
+        assert_eq!(width(8), 3);
+        assert_eq!(width(9), 4);
     }
 }

@@ -38,7 +38,7 @@ assert_eq!(size.position_at(0), Some(BlockPos::ORIGIN));
 
 ## Pure streaming reads
 
-Use `Reader` when the file is much larger than available memory. It inflates the gzip stream through a fixed-size buffer and yields one region at a time, keeping a region's packed payload only until that region is consumed. Peak memory is independent of file size: the buffer, the palette, and one region. NBT field order does not matter; a `Metadata` compound that trails the regions becomes available once the stream is exhausted.
+Use `Reader` when the file is much larger than available memory. It inflates the gzip stream through a fixed-size buffer and yields one region at a time, keeping a region's packed payload only until that region is consumed. Peak memory does not grow with the total file size: it is the buffer, the current palette, and the largest single region payload. NBT field order does not matter; a `Metadata` compound that trails the regions becomes available once the stream is exhausted.
 
 ```rust
 use litematica::knowledge::mc::BlockState;

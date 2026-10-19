@@ -12,14 +12,15 @@ use crate::error::{Error, Quantity, Result};
 use crate::knowledge::mc::{BlockPos, BlockSize, BlockState, PositionIter};
 use crate::knowledge::nbt::{Encode, Tag, Writer};
 use crate::model::bitstream::Packer;
-use crate::model::palette::{Palette, PaletteId};
+use crate::model::palette::{OrderedPalette, PaletteId};
 use crate::model::region::Region;
 use flate2::write::GzEncoder;
-use flate2::Compression;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::io::Write as IoWrite;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub use flate2::Compression;
 
 /// Litematica format version written by this crate (`Version`).
 const FORMAT_VERSION: i32 = 6;
@@ -44,12 +45,36 @@ pub trait Layout {
     /// voxels that get packed.
     fn size(&self) -> BlockSize;
 
+    /// Absolute schematic position of local coordinate [`BlockPos::ORIGIN`].
+    ///
+    /// This is written as the region's `Position`; layouts composed in local
+    /// coordinates keep the default. A layout that mirrors a parsed region
+    /// overrides it, so rewriting preserves where the build stands.
+    fn position(&self) -> BlockPos {
+        BlockPos::ORIGIN
+    }
+
+    /// The signed `Size` the file should declare, when it differs from
+    /// [`Layout::size`] only by direction.
+    ///
+    /// A parsed region may extend along a negative axis; its packed order is
+    /// already expressed in the folded span, so the sign must travel as a
+    /// declaration rather than be silently dropped. `None` lets the writer
+    /// derive a positive declaration from [`Layout::size`]. A returned value
+    /// must fold back to that same span.
+    fn declared_size(&self) -> Option<BlockPos> {
+        None
+    }
+
     /// The block state at `pos`, or `None` for air; `pos` is assumed in bounds.
     ///
     /// Every returned state must be structurally equal (name and properties)
     /// to some entry of [`Layout::block_palette`]; a violation surfaces as
     /// [`Error::BlockNotInPalette`] during serialization. Air never needs an
     /// entry: both `None` and plain `minecraft:air` map to palette index 0.
+    ///
+    /// The writer calls this during palette discovery and again while packing,
+    /// so the answer for a position must not change between calls.
     fn block_at(&self, pos: BlockPos) -> Option<BlockState>;
 
     /// Every state [`Layout::block_at`] may return, as a set, empty cells
@@ -58,10 +83,11 @@ pub trait Layout {
     /// Returning a set lets composite layouts merge their children's
     /// palettes with cheap unions instead of copying and deduplicating
     /// sequences. Over-approximation is allowed: unused entries simply
-    /// travel along in the written file. Implementors that can derive their
-    /// state set analytically should override this: the default discovers it
-    /// with a full scan of the bounding box, which costs one extra pass over
-    /// every voxel.
+    /// travel along in the written file. It must, however, cover every state
+    /// [`Layout::block_at`] can return for this layout's extent. Implementors
+    /// that can derive their state set analytically should override this: the
+    /// default discovers it with a full scan of the bounding box, which costs
+    /// one extra pass over every voxel.
     fn block_palette(&self) -> HashSet<BlockState> {
         let positions = self.size().cartesian_positions();
         positions.fold(HashSet::new(), |mut palette, pos| {
@@ -89,9 +115,21 @@ pub trait Layout {
 /// stays within the compact representation instead of expanding it. The
 /// region's declared direction is folded away, since the writer addresses the
 /// same box and a single-region file has nowhere to record a negative axis.
+///
+/// [`Layout::block_at`] hands a state back by value, so this adapter
+/// materializes one state per query; that cost belongs to the trait's
+/// contract, not to a second copy of the region.
 impl Layout for Region<'_> {
     fn size(&self) -> BlockSize {
         self.size()
+    }
+
+    fn position(&self) -> BlockPos {
+        self.position
+    }
+
+    fn declared_size(&self) -> Option<BlockPos> {
+        Some(self.declared_size())
     }
 
     fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
@@ -109,13 +147,21 @@ impl Layout for Region<'_> {
 
 /// Resolves the identifier written at `pos`: air is 0, and any other state
 /// must be covered by the palette.
-fn resolve_id<L: Layout>(palette: &Palette, layout: &L, pos: BlockPos) -> Result<PaletteId> {
+fn resolve_id<L: Layout>(palette: &OrderedPalette, layout: &L, pos: BlockPos) -> Result<PaletteId> {
     let Some(state) = layout.block_at(pos) else {
         return Ok(0);
     };
     palette
         .id_of(&state)
         .ok_or(Error::BlockNotInPalette { state, pos })
+}
+
+/// Rejects a string NBT cannot length-prefix before the writer emits anything.
+fn ensure_string(value: &str) -> Result<()> {
+    if value.len() > u16::MAX as usize {
+        return Err(Error::StringTooLong { len: value.len() });
+    }
+    Ok(())
 }
 
 // Metadata
@@ -177,29 +223,34 @@ impl WriteOptions {
 /// the layout in storage order and streamed through a bounded packer, so
 /// peak memory is the palette plus a few words, independent of the volume.
 ///
-/// Layout bounds are validated before any byte is written. If the layout's
-/// declared palette misses a state that [`Layout::block_at`] returns, the
-/// error surfaces at that voxel with its coordinates.
+/// Every format limit — axis widths, volume, palette size, string lengths — is
+/// validated before the sink is touched, so a rejected layout leaves the
+/// output empty. If the declared palette misses a state that
+/// [`Layout::block_at`] returns, that error surfaces at the offending voxel
+/// with its coordinates, because the block set cannot be known in advance.
 ///
 /// # Example
 ///
-/// ```no_run
-/// # use litematica::task::writer::{write, Layout, WriteOptions};
-/// # struct MyLayout;
-/// # impl Layout for MyLayout {
-/// #     fn size(&self) -> litematica::knowledge::mc::BlockSize {
-/// #         litematica::knowledge::mc::BlockSize::new(16, 16, 16)
-/// #     }
-/// #     fn block_at(&self, pos: litematica::knowledge::mc::BlockPos)
-/// #         -> Option<litematica::knowledge::mc::BlockState> { None }
-/// # }
-/// # fn main() -> Result<(), litematica::error::Error> {
-/// let layout = MyLayout;
-/// let options = WriteOptions::new("my build", 4189);
-/// let file = std::fs::File::create("my_build.litematic")?;
-/// write(&layout, &options, file)?;
-/// # Ok(())
-/// # }
+/// ```
+/// use litematica::task::writer::{write, Layout, WriteOptions};
+///
+/// struct MyLayout;
+///
+/// impl Layout for MyLayout {
+///     fn size(&self) -> litematica::knowledge::mc::BlockSize {
+///         litematica::knowledge::mc::BlockSize::new(16, 16, 16)
+///     }
+///
+///     fn block_at(&self, _pos: litematica::knowledge::mc::BlockPos)
+///         -> Option<litematica::knowledge::mc::BlockState> { None }
+/// }
+///
+/// fn write_example(path: &str) -> Result<(), litematica::error::Error> {
+///     let layout = MyLayout;
+///     let options = WriteOptions::new("my build", 4189);
+///     write(&layout, &options, std::fs::File::create(path)?)?;
+///     Ok(())
+/// }
 /// ```
 pub fn write<L: Layout, W: IoWrite>(layout: &L, options: &WriteOptions, sink: W) -> Result<()> {
     let total_blocks = Cell::new(0i64);
@@ -207,10 +258,9 @@ pub fn write<L: Layout, W: IoWrite>(layout: &L, options: &WriteOptions, sink: W)
     let mut gz = GzEncoder::new(sink, options.compression);
     let mut nbt = Writer::new(&mut gz);
     schematic.write(&mut nbt)?;
-    nbt.into_inner()
-        .map_err(|source| Error::WriteIo { source })?;
+    nbt.into_inner().map_err(|source| Error::Io { source })?;
     gz.finish()
-        .map_err(|source| Error::WriteIo { source })
+        .map_err(|source| Error::Io { source })
         .map(|_| ())
 }
 
@@ -218,8 +268,10 @@ pub fn write<L: Layout, W: IoWrite>(layout: &L, options: &WriteOptions, sink: W)
 struct Schematic<'a, L: Layout> {
     layout: &'a L,
     options: &'a WriteOptions,
-    palette: Palette,
+    palette: OrderedPalette,
     size: BlockSize,
+    position: BlockPos,
+    declared_size: BlockPos,
     volume: i32,
     longs: i32,
     total_blocks: &'a Cell<i64>,
@@ -230,11 +282,48 @@ impl<'a, L: Layout> Schematic<'a, L> {
     /// every later stage reads.
     fn new(layout: &'a L, options: &'a WriteOptions, total_blocks: &'a Cell<i64>) -> Result<Self> {
         let size = layout.size();
-        let volume = Self::checked_volume(size)?;
-        let palette = Palette::from_declared(layout.block_palette());
+        let declared_size = match layout.declared_size() {
+            Some(declared) => {
+                let span = BlockSize::of(declared);
+                if span != size {
+                    return Err(Error::LayoutExtentMismatch {
+                        declared,
+                        span,
+                        size,
+                    });
+                }
+                declared
+            }
+            None => size
+                .to_declared()
+                .map_err(|value| Error::DimensionOverflow {
+                    quantity: Quantity::SizeAxis,
+                    value: u128::from(value),
+                })?,
+        };
+        let volume = size.volume();
+        let volume_field = i32::try_from(volume).map_err(|_| Error::DimensionOverflow {
+            quantity: Quantity::Volume,
+            value: volume,
+        })?;
+        let palette = OrderedPalette::new(layout.block_palette());
+        i32::try_from(palette.len()).map_err(|_| Error::DimensionOverflow {
+            quantity: Quantity::PaletteLength,
+            value: palette.len() as u128,
+        })?;
+        for state in palette.states() {
+            ensure_string(&state.name)?;
+            for (key, value) in &state.properties {
+                ensure_string(key)?;
+                ensure_string(value)?;
+            }
+        }
+        ensure_string(&options.name)?;
+        ensure_string(&options.description)?;
+        ensure_string(&options.author)?;
         // `volume <= i32::MAX` and `bits <= 32` bound this well below i32::MAX;
         // the checked conversion keeps the written length prefix honest.
-        let longs = (u128::from(volume as u32) * u128::from(palette.bits_per_entry())).div_ceil(64);
+        let longs = (volume * u128::from(palette.bits_per_entry())).div_ceil(64);
         let longs = i32::try_from(longs).map_err(|_| Error::DimensionOverflow {
             quantity: Quantity::BlockStatesLength,
             value: longs,
@@ -244,17 +333,11 @@ impl<'a, L: Layout> Schematic<'a, L> {
             options,
             palette,
             size,
-            volume,
+            position: layout.position(),
+            declared_size,
+            volume: volume_field,
             longs,
             total_blocks,
-        })
-    }
-
-    /// Returns the volume as the `i32` the format stores in `TotalVolume`.
-    fn checked_volume(size: BlockSize) -> Result<i32> {
-        i32::try_from(size.volume()).map_err(|_| Error::DimensionOverflow {
-            quantity: Quantity::Volume,
-            value: size.volume(),
         })
     }
 
@@ -274,6 +357,8 @@ impl<L: Layout> Encode for Schematic<'_, L> {
         let region = RegionNbt {
             layout: self.layout,
             palette: &self.palette,
+            position: self.position,
+            declared_size: self.declared_size,
             size: self.size,
             longs: self.longs,
             total_blocks: self.total_blocks,
@@ -299,7 +384,9 @@ impl<L: Layout> Encode for Schematic<'_, L> {
 /// One region: its box, palette, block states, and tile entities.
 struct RegionNbt<'a, L: Layout> {
     layout: &'a L,
-    palette: &'a Palette,
+    palette: &'a OrderedPalette,
+    position: BlockPos,
+    declared_size: BlockPos,
     size: BlockSize,
     longs: i32,
     total_blocks: &'a Cell<i64>,
@@ -310,8 +397,8 @@ impl<L: Layout> Encode for RegionNbt<'_, L> {
 
     /// Writes the region body: its box, palette, blocks, and tile entities.
     fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
-        BlockPos::ORIGIN.encode("Position", out)?;
-        self.size.encode("Size", out)?;
+        self.position.encode("Position", out)?;
+        self.declared_size.encode("Size", out)?;
         self.palette.encode("BlockStatePalette", out)?;
         let states = BlockStates {
             layout: self.layout,
@@ -331,7 +418,7 @@ impl<L: Layout> Encode for RegionNbt<'_, L> {
 /// The packed block states of a region, pulled one long at a time.
 struct BlockStates<'a, L: Layout> {
     layout: &'a L,
-    palette: &'a Palette,
+    palette: &'a OrderedPalette,
     size: BlockSize,
     longs: i32,
     total_blocks: &'a Cell<i64>,
@@ -349,7 +436,7 @@ impl<L: Layout> Encode for BlockStates<'_, L> {
 /// Packs palette ids into longs, one word per step, counting non-air blocks.
 struct Packed<'a, L: Layout> {
     layout: &'a L,
-    palette: &'a Palette,
+    palette: &'a OrderedPalette,
     positions: PositionIter,
     packer: Packer,
     finished: bool,
@@ -360,7 +447,7 @@ impl<'a, L: Layout> Packed<'a, L> {
     /// Prepares the stream for `layout`, walking `size` in storage order.
     fn new(
         layout: &'a L,
-        palette: &'a Palette,
+        palette: &'a OrderedPalette,
         size: BlockSize,
         total_blocks: &'a Cell<i64>,
     ) -> Self {
@@ -368,7 +455,7 @@ impl<'a, L: Layout> Packed<'a, L> {
             layout,
             palette,
             positions: size.cartesian_positions(),
-            packer: Packer::new(palette.bits_per_entry()),
+            packer: Packer::new(palette.width()),
             finished: false,
             total_blocks,
         }

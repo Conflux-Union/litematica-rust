@@ -202,7 +202,7 @@ fn round_trip_full_layout() {
         ((pos.x + 2 * pos.y + 3 * pos.z) % 4) as u8
     });
     let non_air = table.grid.iter().filter(|&&i| i != AIR).count() as i64;
-    let volume = (5 * 3 * 7) as i64;
+    let volume = 5 * 3 * 7;
 
     let rt = RoundTrip::run(&table, &opts);
     let doc = rt.doc();
@@ -225,7 +225,7 @@ fn round_trip_full_layout() {
     let region = &doc.regions[0];
     assert_eq!(region.name, "多区域 schematic ✓");
     assert_eq!(region.position, BlockPos::new(0, 0, 0));
-    assert_eq!(region.declared_size, BlockPos::new(5, 3, 7));
+    assert_eq!(region.declared_size(), BlockPos::new(5, 3, 7));
     assert_eq!(region.volume(), 105);
     let expected_palette = expected_file_palette(&table);
     let got: Vec<_> = region.palette().states().iter().map(read_view).collect();
@@ -296,7 +296,7 @@ fn round_trip_degenerate_volumes() {
     assert_eq!(region.volume(), 0);
     assert_eq!(region.palette().len(), 1);
     assert_eq!(read_view(&region.palette().states()[0]), write_view(&air()));
-    assert_eq!(region.iter_palette_ids().len(), 0);
+    assert_eq!(region.iter_palette_ids().count(), 0);
     assert_eq!(doc.metadata.total_blocks, Some(0));
     assert_eq!(doc.metadata.total_volume, Some(0));
     assert_eq!(doc.metadata.enclosing_size, Some(BlockPos::new(4, 0, 2)));
@@ -355,7 +355,7 @@ fn write_rejections() {
         other => panic!("unexpected error: {other:?}"),
     }
 
-    // A volume beyond the format's i32 limit and a negative axis.
+    // A volume beyond the format's i32 limit.
     let err = write(
         &sparse(BlockPos::new(65536, 65536, 1)),
         &WriteOptions::new("huge", 4189),
@@ -363,6 +363,31 @@ fn write_rejections() {
     )
     .unwrap_err();
     assert!(matches!(err, Error::DimensionOverflow { .. }));
+
+    // An axis that cannot be declared as an i32 is rejected during preflight,
+    // before the sink receives a single byte.
+    struct Oversize;
+    impl Layout for Oversize {
+        fn size(&self) -> BlockSize {
+            BlockSize::new(u32::MAX, 1, 1)
+        }
+        fn block_at(&self, _pos: BlockPos) -> Option<BlockState> {
+            None
+        }
+    }
+    let mut sink = Vec::new();
+    let err = write(&Oversize, &WriteOptions::new("oversize", 4189), &mut sink).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::DimensionOverflow {
+                quantity: litematica::error::Quantity::SizeAxis,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(sink.is_empty(), "preflight must not touch the sink");
 }
 
 #[test]
@@ -395,6 +420,52 @@ fn parsed_region_serializes_itself() {
             "state at {pos:?}"
         );
     }
+}
+
+#[test]
+fn placement_and_signed_size_survive_a_rewrite() {
+    struct Placed {
+        state: BlockState,
+    }
+
+    impl Layout for Placed {
+        fn size(&self) -> BlockSize {
+            BlockSize::of(BlockPos::new(-2, 3, 1))
+        }
+
+        fn position(&self) -> BlockPos {
+            BlockPos::new(10, -4, 7)
+        }
+
+        fn declared_size(&self) -> Option<BlockPos> {
+            Some(BlockPos::new(-2, 3, 1))
+        }
+
+        fn block_at(&self, _pos: BlockPos) -> Option<BlockState> {
+            Some(self.state.clone())
+        }
+    }
+
+    let layout = Placed {
+        state: st("minecraft:stone", &[]),
+    };
+    let source = RoundTrip::run(&layout, &WriteOptions::new("placed", 4189));
+    let doc = source.doc();
+    let region = &doc.regions[0];
+    assert_eq!(region.position, BlockPos::new(10, -4, 7));
+    assert_eq!(region.declared_size(), BlockPos::new(-2, 3, 1));
+    assert_eq!(region.size(), BlockSize::new(2, 3, 1));
+
+    // A parsed region is itself a Layout, so a second write must preserve the
+    // same placement and direction instead of silently normalizing them.
+    let mut out = Vec::new();
+    write(region, &WriteOptions::new("placed", 4189), &mut out).expect("rewrite");
+    let nbt = gzip_with_limit(&out, 1 << 30).expect("decompress");
+    let copy = Document::parse(&nbt).expect("parse the rewrite");
+    let rewritten = &copy.regions[0];
+    assert_eq!(rewritten.position, region.position);
+    assert_eq!(rewritten.declared_size(), region.declared_size());
+    assert_eq!(rewritten.size(), region.size());
 }
 
 #[test]

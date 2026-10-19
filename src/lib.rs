@@ -22,12 +22,13 @@
 //!   [`model::region::Region::state_at`] in O(1). Memory is the decompressed
 //!   payload plus the palettes.
 //! - [`task::stream::Reader`] keeps memory bounded by the gzip buffer,
-//!   the current palette, and one region's packed payload, independent of the
-//!   schematic's volume. NBT field order does not matter: a region's payload
-//!   is held only until its other fields have been read, then decoded voxel by
-//!   voxel and released. `Metadata` may appear before or after `Regions`, so
-//!   [`task::stream::Reader::metadata`] returns `None` until it has been
-//!   scanned.
+//!   the current palette, and the largest single region's packed payload. It
+//!   never grows with the total schematic volume. NBT field order does not
+//!   matter: a region's payload is held only until its other fields have been
+//!   read, then decoded voxel by voxel and released. `Metadata` and the two
+//!   version fields may appear before or after `Regions`, so
+//!   [`task::stream::Reader::metadata`] returns `None` until the whole header
+//!   has been scanned.
 //!
 //! Unknown fields (`Entities`, `TileEntities`, pending ticks, preview image
 //! data, ...) are skipped in O(length) without allocation, so parsing cost is
@@ -66,26 +67,26 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! ```
 //! use litematica::model::document::Document;
 //! use litematica::task::decompress::gzip_with_limit;
 //!
-//! # fn main() -> Result<(), litematica::error::Error> {
-//! let raw = std::fs::read("bridge.litematic")?;
-//! let nbt = gzip_with_limit(&raw, 512 * 1024 * 1024)?;
-//! let doc = Document::parse(&nbt)?;
+//! fn inspect(path: &str) -> Result<(), litematica::error::Error> {
+//!     let raw = std::fs::read(path)?;
+//!     let nbt = gzip_with_limit(&raw, 512 * 1024 * 1024)?;
+//!     let doc = Document::parse(&nbt)?;
 //!
-//! println!("{} region(s), {} voxels total", doc.regions.len(), doc.volume());
-//! for region in &doc.regions {
-//!     for index in region.iter_palette_ids() {
-//!         // Indices are not validated against the palette; bounds-check.
-//!         if let Some(state) = region.palette().states().get(index as usize) {
-//!             // inspect `state.name` and `state.properties`
+//!     println!("{} region(s), {} voxels total", doc.regions.len(), doc.volume());
+//!     for region in &doc.regions {
+//!         for index in region.iter_palette_ids() {
+//!             // Indices are not validated against the palette; bounds-check.
+//!             if let Some(state) = region.palette().states().get(index as usize) {
+//!                 // inspect `state.name` and `state.properties`
+//!             }
 //!         }
 //!     }
+//!     Ok(())
 //! }
-//! # Ok(())
-//! # }
 //! ```
 
 #![warn(missing_docs)]

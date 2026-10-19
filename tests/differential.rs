@@ -131,10 +131,7 @@ fn assert_matches_oracle(schem: &Schematic) {
     // Values written by rustmatica's serializer.
     assert_eq!(doc.metadata.region_count, Some(schem.regions.len() as i32));
     assert_eq!(doc.metadata.total_blocks, Some(oracle.total_blocks()));
-    assert_eq!(
-        doc.metadata.total_volume,
-        Some(i64::from(oracle.total_volume()))
-    );
+    assert_eq!(doc.metadata.total_volume, Some(oracle.total_volume()));
     let enclosing = oracle.enclosing_size();
     let enclosing = McBlockPos::new(enclosing.x, enclosing.y, enclosing.z);
     assert_eq!(doc.metadata.enclosing_size, Some(enclosing));
@@ -174,7 +171,7 @@ fn assert_matches_oracle(schem: &Schematic) {
             "position of {name}"
         );
         assert_eq!(
-            mregion.declared_size,
+            mregion.declared_size(),
             McBlockPos::new(oregion.size.x, oregion.size.y, oregion.size.z),
             "size of {name}"
         );
@@ -215,7 +212,7 @@ fn assert_matches_oracle(schem: &Schematic) {
             ptr_to_idx.insert(b as *const _, i as u32);
         }
         let mut ours_iter = mregion.iter_palette_ids();
-        assert_eq!(ours_iter.len() as u64, mregion.volume());
+        assert_eq!(ours_iter.size_hint().0 as u64, mregion.volume());
         for (i, (_pos, block)) in oregion.blocks().enumerate() {
             let oidx = *ptr_to_idx
                 .get(&(block as *const _))

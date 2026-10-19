@@ -23,8 +23,8 @@ pub mod decompress {
     /// would exceed `limit` bytes, an [`Error::DecompressionLimitExceeded`] is returned
     /// and no further data is inflated. This bounds the memory an untrusted
     /// file can force the caller to allocate. A corrupt or truncated gzip
-    /// stream surfaces as [`Error::CorruptGzip`] wrapping the underlying I/O
-    /// error.
+    /// stream surfaces as [`Error::CorruptGzip`]; an I/O failure from the
+    /// caller's own reader is [`Error::Io`].
     ///
     /// Trailing bytes after the first gzip member are ignored.
     pub fn gzip_with_limit(input: &[u8], limit: u64) -> Result<Vec<u8>> {
@@ -32,7 +32,9 @@ pub mod decompress {
         // the bound is enforced during decompression rather than after it.
         let mut decoder = GzDecoder::new(input).take(limit.saturating_add(1));
         let mut out = Vec::new();
-        decoder.read_to_end(&mut out)?;
+        decoder
+            .read_to_end(&mut out)
+            .map_err(|source| Error::CorruptGzip { source })?;
         if out.len() as u64 > limit {
             return Err(Error::DecompressionLimitExceeded { limit });
         }
@@ -60,6 +62,7 @@ pub(crate) mod parse {
     use crate::model::document::Document;
     use crate::model::region::Region;
     use crate::model::schema::RootFields;
+    use std::collections::HashSet;
 
     // Document
     //
@@ -111,6 +114,12 @@ pub(crate) mod parse {
 
             while let Some((name, tag)) = r.next_field()? {
                 if let FieldOutcome::Deferred = header.read_field(r, &name, tag, depth)? {
+                    if regions.get().is_some() {
+                        return Err(Error::DuplicateField {
+                            field: "Regions".into(),
+                            offset: r.pos(),
+                        });
+                    }
                     regions.set(Regions::decode(r, "Regions", depth)?);
                 }
             }
@@ -142,8 +151,15 @@ pub(crate) mod parse {
         ) -> Result<Self> {
             let depth = r.nested(enclosing)?;
             let mut regions = Vec::new();
+            let mut seen = HashSet::new();
             while let Some((name, tag)) = r.next_field()? {
                 let offset = r.pos();
+                if !seen.insert(name.clone()) {
+                    return Err(Error::DuplicateField {
+                        field: name,
+                        offset,
+                    });
+                }
                 r.expect("region", tag, Tag::Compound)?;
                 regions.push(Region::decode(r, name, offset, depth)?);
             }

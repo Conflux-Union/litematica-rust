@@ -10,22 +10,23 @@
 //! order those fields however they like, so [`RootFields`] accepts one field
 //! at a time. The random-access reader consumes it once at the end; the
 //! streaming reader may ask it for the metadata after every field, including
-//! ones that arrive after the regions.
+//! ones that arrive after the regions. A header is complete only when
+//! `Metadata`, `MinecraftDataVersion`, and `Version` have all arrived, so no
+//! reader observes a version the file omitted as a silent zero.
 //!
 //! [`RootFields::read_field`] also reports when it reaches `Regions`, so a
 //! caller learns about the boundary without this module owning the region
 //! collection.
-
-use std::borrow::Cow;
-use std::collections::BTreeMap;
-use std::io::Write as IoWrite;
 
 use crate::error::{Error, Quantity, Result};
 use crate::knowledge::mc::{BlockPos, BlockSize, BlockState};
 use crate::knowledge::nbt::{Decode, Encode, FieldEntry, FieldOutcome, FieldTable};
 use crate::knowledge::nbt::{Reader, Slot, Source, Tag, Writer};
 use crate::model::document::Metadata;
-use crate::model::palette::Palette;
+use crate::model::palette::{OrderedPalette, Palette};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::io::Write as IoWrite;
 
 // Root fields
 //
@@ -34,8 +35,8 @@ use crate::model::palette::Palette;
 /// The root fields that describe a schematic, accumulated in any order.
 #[derive(Default)]
 pub(crate) struct RootFields {
-    minecraft_data_version: i32,
-    version: i32,
+    minecraft_data_version: Slot<i32>,
+    version: Slot<i32>,
     sub_version: Slot<i32>,
     metadata: Slot<MetadataFields>,
     /// The metadata assembled from the fields seen so far, kept current so a
@@ -55,11 +56,12 @@ impl RootFields {
     fn fields<R: Source>() -> [FieldEntry<Self, R>; 5] {
         [
             FieldEntry::new("MinecraftDataVersion", |h, r, tag, depth| {
-                h.minecraft_data_version = r.decode_field("MinecraftDataVersion", tag, depth)?;
+                h.minecraft_data_version
+                    .set(r.decode_field("MinecraftDataVersion", tag, depth)?);
                 Ok(())
             }),
             FieldEntry::new("Version", |h, r, tag, depth| {
-                h.version = r.decode_field("Version", tag, depth)?;
+                h.version.set(r.decode_field("Version", tag, depth)?);
                 Ok(())
             }),
             FieldEntry::new("SubVersion", |h, r, tag, depth| {
@@ -99,8 +101,31 @@ impl RootFields {
         self.resolved.as_ref()
     }
 
-    /// Consumes the header, requiring a `Metadata` compound to have appeared.
+    /// The first required root field that has not arrived, if any.
+    pub(crate) fn missing_field(&self) -> Option<&'static str> {
+        if self.metadata.get().is_none() {
+            Some("Metadata")
+        } else if self.minecraft_data_version.get().is_none() {
+            Some("MinecraftDataVersion")
+        } else if self.version.get().is_none() {
+            Some("Version")
+        } else {
+            None
+        }
+    }
+
+    /// Requires the header to be complete, without consuming it.
+    pub(crate) fn ensure_complete(&self, offset: usize) -> Result<()> {
+        match self.missing_field() {
+            Some(field) => Err(Error::MissingField { field, offset }),
+            None => Ok(()),
+        }
+    }
+
+    /// Consumes the header, requiring `Metadata`, `MinecraftDataVersion`, and
+    /// `Version` to have appeared.
     pub(crate) fn into_metadata(self, offset: usize) -> Result<Metadata> {
+        self.ensure_complete(offset)?;
         self.resolved.ok_or(Error::MissingField {
             field: "Metadata",
             offset,
@@ -108,13 +133,20 @@ impl RootFields {
     }
 
     /// Rebuilds the join of the metadata compound and the root-level versions.
+    /// A partial join stays absent, so a streaming caller never observes
+    /// defaulted versions that the file did not declare.
     fn resolve(&mut self) {
-        let (data_version, version) = (self.minecraft_data_version, self.version);
         let sub_version = self.sub_version.get().copied();
-        let resolved = self
-            .metadata
-            .get()
-            .map(|fields| fields.to_metadata(data_version, version, sub_version));
+        let resolved = match (
+            self.metadata.get(),
+            self.minecraft_data_version.get().copied(),
+            self.version.get().copied(),
+        ) {
+            (Some(fields), Some(data_version), Some(version)) => {
+                Some(fields.to_metadata(data_version, version, sub_version))
+            }
+            _ => None,
+        };
         self.resolved = resolved;
     }
 }
@@ -172,16 +204,13 @@ impl Encode for BlockSize {
     /// Writes a span as the signed triple the file expects, rejecting an axis
     /// that does not fit an `i32`.
     fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
-        let axis = |value: u32| {
-            i32::try_from(value).map_err(|_| Error::DimensionOverflow {
+        let declared = self
+            .to_declared()
+            .map_err(|value| Error::DimensionOverflow {
                 quantity: Quantity::SizeAxis,
                 value: u128::from(value),
-            })
-        };
-        axis(self.x)?.encode("x", out)?;
-        axis(self.y)?.encode("y", out)?;
-        axis(self.z)?.encode("z", out)?;
-        out.end()
+            })?;
+        declared.body(out)
     }
 }
 
@@ -291,8 +320,7 @@ impl<S: Source> Decode<S> for Palette {
 impl Encode for Palette {
     const TAG: Tag = Tag::List;
 
-    /// Writes the palette in its own order; a written palette already begins
-    /// with air.
+    /// Writes the palette in its own order.
     fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
         let len = i32::try_from(self.len()).map_err(|_| Error::DimensionOverflow {
             quantity: Quantity::PaletteLength,
@@ -300,6 +328,15 @@ impl Encode for Palette {
         })?;
         out.list(Tag::Compound, len)?;
         self.states().iter().try_for_each(|state| state.body(out))
+    }
+}
+
+impl Encode for OrderedPalette {
+    const TAG: Tag = Tag::List;
+
+    /// Writes the canonical order; an ordered palette already begins with air.
+    fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
+        Encode::body(&**self, out)
     }
 }
 
@@ -314,7 +351,7 @@ pub(crate) struct MetadataFields {
     description: String,
     author: String,
     region_count: Option<i32>,
-    total_volume: Option<i64>,
+    total_volume: Option<i32>,
     total_blocks: Option<i64>,
     time_created: i64,
     time_modified: i64,
@@ -345,7 +382,7 @@ impl MetadataFields {
             }),
             FieldEntry::new("TotalVolume", |m, r, tag, _| {
                 r.expect("Metadata.TotalVolume", tag, Tag::Int)?;
-                m.total_volume = Some(i64::from(r.i32()?));
+                m.total_volume = Some(r.i32()?);
                 Ok(())
             }),
             FieldEntry::new("TotalBlocks", |m, r, tag, _| {

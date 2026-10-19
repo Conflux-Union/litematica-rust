@@ -234,7 +234,7 @@ fn control_minimal_file_parses() {
     let region = &doc.regions[0];
     assert_eq!(region.name, "main");
     assert_eq!(region.position, BlockPos::new(0, 0, 0));
-    assert_eq!(region.declared_size, BlockPos::new(4, 1, 1));
+    assert_eq!(region.declared_size(), BlockPos::new(4, 1, 1));
     assert_eq!(region.volume(), 4);
     assert_eq!(region.bits_per_entry(), 2);
     assert_eq!(region.palette().len(), 2);
@@ -368,6 +368,23 @@ fn well_formedness_rejections() {
         "{err:?}"
     );
 
+    // The root versions are required, not silently defaulted to zero.
+    for missing in ["MinecraftDataVersion", "Version"] {
+        let mut fields = vec![metadata_field()];
+        if missing != "MinecraftDataVersion" {
+            fields.push(field(3, "MinecraftDataVersion", &i32b(4189)));
+        }
+        if missing != "Version" {
+            fields.push(field(3, "Version", &i32b(6)));
+        }
+        fields.push(regions_field(&[unit_region()]));
+        let err = parse_err(&root(&fields));
+        assert!(
+            matches!(err, Error::MissingField { field, .. } if field == missing),
+            "missing {missing}: {err:?}"
+        );
+    }
+
     for missing in ["Position", "Size", "BlockStatePalette", "BlockStates"] {
         let mut region = Vec::new();
         if missing != "Position" {
@@ -411,6 +428,68 @@ fn well_formedness_rejections() {
     fields.push(field(10, "Deep", &payload));
     let err = parse_err(&root(&fields));
     assert!(matches!(err, Error::DepthLimitExceeded { .. }), "{err:?}");
+
+    // Region names are map keys: a repeated name is rejected, not silently
+    // overwritten or kept as two entries.
+    let mut fields = standard_root_fields();
+    fields.push(regions_field(&[unit_region(), unit_region()]));
+    let err = parse_err(&root(&fields));
+    assert!(
+        matches!(err, Error::DuplicateField { ref field, .. } if field == "main"),
+        "{err:?}"
+    );
+
+    // The root may contain `Regions` at most once, matching the streaming
+    // reader's policy.
+    let regions = regions_field(&[unit_region()]);
+    let mut fields = standard_root_fields();
+    fields.push(regions.clone());
+    fields.push(regions);
+    let err = parse_err(&root(&fields));
+    assert!(
+        matches!(err, Error::DuplicateField { ref field, .. } if field == "Regions"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_stream_error_ends_the_iteration() {
+    let mut fields = standard_root_fields();
+    fields.push(regions_field(&[unit_region(), unit_region()]));
+    let bytes = gzip(&root(&fields));
+    let mut reader = Reader::open(Cursor::new(bytes), 1 << 20).expect("open");
+
+    assert!(reader.next_region().expect("first region").is_some());
+    let err = reader.next_region().expect_err("duplicate must fail");
+    assert!(
+        matches!(err, Error::DuplicateField { ref field, .. } if field == "main"),
+        "{err:?}"
+    );
+    assert!(reader.next_region().expect("exhausted").is_none());
+}
+
+#[test]
+fn a_stream_requires_a_complete_header() {
+    let mut fields = vec![
+        metadata_field(),
+        field(3, "MinecraftDataVersion", &i32b(4189)),
+    ];
+    fields.push(regions_field(&[unit_region()]));
+    let bytes = gzip(&root(&fields));
+    let mut reader = Reader::open(Cursor::new(bytes), 1 << 20).expect("open");
+
+    assert!(reader.next_region().expect("read region").is_some());
+    let err = reader.next_region().expect_err("missing Version");
+    assert!(
+        matches!(
+            err,
+            Error::MissingField {
+                field: "Version",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }
 
 #[test]

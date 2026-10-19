@@ -91,7 +91,7 @@ fn real_file_stream_matches_document() {
         let expected = &doc.regions[count];
         assert_eq!(region.name, expected.name);
         assert_eq!(region.position, expected.position);
-        assert_eq!(region.declared_size, expected.declared_size);
+        assert_eq!(region.declared_size(), expected.declared_size());
         assert_eq!(region.size(), expected.size());
         assert_eq!(region.volume(), expected.volume());
         assert_eq!(region.palette(), expected.palette());
