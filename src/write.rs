@@ -8,6 +8,7 @@
 //! may over-approximate, and its default implementation discovers the palette
 //! with one extra scan.
 
+use crate::bitstream::{bits_for, Packer};
 use crate::error::{Error, Result};
 use crate::mc::{BlockPos, BlockSize, BlockState};
 use crate::nbt::{Encode, Tag, Writer};
@@ -167,13 +168,7 @@ impl Palette {
 
     /// Bits per `BlockStates` entry, matching the reader's width rule.
     pub(crate) fn num_bits(&self) -> u32 {
-        Self::bits_for(self.len())
-    }
-
-    /// The litematica bit width for `len` palette entries: the smallest
-    /// `n >= 2` with `2^n >= len`.
-    fn bits_for(len: usize) -> u32 {
-        (2..32).find(|n| (1u64 << n) >= len as u64).unwrap_or(32)
+        bits_for(self.len())
     }
 
     /// Resolves the id written at `pos`: air is 0, and any other state must
@@ -570,55 +565,6 @@ impl Encode for Header<'_> {
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
-/// Packs palette indices into the `BlockStates` bit stream.
-///
-/// The mirror of [`crate::BlockIter`]: one continuous LSB-first
-/// stream of `bits`-wide entries, big-endian longs, entries straddling long
-/// boundaries. A long is returned the moment 64 bits have accumulated;
-/// [`Packer::finish`] flushes the trailing partial long, zero-padded.
-pub(crate) struct Packer {
-    acc: u128,
-    have: u32,
-    bits: u32,
-}
-
-impl Packer {
-    /// Creates a packer emitting `bits`-wide entries.
-    pub(crate) fn new(bits: u32) -> Self {
-        Self {
-            acc: 0,
-            have: 0,
-            bits,
-        }
-    }
-
-    /// Packs one palette index, returning a completed long when one fills.
-    #[inline]
-    pub(crate) fn push(&mut self, id: u32) -> Option<u64> {
-        self.acc |= u128::from(id) << self.have;
-        self.have += self.bits;
-        if self.have >= 64 {
-            let word = self.acc as u64;
-            self.acc >>= 64;
-            self.have -= 64;
-            Some(word)
-        } else {
-            None
-        }
-    }
-
-    /// Flushes the pending partial long, zero-padded to 64 bits.
-    pub(crate) fn finish(&mut self) -> Option<u64> {
-        if self.have == 0 {
-            return None;
-        }
-        let word = self.acc as u64;
-        self.acc = 0;
-        self.have = 0;
-        Some(word)
-    }
-}
-
 // Tests
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
@@ -626,6 +572,7 @@ impl Packer {
 #[cfg(test)]
 mod tests {
     use super::{Layout, Palette};
+    use crate::bitstream::bits_for;
     use crate::mc::{BlockPos, BlockState};
 
     fn st(name: &str, props: &[(&str, &str)]) -> BlockState {
@@ -640,65 +587,6 @@ mod tests {
 
     fn air() -> BlockState {
         st("minecraft:air", &[])
-    }
-
-    #[test]
-    fn packer_round_trips_width_3_through_block_iter() {
-        let values = [1u32, 2, 6, 5, 7]; // 15 bits -> one partial long
-        let mut packer = super::Packer::new(3);
-        let mut longs = Vec::new();
-        for &v in &values {
-            if let Some(w) = packer.push(v) {
-                longs.push(w);
-            }
-        }
-        if let Some(w) = packer.finish() {
-            longs.push(w);
-        }
-        assert_eq!(longs.len(), 1); // ceil(15 / 64)
-        let bytes: Vec<u8> = longs.iter().flat_map(|w| w.to_be_bytes()).collect();
-        let decoded: Vec<u32> = crate::region::BlockIter::new(
-            crate::region::BitStream::new(&bytes, 3),
-            values.len() as u64,
-        )
-        .collect();
-        assert_eq!(decoded, values);
-    }
-
-    #[test]
-    fn packer_round_trips_crossing_long_boundaries() {
-        let values: Vec<u32> = (0..20).map(|i| (i * 7 + 3) % 32).collect(); // 100 bits
-        let mut packer = super::Packer::new(5);
-        let mut longs = Vec::new();
-        for &v in &values {
-            if let Some(w) = packer.push(v) {
-                longs.push(w);
-            }
-        }
-        if let Some(w) = packer.finish() {
-            longs.push(w);
-        }
-        assert_eq!(longs.len(), 2); // ceil(100 / 64)
-        let bytes: Vec<u8> = longs.iter().flat_map(|w| w.to_be_bytes()).collect();
-        let decoded: Vec<u32> = crate::region::BlockIter::new(
-            crate::region::BitStream::new(&bytes, 5),
-            values.len() as u64,
-        )
-        .collect();
-        assert_eq!(decoded, values);
-    }
-
-    #[test]
-    fn packer_exact_multiple_flushes_no_tail() {
-        let mut packer = super::Packer::new(2);
-        let mut longs = Vec::new();
-        for _ in 0..32 {
-            if let Some(w) = packer.push(3) {
-                longs.push(w);
-            }
-        }
-        assert_eq!(longs.len(), 1); // 64 bits exactly
-        assert!(packer.finish().is_none());
     }
 
     #[test]
@@ -737,7 +625,7 @@ mod tests {
                 .map(|i| st("litematica:p", &[("i", &i.to_string())]))
                 .collect();
             let p = Palette::build(declared);
-            let expect = Palette::bits_for(len + 1);
+            let expect = bits_for(len + 1);
             assert_eq!(p.num_bits(), expect, "palette of {len} entries + air");
         }
     }

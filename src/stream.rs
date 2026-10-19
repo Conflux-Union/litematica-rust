@@ -17,18 +17,20 @@
 //! larger is.
 //!
 //! Random access remains the job of [`crate::Document`]. The two modes share
-//! the same NBT decoders, geometry validation, and bit-level cursor, so they
-//! agree on every decoded value; only the storage strategy differs.
+//! the same NBT decoders, header accumulators, geometry validation, and
+//! bit-level cursor, so they agree on every decoded value; only the storage
+//! strategy differs.
 
 use std::io::{BufReader, Read};
 
 use flate2::read::GzDecoder;
 
+use crate::bitstream::decode_payload;
 use crate::error::{Error, Result};
 use crate::mc::{BlockPos, BlockSize};
-use crate::nbt::{Decode, IoSource, Reader, Source, Tag};
-use crate::parse::MetadataFields;
-use crate::region::{decode_payload, region_geometry, BlockState, Palette};
+use crate::nbt::{FieldOutcome, IoSource, Reader, Slot, Source, Tag};
+use crate::region::{region_geometry, BlockState, Palette, RegionHeader, RegionParts};
+use crate::schema::Header;
 use crate::Metadata;
 
 /// A buffered gzip stream, the byte source a [`StreamReader`] consumes.
@@ -49,31 +51,17 @@ pub struct StreamReader<R: Read> {
     reader: Reader<GzipSource<R>>,
     root_depth: usize,
     regions_depth: usize,
-    metadata_fields: Option<MetadataFields>,
-    metadata: Option<Metadata>,
-    minecraft_data_version: i32,
-    version: i32,
-    sub_version: Option<i32>,
+    header: Header,
     done: bool,
 }
 
 impl<R: Read> std::fmt::Debug for StreamReader<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamReader")
-            .field("metadata", &self.metadata)
+            .field("metadata", &self.header.metadata())
             .field("done", &self.done)
             .finish_non_exhaustive()
     }
-}
-
-/// One root-level field consumed by [`StreamReader::read_root_field`].
-enum RootField {
-    /// The root compound ended.
-    End,
-    /// `Regions` was reached; its compound has not been entered yet.
-    Regions,
-    /// A header field was collected or an unknown field was skipped.
-    Other,
 }
 
 impl<R: Read> StreamReader<R> {
@@ -97,11 +85,7 @@ impl<R: Read> StreamReader<R> {
             reader,
             root_depth,
             regions_depth: 0,
-            metadata_fields: None,
-            metadata: None,
-            minecraft_data_version: 0,
-            version: 0,
-            sub_version: None,
+            header: Header::new(),
             done: false,
         };
         stream.scan_to_regions()?;
@@ -114,7 +98,7 @@ impl<R: Read> StreamReader<R> {
     /// Files may place `Metadata` before or after `Regions`; when it trails
     /// the regions, this returns `None` until the stream is exhausted.
     pub fn metadata(&self) -> Option<&Metadata> {
-        self.metadata.as_ref()
+        self.header.metadata()
     }
 
     /// Advances to the next region, parsing it in full.
@@ -128,13 +112,11 @@ impl<R: Read> StreamReader<R> {
         if self.done {
             return Ok(None);
         }
-        let tag = self.reader.tag()?;
-        if tag == Tag::End {
+        let Some((name, tag)) = self.reader.next_field()? else {
             self.finish_root()?;
             self.done = true;
             return Ok(None);
-        }
-        let name = self.reader.string()?;
+        };
         self.reader.expect("region", tag, Tag::Compound)?;
         let region_depth = self.reader.nested(self.regions_depth)?;
         self.read_region(name, region_depth).map(Some)
@@ -146,64 +128,24 @@ impl<R: Read> StreamReader<R> {
     /// the palette and size it depends on may still be ahead in the compound.
     fn read_region(&mut self, name: String, region_depth: usize) -> Result<StreamRegion> {
         let region_offset = self.reader.pos();
-        let mut position = None;
-        let mut size = None;
-        let mut palette = None;
-        let mut payload = None;
+        let mut header = RegionHeader::new();
+        let mut payload = Slot::default();
 
-        loop {
-            let tag = self.reader.tag()?;
-            if tag == Tag::End {
-                break;
-            }
-            let field = self.reader.string()?;
-            match field.as_str() {
-                "Position" => {
-                    self.reader.expect("Position", tag, Tag::Compound)?;
-                    position = Some(BlockPos::decode(
-                        &mut self.reader,
-                        "Position",
-                        region_depth,
-                    )?);
-                }
-                "Size" => {
-                    self.reader.expect("Size", tag, Tag::Compound)?;
-                    size = Some(BlockPos::decode(&mut self.reader, "Size", region_depth)?);
-                }
-                "BlockStatePalette" => {
-                    self.reader.expect("BlockStatePalette", tag, Tag::List)?;
-                    palette = Some(Palette::decode(
-                        &mut self.reader,
-                        "BlockStatePalette",
-                        region_depth,
-                    )?);
-                }
-                "BlockStates" => {
-                    self.reader.expect("BlockStates", tag, Tag::LongArray)?;
-                    let longs = self.reader.count()?;
-                    let bytes = read_payload(&mut self.reader, longs)?;
-                    payload.get_or_insert(bytes);
-                }
-                _ => self.reader.skip_value(tag, region_depth)?,
+        while let Some((field, tag)) = self.reader.next_field()? {
+            if let FieldOutcome::Deferred =
+                header.read_field(&mut self.reader, &field, tag, region_depth)?
+            {
+                let longs = self.reader.count()?;
+                payload.set(read_payload(&mut self.reader, longs)?);
             }
         }
 
-        let position = position.ok_or(Error::MissingField {
-            field: "Position",
-            offset: region_offset,
-        })?;
-        let size = size.ok_or(Error::MissingField {
-            field: "Size",
-            offset: region_offset,
-        })?;
-        let palette = palette.ok_or(Error::MissingField {
-            field: "BlockStatePalette",
-            offset: region_offset,
-        })?;
-        let payload = payload.ok_or(Error::MissingField {
-            field: "BlockStates",
-            offset: region_offset,
-        })?;
+        let RegionParts {
+            position,
+            size,
+            palette,
+        } = header.into_parts(region_offset)?;
+        let payload = payload.required("BlockStates", region_offset)?;
 
         let geometry = region_geometry(size, &palette, payload.len() as u64, region_offset)?;
         Ok(StreamRegion {
@@ -223,17 +165,17 @@ impl<R: Read> StreamReader<R> {
     fn scan_to_regions(&mut self) -> Result<()> {
         loop {
             match self.read_root_field()? {
-                RootField::Regions => {
+                Some(FieldOutcome::Deferred) => {
                     self.regions_depth = self.reader.nested(self.root_depth)?;
                     return Ok(());
                 }
-                RootField::End => {
+                Some(FieldOutcome::Value) => {}
+                None => {
                     return Err(Error::MissingField {
                         field: "Regions",
                         offset: self.reader.pos(),
                     });
                 }
-                RootField::Other => {}
             }
         }
     }
@@ -242,63 +184,24 @@ impl<R: Read> StreamReader<R> {
     fn finish_root(&mut self) -> Result<()> {
         loop {
             match self.read_root_field()? {
-                RootField::End => return Ok(()),
-                RootField::Regions => {
+                None => return Ok(()),
+                Some(FieldOutcome::Deferred) => {
                     // A duplicate `Regions` is not part of the schema; skip it.
                     self.reader.skip_value(Tag::Compound, self.root_depth)?;
                 }
-                RootField::Other => {}
+                Some(FieldOutcome::Value) => {}
             }
         }
     }
 
-    /// Consumes one root-level field, updating the header as it is found.
-    fn read_root_field(&mut self) -> Result<RootField> {
-        let tag = self.reader.tag()?;
-        if tag == Tag::End {
-            return Ok(RootField::End);
-        }
-        let name = self.reader.string()?;
-        match name.as_str() {
-            "MinecraftDataVersion" => {
-                self.reader.expect("MinecraftDataVersion", tag, Tag::Int)?;
-                self.minecraft_data_version = self.reader.i32()?;
-                self.refresh_metadata();
-            }
-            "Version" => {
-                self.reader.expect("Version", tag, Tag::Int)?;
-                self.version = self.reader.i32()?;
-                self.refresh_metadata();
-            }
-            "SubVersion" => {
-                self.reader.expect("SubVersion", tag, Tag::Int)?;
-                self.sub_version = Some(self.reader.i32()?);
-                self.refresh_metadata();
-            }
-            "Metadata" => {
-                self.reader.expect("Metadata", tag, Tag::Compound)?;
-                let fields = MetadataFields::decode(&mut self.reader, "Metadata", self.root_depth)?;
-                self.metadata_fields = Some(fields);
-                self.refresh_metadata();
-            }
-            "Regions" => {
-                self.reader.expect("Regions", tag, Tag::Compound)?;
-                return Ok(RootField::Regions);
-            }
-            _ => self.reader.skip_value(tag, self.root_depth)?,
-        }
-        Ok(RootField::Other)
-    }
-
-    /// Rebuilds [`StreamReader::metadata`] from every header field seen so far.
-    fn refresh_metadata(&mut self) {
-        let (data_version, version, sub_version) =
-            (self.minecraft_data_version, self.version, self.sub_version);
-        let metadata = self
-            .metadata_fields
-            .as_ref()
-            .map(|fields| fields.to_metadata(data_version, version, sub_version));
-        self.metadata = metadata;
+    /// Consumes one root-level field, handing it to the shared header.
+    fn read_root_field(&mut self) -> Result<Option<FieldOutcome>> {
+        let Some((name, tag)) = self.reader.next_field()? else {
+            return Ok(None);
+        };
+        self.header
+            .read_field(&mut self.reader, &name, tag, self.root_depth)
+            .map(Some)
     }
 }
 

@@ -2,9 +2,12 @@
 
 use std::fmt;
 
+use crate::bitstream::{bits_for, BitStream, BlockIter};
 use crate::error::{Error, Result};
 use crate::mc::{BlockPos, BlockSize};
-use crate::nbt::{Decode, Reader, SliceSource, Source, Tag};
+use crate::nbt::{
+    Decode, FieldEntry, FieldOutcome, FieldTable, Reader, SliceSource, Slot, Source, Tag,
+};
 
 // Block state
 //
@@ -21,52 +24,149 @@ pub struct BlockState {
 }
 
 impl<S: Source> Decode<S> for BlockState {
+    const TAG: Tag = Tag::Compound;
+
     /// Reads one palette entry: a compound with a `Name` and an optional
     /// `Properties` compound.
     fn decode(r: &mut Reader<S>, _field: &'static str, enclosing: usize) -> Result<Self> {
         let depth = r.nested(enclosing)?;
-        let entry_offset = r.pos();
-        let mut name: Option<String> = None;
-        let mut properties: Vec<(String, String)> = Vec::new();
-        loop {
-            let tag = r.tag()?;
-            if tag == Tag::End {
-                break;
-            }
-            let field = r.string()?;
-            match field.as_str() {
-                "Name" => {
-                    r.expect("palette entry Name", tag, Tag::String)?;
-                    name = Some(r.string()?);
-                }
-                "Properties" => properties = Self::decode_properties(r, tag)?,
-                _ => r.skip_value(tag, depth)?,
-            }
+        let offset = r.pos();
+        let fields = EntryFields::fields();
+        let mut entry = EntryFields::default();
+        while let Some((field, tag)) = r.next_field()? {
+            FieldTable::new(&fields).apply(&mut entry, r, &field, tag, depth)?;
         }
-        let name = name.ok_or(Error::MissingField {
-            field: "palette entry Name",
-            offset: entry_offset,
-        })?;
-        Ok(Self { name, properties })
+        Ok(Self {
+            name: entry.name.required("palette entry Name", offset)?,
+            properties: entry.properties.or_default(),
+        })
+    }
+}
+
+/// The members of a palette entry while they are still arriving.
+///
+/// `Properties` is optional, so it stays in a [`Slot`] until the compound
+/// ends; `Name` is required and reports the entry's byte offset when missing.
+#[derive(Default)]
+struct EntryFields {
+    name: Slot<String>,
+    properties: Slot<Vec<(String, String)>>,
+}
+
+impl EntryFields {
+    /// The members of a palette entry and the way each one lands here.
+    fn fields<R: Source>() -> [FieldEntry<Self, R>; 2] {
+        [
+            FieldEntry::new("Name", |entry, r, tag, depth| {
+                entry
+                    .name
+                    .set(r.decode_field("palette entry Name", tag, depth)?);
+                Ok(())
+            }),
+            FieldEntry::new("Properties", |entry, r, tag, depth| {
+                entry
+                    .properties
+                    .set(BlockState::decode_properties(r, tag, depth)?);
+                Ok(())
+            }),
+        ]
     }
 }
 
 impl BlockState {
     /// Reads a `Properties` compound: a map from property name to string value.
-    fn decode_properties<S: Source>(r: &mut Reader<S>, tag: Tag) -> Result<Vec<(String, String)>> {
+    fn decode_properties<S: Source>(
+        r: &mut Reader<S>,
+        tag: Tag,
+        enclosing: usize,
+    ) -> Result<Vec<(String, String)>> {
         r.expect("palette entry Properties", tag, Tag::Compound)?;
+        let depth = r.nested(enclosing)?;
         let mut properties = Vec::new();
-        loop {
-            let tag = r.tag()?;
-            if tag == Tag::End {
-                break;
-            }
-            let key = r.string()?;
-            r.expect("palette property value", tag, Tag::String)?;
-            properties.push((key, r.string()?));
+        while let Some((key, tag)) = r.next_field()? {
+            properties.push((key, r.decode_field("palette property value", tag, depth)?));
         }
         Ok(properties)
     }
+}
+
+// Region header
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
+/// The header fields of one region, accumulated in whatever order they arrive.
+///
+/// The random-access and streaming readers differ only in where the packed
+/// payload lives; both hand the same field names to this accumulator, so the
+/// region schema is stated once.
+#[derive(Default)]
+pub(crate) struct RegionHeader {
+    position: Slot<BlockPos>,
+    size: Slot<BlockPos>,
+    palette: Slot<Palette>,
+}
+
+impl RegionHeader {
+    /// Creates an empty header; every field defaults until one is read.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The members of a region compound and the way each one lands here.
+    /// `BlockStates` is deferred: its long array length and payload belong to
+    /// the caller, which chooses between borrowing and copying them.
+    fn fields<R: Source>() -> [FieldEntry<Self, R>; 4] {
+        [
+            FieldEntry::new("Position", |h, r, tag, depth| {
+                h.position.set(r.decode_field("Position", tag, depth)?);
+                Ok(())
+            }),
+            FieldEntry::new("Size", |h, r, tag, depth| {
+                h.size.set(r.decode_field("Size", tag, depth)?);
+                Ok(())
+            }),
+            FieldEntry::new("BlockStatePalette", |h, r, tag, depth| {
+                h.palette
+                    .set(r.decode_field("BlockStatePalette", tag, depth)?);
+                Ok(())
+            }),
+            FieldEntry::deferred("BlockStates", |_, r, tag, _| {
+                r.expect("BlockStates", tag, Tag::LongArray)
+            }),
+        ]
+    }
+
+    /// Consumes one field whose name has already been read.
+    ///
+    /// A deferred outcome means `BlockStates` was reached; its length prefix
+    /// has not been read, so the caller decides whether to borrow or copy the
+    /// payload. `enclosing` is the depth of the region's fields.
+    pub(crate) fn read_field<R: Source>(
+        &mut self,
+        r: &mut Reader<R>,
+        field: &str,
+        tag: Tag,
+        enclosing: usize,
+    ) -> Result<FieldOutcome> {
+        let fields = Self::fields();
+        FieldTable::new(&fields).apply(self, r, field, tag, enclosing)
+    }
+
+    /// Returns the header, or the first required field that never arrived.
+    pub(crate) fn into_parts(self, offset: usize) -> Result<RegionParts> {
+        Ok(RegionParts {
+            position: self.position.required("Position", offset)?,
+            size: self.size.required("Size", offset)?,
+            palette: self.palette.required("BlockStatePalette", offset)?,
+        })
+    }
+}
+
+/// The required header of a region, once all of it has arrived.
+pub(crate) struct RegionParts {
+    pub(crate) position: BlockPos,
+    pub(crate) size: BlockPos,
+    pub(crate) palette: Palette,
 }
 
 // Region
@@ -117,59 +217,21 @@ impl<'a> Region<'a> {
         enclosing: usize,
     ) -> Result<Self> {
         let depth = r.nested(enclosing)?;
-        let mut position: Option<BlockPos> = None;
-        let mut size: Option<BlockPos> = None;
-        let mut palette: Option<Palette> = None;
-        let mut states: Option<&[u8]> = None;
-        let mut states_offset = 0usize;
+        let mut header = RegionHeader::new();
+        let mut payload: Slot<(&'a [u8], usize)> = Slot::default();
 
-        loop {
-            let tag = r.tag()?;
-            if tag == Tag::End {
-                break;
-            }
-            let field = r.string()?;
-            match field.as_str() {
-                "Position" => {
-                    r.expect("Position", tag, Tag::Compound)?;
-                    position = Some(BlockPos::decode(r, "Position", depth)?);
-                }
-                "Size" => {
-                    r.expect("Size", tag, Tag::Compound)?;
-                    size = Some(BlockPos::decode(r, "Size", depth)?);
-                }
-                "BlockStatePalette" => {
-                    r.expect("BlockStatePalette", tag, Tag::List)?;
-                    palette = Some(Palette::decode(r, "BlockStatePalette", depth)?);
-                }
-                "BlockStates" => {
-                    r.expect("BlockStates", tag, Tag::LongArray)?;
-                    states_offset = r.pos();
-                    let count = r.count()?;
-                    // Borrow the payload directly; never copy or expand it.
-                    states = Some(r.take(count as u64 * 8)?);
-                }
-                _ => r.skip_value(tag, depth)?,
+        while let Some((field, tag)) = r.next_field()? {
+            if let FieldOutcome::Deferred = header.read_field(r, &field, tag, depth)? {
+                let offset = r.pos();
+                let count = r.count()?;
+                // Borrow the payload directly; never copy or expand it.
+                payload.set((r.take(count as u64 * 8)?, offset));
             }
         }
 
-        let position = position.ok_or(Error::MissingField {
-            field: "Position",
-            offset: region_offset,
-        })?;
-        let size = size.ok_or(Error::MissingField {
-            field: "Size",
-            offset: region_offset,
-        })?;
-        let palette = palette.ok_or(Error::MissingField {
-            field: "BlockStatePalette",
-            offset: region_offset,
-        })?;
-        let states = states.ok_or(Error::MissingField {
-            field: "BlockStates",
-            offset: region_offset,
-        })?;
-        Self::from_parts(name, position, size, palette, states, states_offset)
+        let parts = header.into_parts(region_offset)?;
+        let (block_states, states_offset) = payload.required("BlockStates", region_offset)?;
+        Self::from_parts(name, parts, block_states, states_offset)
     }
 
     /// Assembles a region from parsed pieces and validates the block data
@@ -177,12 +239,15 @@ impl<'a> Region<'a> {
     /// region's `BlockStates` payload and is used in error reports.
     fn from_parts(
         name: String,
-        position: BlockPos,
-        size: BlockPos,
-        palette: Palette,
+        parts: RegionParts,
         block_states: &'a [u8],
         offset: usize,
     ) -> Result<Self> {
+        let RegionParts {
+            position,
+            size,
+            palette,
+        } = parts;
         let geometry = region_geometry(size, &palette, block_states.len() as u64, offset)?;
         Ok(Self {
             name,
@@ -256,7 +321,7 @@ impl<'a> Region<'a> {
     /// [`Region::block_at`], which does it. This iterator never panics on such
     /// input.
     pub fn iter_blocks(&self) -> BlockIter<'_> {
-        BlockIter::new(self.blocks, self.volume)
+        self.blocks.iter(self.volume)
     }
 }
 
@@ -320,6 +385,8 @@ pub(crate) struct Palette {
 }
 
 impl<S: Source> Decode<S> for Palette {
+    const TAG: Tag = Tag::List;
+
     /// Reads a `BlockStatePalette`: a list of palette entry compounds.
     fn decode(r: &mut Reader<S>, _field: &'static str, enclosing: usize) -> Result<Self> {
         let elem = r.tag()?;
@@ -339,14 +406,8 @@ impl<S: Source> Decode<S> for Palette {
 impl Palette {
     /// Wraps the states read from a file, deriving the region's bit width.
     fn from_states(states: Vec<BlockState>) -> Self {
-        let bits = Self::bits_for(states.len());
+        let bits = bits_for(states.len());
         Self { states, bits }
-    }
-
-    /// The litematica bit width for `len` palette entries: the smallest
-    /// `n >= 2` with `2^n >= len`.
-    fn bits_for(len: usize) -> u32 {
-        (2..32).find(|n| (1u64 << n) >= len as u64).unwrap_or(32)
     }
 
     /// The states in file order; index 0 is the first entry.
@@ -360,316 +421,13 @@ impl Palette {
     }
 }
 
-// Bit stream
-//
-// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
-
-/// The packed `BlockStates` payload viewed as fixed-width entries.
-///
-/// The payload is a run of big-endian longs, but entries are not aligned to
-/// them: entry `i` starts at bit `i * bits` of one continuous stream, least
-/// significant bit first, and may straddle two longs. [`BitCursor`] performs
-/// that decode for both sequential and random access, so the layout of the
-/// stream is stated once.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct BitStream<'a> {
-    longs: &'a [[u8; 8]],
-    bits: u32,
-    mask: u64,
-}
-
-impl<'a> BitStream<'a> {
-    pub(crate) fn new(bytes: &'a [u8], bits: u32) -> Self {
-        // A long array payload is a whole number of 8-byte entries, so the
-        // remainder is empty for well-formed input and ignored otherwise.
-        let (longs, _remainder) = bytes.as_chunks::<8>();
-        Self {
-            longs,
-            bits,
-            mask: (1u64 << bits) - 1,
-        }
-    }
-
-    /// Entry `index`, or `None` when the payload does not reach it.
-    fn entry(self, index: u64) -> Option<u32> {
-        let bit = u128::from(index) * u128::from(self.bits);
-        let long = usize::try_from(bit / 64).ok()?;
-        let shift = (bit % 64) as u32;
-        let first = u64::from_be_bytes(*self.longs.get(long)?);
-        let mut source = SliceLongs {
-            stream: self,
-            next: long + 1,
-        };
-        let mut cursor = BitCursor::with_remainder(first >> shift, 64 - shift);
-        cursor.next(self.bits, self.mask, &mut source).ok()
-    }
-
-    /// The `index`th long, zero-filled when the payload is shorter.
-    fn long(self, index: usize) -> u64 {
-        self.longs
-            .get(index)
-            .copied()
-            .map(u64::from_be_bytes)
-            .unwrap_or(0)
-    }
-
-    /// Number of payload bytes this stream windows, longs only.
-    fn byte_len(self) -> usize {
-        self.longs.len() * 8
-    }
-}
-
-/// A source of 64-bit words for [`BitCursor`].
-///
-/// The slice-backed random reader and the streaming reader supply words from
-/// different places, but decode entries through the same cursor.
-pub(crate) trait LongSource {
-    /// The next word, least significant byte of the stream first.
-    fn next_long(&mut self) -> Result<u64>;
-}
-
-/// A forward cursor over a continuous bit stream, buffering one word.
-///
-/// Sequential iteration is the cursor's natural use: each step consumes the
-/// low `bits` of the buffer and refills only when the next entry crosses a
-/// long boundary.
-#[derive(Debug, Default)]
-pub(crate) struct BitCursor {
-    cur: u64,
-    cur_bits: u32,
-}
-
-impl BitCursor {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    fn with_remainder(cur: u64, cur_bits: u32) -> Self {
-        Self { cur, cur_bits }
-    }
-
-    #[inline]
-    pub(crate) fn next(
-        &mut self,
-        bits: u32,
-        mask: u64,
-        source: &mut impl LongSource,
-    ) -> Result<u32> {
-        if self.cur_bits >= bits {
-            // Fast path: enough buffered bits for this entry.
-            let value = (self.cur & mask) as u32;
-            self.cur >>= bits;
-            self.cur_bits -= bits;
-            return Ok(value);
-        }
-        // Slow path: the entry straddles the word boundary, low bits from
-        // the buffer, the rest from the next word.
-        let low = self.cur_bits;
-        let mut value = self.cur & mask;
-        self.cur = source.next_long()?;
-        self.cur_bits = 64;
-        value |= (self.cur & (mask >> low)) << low;
-        self.cur >>= bits - low;
-        self.cur_bits -= bits - low;
-        Ok(value as u32)
-    }
-}
-
-/// A [`LongSource`] reading words borrowed from a [`BitStream`].
-#[derive(Debug)]
-struct SliceLongs<'a> {
-    stream: BitStream<'a>,
-    next: usize,
-}
-
-impl LongSource for SliceLongs<'_> {
-    fn next_long(&mut self) -> Result<u64> {
-        let word = self.stream.long(self.next);
-        self.next += 1;
-        Ok(word)
-    }
-}
-
-// Block iterator
-//
-// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
-
-/// An [`Iterator`] over the palette indices of a region, decoded on the fly
-/// from the `BlockStates` bit stream.
-///
-/// The whole long array is treated as one continuous bit stream (entries may
-/// cross long boundaries). Within a big-endian long, bit 0 is the least
-/// significant bit; the first bit in the stream is the lowest bit of the
-/// first entry. This matches the packing used by the Litematica mod and
-/// rustmatica.
-#[derive(Debug)]
-#[must_use = "iterators are lazy and do nothing unless consumed"]
-pub struct BlockIter<'a> {
-    cursor: BitCursor,
-    source: SliceLongs<'a>,
-    bits: u32,
-    mask: u64,
-    remaining: u64,
-}
-
-impl<'a> BlockIter<'a> {
-    pub(crate) fn new(stream: BitStream<'a>, volume: u64) -> Self {
-        Self {
-            cursor: BitCursor::new(),
-            source: SliceLongs { stream, next: 0 },
-            bits: stream.bits,
-            mask: stream.mask,
-            remaining: volume,
-        }
-    }
-}
-
-impl Iterator for BlockIter<'_> {
-    type Item = u32;
-
-    #[inline]
-    fn next(&mut self) -> Option<u32> {
-        if self.remaining == 0 {
-            return None;
-        }
-        self.remaining -= 1;
-        self.cursor
-            .next(self.bits, self.mask, &mut self.source)
-            .ok()
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.len();
-        (n, Some(n))
-    }
-}
-
-impl ExactSizeIterator for BlockIter<'_> {
-    #[inline]
-    fn len(&self) -> usize {
-        usize::try_from(self.remaining).unwrap_or(usize::MAX)
-    }
-}
-
-/// Decodes every palette index of a packed payload, calling `f` once per
-/// voxel.
-///
-/// This is the sequential counterpart of [`BlockIter`] for callers that own
-/// the payload bytes rather than borrowing them, such as the streaming
-/// reader. Indices are passed straight to `f` and are never collected.
-pub(crate) fn decode_payload(
-    bytes: &[u8],
-    bits: u32,
-    volume: u64,
-    mut f: impl FnMut(u32) -> Result<()>,
-) -> Result<()> {
-    let stream = BitStream::new(bytes, bits);
-    let mask = stream.mask;
-    let mut cursor = BitCursor::new();
-    let mut source = SliceLongs { stream, next: 0 };
-    for _ in 0..volume {
-        f(cursor.next(bits, mask, &mut source)?)?;
-    }
-    Ok(())
-}
-
 // Tests
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
 #[cfg(test)]
 mod tests {
-    use super::{BitStream, BlockIter, BlockPos, BlockSize, Palette};
-
-    #[test]
-    fn bits_for_matches_litematica() {
-        assert_eq!(Palette::bits_for(1), 2);
-        assert_eq!(Palette::bits_for(2), 2);
-        assert_eq!(Palette::bits_for(3), 2);
-        assert_eq!(Palette::bits_for(4), 2);
-        assert_eq!(Palette::bits_for(5), 3);
-        assert_eq!(Palette::bits_for(8), 3);
-        assert_eq!(Palette::bits_for(9), 4);
-        assert_eq!(Palette::bits_for(16), 4);
-        assert_eq!(Palette::bits_for(17), 5);
-        assert_eq!(Palette::bits_for(64), 6);
-        assert_eq!(Palette::bits_for(65), 7);
-        assert_eq!(Palette::bits_for(100), 7);
-    }
-
-    #[test]
-    fn iter_decodes_lsb_first_stream() {
-        // 3 bits per entry, values 1, 2, 6, 5, 7 -> bits cross long boundary.
-        let values = [1u32, 2, 6, 5, 7];
-        let mut acc = 0u64;
-        let mut filled = 0u32;
-        for &v in &values {
-            for k in 0..3 {
-                acc |= u64::from((v >> k) & 1) << filled;
-                filled += 1;
-            }
-        }
-        let bytes = acc.to_be_bytes();
-        let iter = BlockIter::new(BitStream::new(&bytes, 3), values.len() as u64);
-        assert_eq!(iter.len(), values.len());
-        let decoded: Vec<u32> = iter.collect();
-        assert_eq!(decoded, values);
-    }
-
-    #[test]
-    fn iter_entries_crossing_long_boundaries() {
-        // 5 bits per entry, 20 entries -> 100 bits, crossing 64-bit borders.
-        let values: Vec<u32> = (0..20).map(|i| (i * 7 + 3) % 32).collect();
-        let mut longs = Vec::new();
-        let mut acc = 0u64;
-        let mut filled = 0u32;
-        for &v in &values {
-            for k in 0..5 {
-                acc |= u64::from((v >> k) & 1) << filled;
-                filled += 1;
-                if filled == 64 {
-                    longs.extend_from_slice(&acc.to_be_bytes());
-                    acc = 0;
-                    filled = 0;
-                }
-            }
-        }
-        if filled > 0 {
-            longs.extend_from_slice(&acc.to_be_bytes());
-        }
-        let decoded: Vec<u32> =
-            BlockIter::new(BitStream::new(&longs, 5), values.len() as u64).collect();
-        assert_eq!(decoded, values);
-    }
-
-    #[test]
-    fn random_entries_match_the_sequential_stream() {
-        // 5 bits, entries straddling several long boundaries.
-        let values: Vec<u32> = (0..20).map(|i| (i * 7 + 3) % 32).collect();
-        let mut longs = Vec::new();
-        let mut acc = 0u64;
-        let mut filled = 0u32;
-        for &v in &values {
-            for k in 0..5 {
-                acc |= u64::from((v >> k) & 1) << filled;
-                filled += 1;
-                if filled == 64 {
-                    longs.extend_from_slice(&acc.to_be_bytes());
-                    acc = 0;
-                    filled = 0;
-                }
-            }
-        }
-        if filled > 0 {
-            longs.extend_from_slice(&acc.to_be_bytes());
-        }
-        let stream = BitStream::new(&longs, 5);
-        for (i, &want) in values.iter().enumerate() {
-            assert_eq!(stream.entry(i as u64), Some(want), "entry {i}");
-        }
-        assert_eq!(stream.entry(100), None);
-    }
+    use super::{BlockPos, BlockSize};
 
     #[test]
     fn block_size_index_round_trips_through_positions() {
@@ -681,12 +439,5 @@ mod tests {
         }
         assert_eq!(size.index_of(BlockPos::new(3, 0, 0)), None);
         assert_eq!(size.position_at(size.volume() as u64), None);
-    }
-
-    #[test]
-    fn iter_zero_volume_is_empty() {
-        let mut iter = BlockIter::new(BitStream::new(&[], 2), 0);
-        assert_eq!(iter.len(), 0);
-        assert!(iter.next().is_none());
     }
 }

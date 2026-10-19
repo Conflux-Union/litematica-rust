@@ -68,44 +68,149 @@ impl Tag {
 
     /// Resolves a wire id, or `None` when it is outside the tag space.
     pub(crate) const fn from_id(id: u8) -> Option<Self> {
-        match id {
-            0 => Some(Self::End),
-            1 => Some(Self::Byte),
-            2 => Some(Self::Short),
-            3 => Some(Self::Int),
-            4 => Some(Self::Long),
-            5 => Some(Self::Float),
-            6 => Some(Self::Double),
-            7 => Some(Self::ByteArray),
-            8 => Some(Self::String),
-            9 => Some(Self::List),
-            10 => Some(Self::Compound),
-            11 => Some(Self::IntArray),
-            12 => Some(Self::LongArray),
-            _ => None,
+        if id as usize >= TAGS.len() {
+            return None;
         }
+        TAGS[id as usize]
     }
 
-    /// Payload size of a fixed-width scalar, or `None` for tags whose payload
-    /// is length-prefixed or structural.
-    ///
-    /// Skipping uses this to jump over scalars in one step instead of
-    /// matching each tag individually.
-    const fn scalar_size(self) -> Option<u64> {
+    /// How this tag's payload is laid out on the wire.
+    const fn shape(self) -> Option<Shape> {
+        SHAPES[self.id() as usize]
+    }
+}
+
+/// How an NBT value is laid out on the wire, as skipping sees it.
+///
+/// Skipping never needs the semantic kind of a value, only its byte layout: a
+/// value is a fixed-width scalar, a count followed by same-width elements, a
+/// list, or a compound. Collapsing the twelve tags into these forms keeps tag
+/// knowledge in tables instead of in a branch of every read loop.
+#[derive(Clone, Copy)]
+enum Shape {
+    /// A payload of a fixed byte length.
+    Fixed(u64),
+    /// A count followed by that many elements of `width` bytes.
+    Sized {
+        /// How the element count is encoded.
+        prefix: Prefix,
+        /// Width of one element in bytes.
+        width: u64,
+    },
+    /// An element tag, a count, and that many elements.
+    List,
+    /// A named sequence of members.
+    Compound,
+}
+
+/// How a sized NBT value announces its element count.
+#[derive(Clone, Copy)]
+enum Prefix {
+    /// A `u16`, as NBT strings use.
+    U16,
+    /// A non-negative `i32`, as arrays use.
+    I32,
+}
+
+/// Every tag id, indexed by its wire value.
+const TAGS: [Option<Tag>; 13] = [
+    Some(Tag::End),
+    Some(Tag::Byte),
+    Some(Tag::Short),
+    Some(Tag::Int),
+    Some(Tag::Long),
+    Some(Tag::Float),
+    Some(Tag::Double),
+    Some(Tag::ByteArray),
+    Some(Tag::String),
+    Some(Tag::List),
+    Some(Tag::Compound),
+    Some(Tag::IntArray),
+    Some(Tag::LongArray),
+];
+
+/// The skip shape of every tag id, indexed by its wire value.
+const SHAPES: [Option<Shape>; 13] = [
+    None,                  // End
+    Some(Shape::Fixed(1)), // Byte
+    Some(Shape::Fixed(2)), // Short
+    Some(Shape::Fixed(4)), // Int
+    Some(Shape::Fixed(8)), // Long
+    Some(Shape::Fixed(4)), // Float
+    Some(Shape::Fixed(8)), // Double
+    Some(Shape::Sized {
+        prefix: Prefix::I32,
+        width: 1,
+    }), // ByteArray
+    Some(Shape::Sized {
+        prefix: Prefix::U16,
+        width: 1,
+    }), // String
+    Some(Shape::List),     // List
+    Some(Shape::Compound), // Compound
+    Some(Shape::Sized {
+        prefix: Prefix::I32,
+        width: 4,
+    }), // IntArray
+    Some(Shape::Sized {
+        prefix: Prefix::I32,
+        width: 8,
+    }), // LongArray
+];
+
+impl Shape {
+    /// Skips one value of this shape nested inside `enclosing`.
+    fn skip<S: Source>(self, r: &mut Reader<S>, enclosing: usize) -> Result<()> {
         match self {
-            Self::Byte => Some(1),
-            Self::Short => Some(2),
-            Self::Int | Self::Float => Some(4),
-            Self::Long | Self::Double => Some(8),
-            Self::End
-            | Self::ByteArray
-            | Self::String
-            | Self::List
-            | Self::Compound
-            | Self::IntArray
-            | Self::LongArray => None,
+            Self::Fixed(width) => r.skip(width),
+            Self::Sized { prefix, width } => {
+                let count = prefix.count(r)?;
+                r.skip(count * width)
+            }
+            Self::List => skip_list(r, enclosing),
+            Self::Compound => skip_compound(r, enclosing),
         }
     }
+}
+
+impl Prefix {
+    /// Reads this prefix as a non-negative element count.
+    fn count<S: Source>(self, r: &mut Reader<S>) -> Result<u64> {
+        match self {
+            Self::U16 => Ok(u64::from(r.u16()?)),
+            Self::I32 => Ok(r.count()? as u64),
+        }
+    }
+}
+
+/// Skips a list: its element tag, count, and every element.
+fn skip_list<S: Source>(r: &mut Reader<S>, enclosing: usize) -> Result<()> {
+    let elem = r.tag()?;
+    let count = r.count()?;
+    if count == 0 {
+        return Ok(());
+    }
+    let depth = r.nested(enclosing)?;
+    if elem == Tag::End {
+        return Err(Error::UnexpectedTag {
+            field: "list element",
+            tag: elem.id(),
+            offset: r.pos(),
+        });
+    }
+    for _ in 0..count {
+        r.skip_value(elem, depth)?;
+    }
+    Ok(())
+}
+
+/// Skips a compound by the shapes of its members.
+fn skip_compound<S: Source>(r: &mut Reader<S>, enclosing: usize) -> Result<()> {
+    let depth = r.nested(enclosing)?;
+    while let Some((_, tag)) = r.next_field()? {
+        r.skip_value(tag, depth)?;
+    }
+    Ok(())
 }
 
 // Encode
@@ -179,25 +284,169 @@ impl Encode for String {
 /// compound can derive the depth of its own fields and hand unknown members
 /// to [`Reader::skip_value`].
 pub(crate) trait Decode<S: Source>: Sized {
+    /// The tag this value is written as.
+    const TAG: Tag;
+
     /// Reads this value's payload, without a tag id or a name.
     fn decode(r: &mut Reader<S>, field: &'static str, enclosing: usize) -> Result<Self>;
 }
 
 impl<S: Source> Decode<S> for i32 {
+    const TAG: Tag = Tag::Int;
+
     fn decode(r: &mut Reader<S>, _field: &'static str, _enclosing: usize) -> Result<Self> {
         r.i32()
     }
 }
 
 impl<S: Source> Decode<S> for i64 {
+    const TAG: Tag = Tag::Long;
+
     fn decode(r: &mut Reader<S>, _field: &'static str, _enclosing: usize) -> Result<Self> {
         r.i64()
     }
 }
 
 impl<S: Source> Decode<S> for String {
+    const TAG: Tag = Tag::String;
+
     fn decode(r: &mut Reader<S>, _field: &'static str, _enclosing: usize) -> Result<Self> {
         r.string()
+    }
+}
+
+// Slot
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
+/// The position of one field in a compound accumulator.
+///
+/// NBT compounds are unordered, so a decoder cannot assign a field as it
+/// walks them; it deposits each member it meets into its slot and asks for
+/// the result once the compound ends. The slot records presence, so the rule
+/// for a missing required field lives with the field rather than in a pile of
+/// `Option` sentinels and `ok_or` calls after the scan.
+#[derive(Debug)]
+pub(crate) struct Slot<T> {
+    value: Option<T>,
+}
+
+impl<T> Default for Slot<T> {
+    fn default() -> Self {
+        Self { value: None }
+    }
+}
+
+impl<T> Slot<T> {
+    /// Stores the value read for this field, replacing an earlier one.
+    pub(crate) fn set(&mut self, value: T) {
+        self.value = Some(value);
+    }
+
+    /// The stored value, borrowed.
+    pub(crate) fn get(&self) -> Option<&T> {
+        self.value.as_ref()
+    }
+
+    /// The value, or an error naming `field` when the file omitted it.
+    pub(crate) fn required(self, field: &'static str, offset: usize) -> Result<T> {
+        self.value.ok_or(Error::MissingField { field, offset })
+    }
+
+    /// The value, or `T::default()` when the file omitted this field.
+    pub(crate) fn or_default(self) -> T
+    where
+        T: Default,
+    {
+        self.value.unwrap_or_default()
+    }
+}
+
+// Fields
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
+/// What consuming a compound member leaves for the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FieldOutcome {
+    /// The member's value was consumed or skipped.
+    Value,
+    /// The member marks a payload whose bytes the caller consumes, so the
+    /// schema node reported it without reading further.
+    Deferred,
+}
+
+/// One named member of a schema compound and the way it deposits its value.
+///
+/// A field is data: it carries the name it answers to, the slot filler that
+/// accepts its value, and whether consuming it defers the payload to the
+/// caller. A schema node states its fields as a table and lets the table find
+/// the member it just met, so adding a field never means editing a dispatch
+/// `match`.
+pub(crate) struct FieldEntry<S, R: Source> {
+    name: &'static str,
+    outcome: FieldOutcome,
+    apply: fn(&mut S, &mut Reader<R>, Tag, usize) -> Result<()>,
+}
+
+impl<S, R: Source> FieldEntry<S, R> {
+    /// A field whose value is consumed here, or skipped when unknown.
+    pub(crate) const fn new(
+        name: &'static str,
+        apply: fn(&mut S, &mut Reader<R>, Tag, usize) -> Result<()>,
+    ) -> Self {
+        Self {
+            name,
+            outcome: FieldOutcome::Value,
+            apply,
+        }
+    }
+
+    /// A field that only validates its own header and hands the payload back
+    /// to the caller, such as a `BlockStates` long array.
+    pub(crate) const fn deferred(
+        name: &'static str,
+        apply: fn(&mut S, &mut Reader<R>, Tag, usize) -> Result<()>,
+    ) -> Self {
+        Self {
+            name,
+            outcome: FieldOutcome::Deferred,
+            apply,
+        }
+    }
+}
+
+/// A schema compound's declared members, looked up by the name just read.
+///
+/// The table is the whole dispatch: a member either matches an entry and is
+/// applied by it, or is unknown and skipped uniformly. NBT compounds are
+/// unordered, so the table is consulted once per member and carries no
+/// position.
+pub(crate) struct FieldTable<'a, S, R: Source> {
+    entries: &'a [FieldEntry<S, R>],
+}
+
+impl<'a, S, R: Source> FieldTable<'a, S, R> {
+    /// Wraps a schema node's declared fields.
+    pub(crate) fn new(entries: &'a [FieldEntry<S, R>]) -> Self {
+        Self { entries }
+    }
+
+    /// Applies the member `name` to `schema`, or skips it when undeclared.
+    pub(crate) fn apply(
+        &self,
+        schema: &mut S,
+        r: &mut Reader<R>,
+        name: &str,
+        tag: Tag,
+        enclosing: usize,
+    ) -> Result<FieldOutcome> {
+        if let Some(entry) = self.entries.iter().find(|entry| entry.name == name) {
+            (entry.apply)(schema, r, tag, enclosing)?;
+            return Ok(entry.outcome);
+        }
+        r.skip_value(tag, enclosing)?;
+        Ok(FieldOutcome::Value)
     }
 }
 
@@ -374,6 +623,14 @@ impl<S: Source> Reader<S> {
         Ok(b[0])
     }
 
+    /// Reads one big-endian `u16`.
+    #[inline]
+    pub(crate) fn u16(&mut self) -> Result<u16> {
+        let mut b = [0u8; 2];
+        self.read_exact(&mut b)?;
+        Ok(u16::from_be_bytes(b))
+    }
+
     /// Reads one big-endian `i32`.
     #[inline]
     pub(crate) fn i32(&mut self) -> Result<i32> {
@@ -395,9 +652,7 @@ impl<S: Source> Reader<S> {
     /// standard UTF-8 only in encodings that never appear in litematic files,
     /// so a lossy decode is sufficient here.
     pub(crate) fn string(&mut self) -> Result<String> {
-        let mut len = [0u8; 2];
-        self.read_exact(&mut len)?;
-        let n = u16::from_be_bytes(len) as usize;
+        let n = usize::from(self.u16()?);
         let mut bytes = vec![0u8; n];
         self.read_exact(&mut bytes)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -433,6 +688,33 @@ impl<S: Source> Reader<S> {
         Ok(())
     }
 
+    /// Reads the header of a compound's next member, or `None` at its end.
+    ///
+    /// This is the whole wire protocol of a compound: a tag id, the member
+    /// name, and then a value the caller decides how to treat. Centralizing it
+    /// keeps every schema node from restating the end-of-compound rule.
+    pub(crate) fn next_field(&mut self) -> Result<Option<(String, Tag)>> {
+        let tag = self.tag()?;
+        if tag == Tag::End {
+            return Ok(None);
+        }
+        Ok(Some((self.string()?, tag)))
+    }
+
+    /// Reads the payload of `T`, which the caller found under `tag`.
+    ///
+    /// The declared tag check and the payload decode are one step, so a schema
+    /// node names a field and its type without restating the type's tag.
+    pub(crate) fn decode_field<T: Decode<S>>(
+        &mut self,
+        field: &'static str,
+        tag: Tag,
+        enclosing: usize,
+    ) -> Result<T> {
+        self.expect(field, tag, T::TAG)?;
+        T::decode(self, field, enclosing)
+    }
+
     /// The depth of a container nested inside `enclosing`, enforcing
     /// [`MAX_DEPTH`].
     pub(crate) fn nested(&self, enclosing: usize) -> Result<usize> {
@@ -444,66 +726,16 @@ impl<S: Source> Reader<S> {
     }
 
     /// Skips the payload of `tag`, which is a value nested inside a container
-    /// at `enclosing_depth`. Sized arrays jump directly by length * element
-    /// size; compounds and lists walk their headers only.
+    /// at `enclosing_depth`. The tag's declared shape decides how many bytes
+    /// to advance; sized payloads jump by length * element size, while lists
+    /// and compounds walk only headers.
     pub(crate) fn skip_value(&mut self, tag: Tag, enclosing_depth: usize) -> Result<()> {
-        if let Some(n) = tag.scalar_size() {
-            return self.skip(n);
-        }
-        match tag {
-            Tag::ByteArray => {
-                let n = self.count()?;
-                self.skip(n as u64)?;
-            }
-            Tag::String => {
-                self.string()?;
-            }
-            Tag::List => {
-                let elem = self.tag()?;
-                let count = self.count()?;
-                if count > 0 {
-                    let depth = self.nested(enclosing_depth)?;
-                    if elem == Tag::End {
-                        return Err(Error::UnexpectedTag {
-                            field: "list element",
-                            tag: elem.id(),
-                            offset: self.pos(),
-                        });
-                    }
-                    for _ in 0..count {
-                        self.skip_value(elem, depth)?;
-                    }
-                }
-            }
-            Tag::Compound => {
-                let depth = self.nested(enclosing_depth)?;
-                loop {
-                    let t = self.tag()?;
-                    if t == Tag::End {
-                        break;
-                    }
-                    self.string()?;
-                    self.skip_value(t, depth)?;
-                }
-            }
-            Tag::IntArray => {
-                let n = self.count()?;
-                self.skip(n as u64 * 4)?;
-            }
-            Tag::LongArray => {
-                let n = self.count()?;
-                self.skip(n as u64 * 8)?;
-            }
-            // Scalars were handled above; this arm keeps the match exhaustive.
-            Tag::End | Tag::Byte | Tag::Short | Tag::Int | Tag::Long | Tag::Float | Tag::Double => {
-                return Err(Error::UnexpectedTag {
-                    field: "value",
-                    tag: tag.id(),
-                    offset: self.pos(),
-                });
-            }
-        }
-        Ok(())
+        let shape = tag.shape().ok_or_else(|| Error::UnexpectedTag {
+            field: "value",
+            tag: tag.id(),
+            offset: self.pos(),
+        })?;
+        shape.skip(self, enclosing_depth)
     }
 }
 

@@ -68,10 +68,12 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod bitstream;
 mod error;
 mod nbt;
 mod parse;
 mod region;
+mod schema;
 mod stream;
 use crate::mc::{BlockPos, BlockSize};
 use flate2::read::GzDecoder;
@@ -79,9 +81,10 @@ use std::io::Read;
 
 pub mod mc;
 pub mod write;
+pub use bitstream::BlockIter;
 pub use error::{Error, Result};
 pub use flate2::Compression;
-pub use region::{BlockIter, BlockState, Region};
+pub use region::{BlockState, Region};
 pub use stream::{StreamReader, StreamRegion};
 
 /// Decompresses a single gzip member with a hard cap on the output size.
@@ -94,19 +97,13 @@ pub use stream::{StreamReader, StreamRegion};
 ///
 /// Trailing bytes after the first gzip member are ignored.
 pub fn decompress_gzip_with_limit(input: &[u8], limit: u64) -> Result<Vec<u8>> {
-    const CHUNK: usize = 64 * 1024;
+    // `Take` stops inflating as soon as one byte past the cap arrives, so the
+    // bound is enforced during decompression rather than after it.
+    let mut decoder = GzDecoder::new(input).take(limit.saturating_add(1));
     let mut out = Vec::new();
-    let mut decoder = GzDecoder::new(input);
-    let mut chunk = vec![0u8; CHUNK];
-    loop {
-        let n = decoder.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        if out.len() as u64 + n as u64 > limit {
-            return Err(Error::SizeLimitExceeded { limit });
-        }
-        out.extend_from_slice(&chunk[..n]);
+    decoder.read_to_end(&mut out)?;
+    if out.len() as u64 > limit {
+        return Err(Error::SizeLimitExceeded { limit });
     }
     Ok(out)
 }
