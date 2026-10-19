@@ -8,7 +8,7 @@
 //! may over-approximate, and its default implementation discovers the palette
 //! with one extra scan.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Quantity, Result};
 use crate::knowledge::mc::{BlockPos, BlockSize, BlockState, PositionIter};
 use crate::knowledge::nbt::{Encode, Tag, Writer};
 use crate::model::bitstream::Packer;
@@ -91,7 +91,7 @@ pub trait Layout {
 /// same box and a single-region file has nowhere to record a negative axis.
 impl Layout for Region<'_> {
     fn size(&self) -> BlockSize {
-        self.dims()
+        self.size()
     }
 
     fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
@@ -99,7 +99,7 @@ impl Layout for Region<'_> {
     }
 
     fn block_palette(&self) -> HashSet<BlockState> {
-        self.palette().iter().cloned().collect()
+        self.palette().states().iter().cloned().collect()
     }
 }
 
@@ -149,7 +149,7 @@ impl WriteOptions {
     /// Creates options for a schematic named `name` targeting Minecraft
     /// data version `minecraft_data_version`. Timestamps default to now,
     /// description and author to empty, compression to the default level.
-    pub fn new(minecraft_data_version: i32, name: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>, minecraft_data_version: i32) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -184,7 +184,7 @@ impl WriteOptions {
 /// # Example
 ///
 /// ```no_run
-/// # use litematica::task::write::{write, Layout, WriteOptions};
+/// # use litematica::task::writer::{write, Layout, WriteOptions};
 /// # struct MyLayout;
 /// # impl Layout for MyLayout {
 /// #     fn size(&self) -> litematica::knowledge::mc::BlockSize {
@@ -195,7 +195,7 @@ impl WriteOptions {
 /// # }
 /// # fn main() -> Result<(), litematica::error::Error> {
 /// let layout = MyLayout;
-/// let options = WriteOptions::new(4189, "my build");
+/// let options = WriteOptions::new("my build", 4189);
 /// let file = std::fs::File::create("my_build.litematic")?;
 /// write(&layout, &options, file)?;
 /// # Ok(())
@@ -231,12 +231,12 @@ impl<'a, L: Layout> Schematic<'a, L> {
     fn new(layout: &'a L, options: &'a WriteOptions, total_blocks: &'a Cell<i64>) -> Result<Self> {
         let size = layout.size();
         let volume = Self::checked_volume(size)?;
-        let palette = Palette::from_layout(layout.block_palette());
+        let palette = Palette::from_declared(layout.block_palette());
         // `volume <= i32::MAX` and `bits <= 32` bound this well below i32::MAX;
         // the checked conversion keeps the written length prefix honest.
-        let longs = (u128::from(volume as u32) * u128::from(palette.bits())).div_ceil(64);
+        let longs = (u128::from(volume as u32) * u128::from(palette.bits_per_entry())).div_ceil(64);
         let longs = i32::try_from(longs).map_err(|_| Error::DimensionOverflow {
-            what: "BlockStates length",
+            quantity: Quantity::BlockStatesLength,
             value: longs,
         })?;
         Ok(Self {
@@ -253,7 +253,7 @@ impl<'a, L: Layout> Schematic<'a, L> {
     /// Returns the volume as the `i32` the format stores in `TotalVolume`.
     fn checked_volume(size: BlockSize) -> Result<i32> {
         i32::try_from(size.volume()).map_err(|_| Error::DimensionOverflow {
-            what: "volume",
+            quantity: Quantity::Volume,
             value: size.volume(),
         })
     }
@@ -351,7 +351,6 @@ struct Packed<'a, L: Layout> {
     layout: &'a L,
     palette: &'a Palette,
     positions: PositionIter,
-    remaining: u64,
     packer: Packer,
     finished: bool,
     total_blocks: &'a Cell<i64>,
@@ -369,8 +368,7 @@ impl<'a, L: Layout> Packed<'a, L> {
             layout,
             palette,
             positions: size.cartesian_positions(),
-            remaining: u64::try_from(size.volume()).unwrap_or(u64::MAX),
-            packer: Packer::new(palette.bits()),
+            packer: Packer::new(palette.bits_per_entry()),
             finished: false,
             total_blocks,
         }
@@ -386,16 +384,7 @@ impl<L: Layout> Iterator for Packed<'_, L> {
         if self.finished {
             return None;
         }
-        loop {
-            if self.remaining == 0 {
-                self.finished = true;
-                return self.packer.finish().map(|word| Ok(word as i64));
-            }
-            self.remaining -= 1;
-            let pos = self
-                .positions
-                .next()
-                .expect("the walk covers exactly the declared volume");
+        for pos in self.positions.by_ref() {
             let id = match resolve_id(self.palette, self.layout, pos) {
                 Ok(id) => id,
                 Err(error) => {
@@ -410,6 +399,8 @@ impl<L: Layout> Iterator for Packed<'_, L> {
                 return Some(Ok(word as i64));
             }
         }
+        self.finished = true;
+        self.packer.finish().map(|word| Ok(word as i64))
     }
 }
 
@@ -436,7 +427,7 @@ impl Encode for MetadataNbt<'_> {
         self.volume.encode("TotalVolume", out)?;
         let total_blocks =
             i32::try_from(self.total_blocks.get()).map_err(|_| Error::DimensionOverflow {
-                what: "TotalBlocks",
+                quantity: Quantity::TotalBlocks,
                 value: self.total_blocks.get() as u128,
             })?;
         total_blocks.encode("TotalBlocks", out)?;

@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use litematica::model::document::Document;
-use litematica::task::decompress::decompress_gzip_with_limit;
-use litematica::task::stream::StreamReader;
+use litematica::task::decompress::gzip_with_limit;
+use litematica::task::stream::Reader;
 
 #[test]
 #[ignore = "set LITEMATICA_TEST_FILE to a real .litematic file to run this"]
@@ -29,14 +29,14 @@ fn real_file_parse_and_iterate() {
     let raw = std::fs::read(&path).expect("read test file");
 
     let t0 = Instant::now();
-    let nbt = decompress_gzip_with_limit(&raw, 8 << 30).expect("decompress");
+    let nbt = gzip_with_limit(&raw, 8 << 30).expect("decompress");
     let t1 = Instant::now();
     let doc = Document::parse(&nbt).expect("parse");
     let t2 = Instant::now();
 
     let mut volume = 0u64;
     for region in &doc.regions {
-        for _ in region.iter_blocks() {
+        for _ in region.iter_palette_ids() {
             volume += 1;
         }
     }
@@ -52,7 +52,7 @@ fn real_file_parse_and_iterate() {
     println!(
         "volume={} total_volume={} declared_total_volume={:?}",
         volume,
-        doc.total_volume(),
+        doc.volume(),
         doc.metadata.total_volume
     );
     println!(
@@ -61,7 +61,7 @@ fn real_file_parse_and_iterate() {
         (t2 - t1).as_millis(),
         (t3 - t2).as_millis()
     );
-    assert_eq!(volume, doc.total_volume());
+    assert_eq!(volume, doc.volume());
 
     if std::env::var_os("LITEMATICA_DIFF_RUSTMATICA").is_some() {
         diff_against_rustmatica(&raw, &doc);
@@ -81,24 +81,24 @@ fn real_file_stream_matches_document() {
         return;
     };
     let raw = std::fs::read(&path).expect("read test file");
-    let nbt = decompress_gzip_with_limit(&raw, 8 << 30).expect("decompress");
+    let nbt = gzip_with_limit(&raw, 8 << 30).expect("decompress");
     let doc = Document::parse(&nbt).expect("parse");
 
     let file = std::fs::File::open(&path).expect("open test file");
-    let mut reader = StreamReader::open(file, 8 << 30).expect("stream open");
+    let mut reader = Reader::open(file, 8 << 30).expect("stream open");
     let mut count = 0usize;
     while let Some(region) = reader.next_region().expect("region") {
         let expected = &doc.regions[count];
         assert_eq!(region.name, expected.name);
         assert_eq!(region.position, expected.position);
         assert_eq!(region.declared_size, expected.declared_size);
-        assert_eq!(region.dims(), expected.dims());
+        assert_eq!(region.size(), expected.size());
         assert_eq!(region.volume(), expected.volume());
         assert_eq!(region.palette(), expected.palette());
 
         let name = region.name.clone();
-        let mut voxels = expected.iter_blocks();
-        for (seen, index) in region.iter_blocks().enumerate() {
+        let mut voxels = expected.iter_palette_ids();
+        for (seen, index) in region.iter_palette_ids().enumerate() {
             assert_eq!(Some(index), voxels.next(), "voxel {seen} of {name}");
         }
         assert!(voxels.next().is_none(), "region {name} is longer");
@@ -129,7 +129,7 @@ fn diff_against_rustmatica(raw: &[u8], doc: &Document<'_>) {
         for (i, b) in palette.iter().enumerate() {
             ptr_to_idx.insert(b as *const _, i as u32);
         }
-        let mut iter = mregion.iter_blocks();
+        let mut iter = mregion.iter_palette_ids();
         let mut count = 0u64;
         for (_pos, block) in oregion.blocks() {
             let oidx = *ptr_to_idx

@@ -535,7 +535,7 @@ impl<R: IoRead> IoSource<R> {
 
     fn check(&self, n: u64) -> Result<()> {
         if self.pos.saturating_add(n) > self.limit {
-            return Err(Error::SizeLimitExceeded { limit: self.limit });
+            return Err(Error::DecompressionLimitExceeded { limit: self.limit });
         }
         Ok(())
     }
@@ -545,7 +545,7 @@ impl<R: IoRead> IoSource<R> {
 fn map_io(error: std::io::Error, offset: usize) -> Error {
     match error.kind() {
         std::io::ErrorKind::UnexpectedEof => Error::UnexpectedEof { offset },
-        _ => Error::CorruptGzip(error),
+        _ => Error::CorruptGzip { source: error },
     }
 }
 

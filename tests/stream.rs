@@ -15,7 +15,7 @@ use std::io::{Cursor, Write as _};
 use flate2::{write::GzEncoder, Compression};
 use litematica::knowledge::mc::{BlockPos, BlockSize};
 use litematica::model::document::Document;
-use litematica::task::stream::StreamReader;
+use litematica::task::stream::Reader;
 
 // NBT fixture builder
 //
@@ -262,8 +262,8 @@ fn gzip(data: &[u8]) -> Vec<u8> {
     enc.finish().expect("gzip finish")
 }
 
-fn open(bytes: &[u8]) -> StreamReader<Cursor<Vec<u8>>> {
-    StreamReader::open(Cursor::new(bytes.to_vec()), 1 << 30).expect("open fixture")
+fn open(bytes: &[u8]) -> Reader<Cursor<Vec<u8>>> {
+    Reader::open(Cursor::new(bytes.to_vec()), 1 << 30).expect("open fixture")
 }
 
 // Fixtures
@@ -348,17 +348,17 @@ fn stream_matches_document_region_by_region() {
         assert_eq!(region.name, spec.name);
         assert_eq!(region.position, spec.position);
         assert_eq!(region.declared_size, spec.size);
-        assert_eq!(region.dims(), BlockSize::of(spec.size));
+        assert_eq!(region.size(), BlockSize::of(spec.size));
         assert_eq!(region.volume(), spec.volume());
         assert_eq!(region.bits_per_entry(), spec.bits());
         assert_eq!(
-            palette_view(region.palette()),
-            palette_view(doc_region.palette())
+            palette_view(region.palette().states()),
+            palette_view(doc_region.palette().states())
         );
 
-        let ids: Vec<u32> = region.iter_blocks().collect();
+        let ids: Vec<u32> = region.iter_palette_ids().collect();
         assert_eq!(ids, spec.indices, "voxel stream of {}", spec.name);
-        let random: Vec<u32> = doc_region.iter_blocks().collect();
+        let random: Vec<u32> = doc_region.iter_palette_ids().collect();
         assert_eq!(ids, random, "stream vs Document for {}", spec.name);
 
         let states: Vec<&str> = region
@@ -400,11 +400,11 @@ fn field_order_is_irrelevant() {
             assert_eq!(region.position, spec.position);
             assert_eq!(region.declared_size, spec.size);
             assert_eq!(
-                palette_view(region.palette()),
-                palette_view(doc_region.palette())
+                palette_view(region.palette().states()),
+                palette_view(doc_region.palette().states())
             );
 
-            let streamed: Vec<u32> = region.iter_blocks().collect();
+            let streamed: Vec<u32> = region.iter_palette_ids().collect();
             assert_eq!(streamed, spec.indices, "voxel stream of {}", spec.name);
         }
 
@@ -435,7 +435,7 @@ fn dropping_an_unread_region_advances_the_stream() {
         .expect("second header")
         .expect("present");
     assert_eq!(second.name, "negative");
-    let streamed: Vec<u32> = second.iter_blocks().collect();
+    let streamed: Vec<u32> = second.iter_palette_ids().collect();
     assert_eq!(streamed, specs[1].indices);
 }
 
@@ -445,8 +445,8 @@ fn iterating_a_streamed_region_is_repeatable() {
     let mut reader = open(&gzip(&document_bytes(&specs, false, false)));
 
     let region = reader.next_region().expect("header").expect("present");
-    let first: Vec<u32> = region.iter_blocks().collect();
-    let second: Vec<u32> = region.iter_blocks().collect();
+    let first: Vec<u32> = region.iter_palette_ids().collect();
+    let second: Vec<u32> = region.iter_palette_ids().collect();
     assert_eq!(first, specs[0].indices);
     assert_eq!(first, second);
     drop(region);
@@ -462,9 +462,9 @@ fn truncated_and_corrupt_inputs_error_without_panicking() {
     // error; every cut inside the deflate stream must be.
     for cut in [0, bytes.len() / 4, bytes.len() / 2, bytes.len() * 3 / 4] {
         let input = bytes[..cut].to_vec();
-        let outcome = StreamReader::open(Cursor::new(input), 1 << 30).and_then(|mut reader| {
+        let outcome = Reader::open(Cursor::new(input), 1 << 30).and_then(|mut reader| {
             while let Some(region) = reader.next_region()? {
-                region.iter_blocks().for_each(drop);
+                region.iter_palette_ids().for_each(drop);
             }
             Ok(())
         });
@@ -472,5 +472,5 @@ fn truncated_and_corrupt_inputs_error_without_panicking() {
     }
 
     let garbage = vec![0xFFu8; 64];
-    assert!(StreamReader::open(Cursor::new(garbage), 1 << 30).is_err());
+    assert!(Reader::open(Cursor::new(garbage), 1 << 30).is_err());
 }

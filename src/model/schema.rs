@@ -20,7 +20,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::Write as IoWrite;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Quantity, Result};
 use crate::knowledge::mc::{BlockPos, BlockSize, BlockState};
 use crate::knowledge::nbt::{Decode, Encode, FieldEntry, FieldOutcome, FieldTable};
 use crate::knowledge::nbt::{Reader, Slot, Source, Tag, Writer};
@@ -174,7 +174,7 @@ impl Encode for BlockSize {
     fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
         let axis = |value: u32| {
             i32::try_from(value).map_err(|_| Error::DimensionOverflow {
-                what: "size axis",
+                quantity: Quantity::SizeAxis,
                 value: u128::from(value),
             })
         };
@@ -295,7 +295,7 @@ impl Encode for Palette {
     /// with air.
     fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
         let len = i32::try_from(self.len()).map_err(|_| Error::DimensionOverflow {
-            what: "BlockStatePalette length",
+            quantity: Quantity::PaletteLength,
             value: self.len() as u128,
         })?;
         out.list(Tag::Compound, len)?;

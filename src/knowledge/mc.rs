@@ -107,11 +107,11 @@ impl BlockPos {
     /// lower corner shared by all spans.
     pub const ORIGIN: Self = Self::new(0, 0, 0);
 
-    /// The position with one cell on every axis.
+    /// The position one cell past the origin on every axis.
     ///
     /// Useful when moving from a declared size to the far corner of the box it
     /// spans.
-    pub const ONE: Self = Self::new(1, 1, 1);
+    pub const UNIT: Self = Self::new(1, 1, 1);
 
     /// Creates a position from its three components.
     ///
@@ -127,7 +127,7 @@ impl BlockPos {
     /// The result always lies in the positive octant. This is a plain
     /// coordinate operation, not the way to obtain a span; use
     /// [`BlockSize::of`] to read a signed size as the box it covers.
-    pub const fn abs(&self) -> Self {
+    pub const fn abs(self) -> Self {
         Self {
             x: self.x.abs(),
             y: self.y.abs(),

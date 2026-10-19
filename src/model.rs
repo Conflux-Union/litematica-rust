@@ -23,7 +23,7 @@ pub mod document {
     //!
     //! Metadata is kept exactly as declared. In particular the file's
     //! `EnclosingSize` is a cached summary written by the authoring tool, so it
-    //! may disagree with the regions; [`Document::enclosing_size`] computes the
+    //! may disagree with the regions; [`Document::bounding_size`] computes the
     //! box the regions actually span instead.
 
     use crate::knowledge::mc::{BlockPos, BlockSize};
@@ -89,7 +89,7 @@ pub mod document {
         /// Each region's volume is validated during parsing to fit a `u64`; the
         /// sum saturates rather than wrapping, which in practice can only happen
         /// for inputs far beyond any real file.
-        pub fn total_volume(&self) -> u64 {
+        pub fn volume(&self) -> u64 {
             self.regions
                 .iter()
                 .map(Region::volume)
@@ -110,7 +110,7 @@ pub mod document {
         /// `|mx - mn + 1|`.
         ///
         /// Returns `None` if the document has no regions.
-        pub fn enclosing_size(&self) -> Option<BlockSize> {
+        pub fn bounding_size(&self) -> Option<BlockSize> {
             if self.regions.is_empty() {
                 return None;
             }
@@ -118,11 +118,11 @@ pub mod document {
             for region in &self.regions {
                 let p = region.position;
                 let s = region.declared_size;
-                lo = lo.min(p.min(p.saturating_add(s).saturating_add(BlockPos::ONE)));
-                hi = hi.max(p.max(p.saturating_add(s).saturating_sub(BlockPos::ONE)));
+                lo = lo.min(p.min(p.saturating_add(s).saturating_add(BlockPos::UNIT)));
+                hi = hi.max(p.max(p.saturating_add(s).saturating_sub(BlockPos::UNIT)));
             }
             Some(BlockSize::of(
-                hi.saturating_sub(lo).saturating_add(BlockPos::ONE),
+                hi.saturating_sub(lo).saturating_add(BlockPos::UNIT),
             ))
         }
     }

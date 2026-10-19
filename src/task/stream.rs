@@ -1,7 +1,7 @@
 //! Sequential, bounded-memory reading of `.litematic` files.
 //!
 //! The counterpart of [`crate::model::document::Document`]: instead of
-//! borrowing a fully decompressed buffer, a [`StreamReader`] pulls the gzip member through a
+//! borrowing a fully decompressed buffer, a [`Reader`] pulls the gzip member through a
 //! small buffer and hands out one [`Region`] at a time. A region's palette is
 //! materialized (it is small) and its packed `BlockStates` payload is held
 //! only while that region is alive, then released. Peak memory is
@@ -25,12 +25,12 @@ use std::io::{BufReader, Read};
 use flate2::read::GzDecoder;
 
 use crate::error::{Error, Result};
-use crate::knowledge::nbt::{FieldOutcome, IoSource, Reader, Slot, Source, Tag};
+use crate::knowledge::nbt::{FieldOutcome, IoSource, Reader as NbtReader, Slot, Source, Tag};
 use crate::model::document::Metadata;
 use crate::model::region::{Region, RegionHeader, RegionParts};
 use crate::model::schema::RootFields;
 
-/// A buffered gzip stream, the byte source a [`StreamReader`] consumes.
+/// A buffered gzip stream, the byte source a [`Reader`] consumes.
 type GzipSource<R> = IoSource<BufReader<GzDecoder<R>>>;
 
 // Stream reader
@@ -40,37 +40,37 @@ type GzipSource<R> = IoSource<BufReader<GzDecoder<R>>>;
 /// A sequential reader for gzip-compressed `.litematic` files.
 ///
 /// Opening the stream scans root fields until `Regions` is reached, collecting
-/// header fields whenever they appear. [`StreamReader::metadata`] returns
+/// header fields whenever they appear. [`Reader::metadata`] returns
 /// `None` until `Metadata` has been scanned, which may be after the last
-/// region. Each call to [`StreamReader::next_region`] parses one region
+/// region. Each call to [`Reader::next_region`] parses one region
 /// completely and returns it.
-pub struct StreamReader<R: Read> {
-    reader: Reader<GzipSource<R>>,
+pub struct Reader<R: Read> {
+    reader: NbtReader<GzipSource<R>>,
     root_depth: usize,
     regions_depth: usize,
     header: RootFields,
     done: bool,
 }
 
-impl<R: Read> std::fmt::Debug for StreamReader<R> {
+impl<R: Read> std::fmt::Debug for Reader<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamReader")
+        f.debug_struct("Reader")
             .field("metadata", &self.header.metadata())
             .field("done", &self.done)
             .finish_non_exhaustive()
     }
 }
 
-impl<R: Read> StreamReader<R> {
+impl<R: Read> Reader<R> {
     /// Opens a gzip-compressed litematic and scans the root up to `Regions`.
     ///
     /// `limit` caps the decompressed byte count; exceeding it fails with
-    /// [`Error::SizeLimitExceeded`] while inflating, so an untrusted file
+    /// [`Error::DecompressionLimitExceeded`] while inflating, so an untrusted file
     /// cannot force unbounded memory or CPU use. Trailing bytes after the
     /// first gzip member are ignored.
     pub fn open(inner: R, limit: u64) -> Result<Self> {
         let decoder = BufReader::with_capacity(64 * 1024, GzDecoder::new(inner));
-        let mut reader = Reader::new(IoSource::new(decoder, limit));
+        let mut reader = NbtReader::new(IoSource::new(decoder, limit));
 
         let tag = reader.tag()?;
         reader.expect("root", tag, Tag::Compound)?;
@@ -186,7 +186,7 @@ impl<R: Read> StreamReader<R> {
     }
 }
 
-impl<R: Read> Iterator for StreamReader<R> {
+impl<R: Read> Iterator for Reader<R> {
     type Item = Result<Region<'static>>;
 
     /// Yields regions until the end of `Regions`.
@@ -194,7 +194,7 @@ impl<R: Read> Iterator for StreamReader<R> {
     /// An error ends the iteration: the stream cannot be resumed after a parse
     /// failure, so every later call returns `None`. Once exhausted, a trailing
     /// `Metadata` has been scanned and is available through
-    /// [`StreamReader::metadata`].
+    /// [`Reader::metadata`].
     fn next(&mut self) -> Option<Self::Item> {
         let region = self.next_region();
         if region.is_err() {
@@ -204,14 +204,14 @@ impl<R: Read> Iterator for StreamReader<R> {
     }
 }
 
-impl<R: Read> std::iter::FusedIterator for StreamReader<R> {}
+impl<R: Read> std::iter::FusedIterator for Reader<R> {}
 
 /// Reads a `BlockStates` long array into owned bytes.
 ///
 /// The buffer grows in chunks and is never pre-allocated at the claimed
 /// length, so a hostile count cannot force a huge allocation before the
 /// payload (and the decompression limit) proves it real.
-fn read_payload<S: Source>(reader: &mut Reader<S>, longs: usize) -> Result<Vec<u8>> {
+fn read_payload<S: Source>(reader: &mut NbtReader<S>, longs: usize) -> Result<Vec<u8>> {
     const CHUNK: usize = 64 * 1024;
     let total = longs.checked_mul(8).ok_or_else(|| Error::PayloadTooLarge {
         longs,

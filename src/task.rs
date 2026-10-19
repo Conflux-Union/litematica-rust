@@ -3,11 +3,11 @@
 //! Each task consumes the model layer and owns its I/O: [`decompress`] feeds
 //! the readers, `parse` builds a whole
 //! [`crate::model::document::Document`], [`stream`] walks one region at a
-//! time, and [`mod@write`] emits a layout. Tasks never redefine a model type;
+//! time, and [`mod@writer`] emits a layout. Tasks never redefine a model type;
 //! they add behavior to the one model the crate shares.
 
 pub mod stream;
-pub mod write;
+pub mod writer;
 
 pub mod decompress {
     //! Bounded decompression, the entry point shared by both readers.
@@ -20,21 +20,21 @@ pub mod decompress {
     /// Decompresses a single gzip member with a hard cap on the output size.
     ///
     /// The check happens while decompressing: as soon as the cumulative output
-    /// would exceed `limit` bytes, an [`Error::SizeLimitExceeded`] is returned
+    /// would exceed `limit` bytes, an [`Error::DecompressionLimitExceeded`] is returned
     /// and no further data is inflated. This bounds the memory an untrusted
     /// file can force the caller to allocate. A corrupt or truncated gzip
     /// stream surfaces as [`Error::CorruptGzip`] wrapping the underlying I/O
     /// error.
     ///
     /// Trailing bytes after the first gzip member are ignored.
-    pub fn decompress_gzip_with_limit(input: &[u8], limit: u64) -> Result<Vec<u8>> {
+    pub fn gzip_with_limit(input: &[u8], limit: u64) -> Result<Vec<u8>> {
         // `Take` stops inflating as soon as one byte past the cap arrives, so
         // the bound is enforced during decompression rather than after it.
         let mut decoder = GzDecoder::new(input).take(limit.saturating_add(1));
         let mut out = Vec::new();
         decoder.read_to_end(&mut out)?;
         if out.len() as u64 > limit {
-            return Err(Error::SizeLimitExceeded { limit });
+            return Err(Error::DecompressionLimitExceeded { limit });
         }
         Ok(out)
     }

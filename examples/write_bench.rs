@@ -15,7 +15,7 @@
 use std::time::Instant;
 
 use litematica::knowledge::mc::{BlockPos, BlockSize, BlockState};
-use litematica::task::write::{write, Layout, WriteOptions};
+use litematica::task::writer::{write, Layout, WriteOptions};
 
 /// Peak resident set size in bytes (Linux only, from VmHWM).
 fn peak_rss_bytes() -> Option<u64> {
@@ -74,7 +74,7 @@ fn main() -> Result<(), litematica::error::Error> {
         shell: "minecraft:stone".into(),
         filler: "minecraft:glass".into(),
     };
-    let options = WriteOptions::new(4189, "write bench");
+    let options = WriteOptions::new("write bench", 4189);
 
     let t0 = Instant::now();
     let file = std::fs::File::create(&out_path)?;

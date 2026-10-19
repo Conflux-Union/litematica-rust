@@ -3,7 +3,7 @@
 //!
 //! A litematic region stores palette identifiers as a continuous LSB-first bit
 //! stream carried by big-endian longs: entry `i` starts at bit `i * width` and
-//! may straddle two words. [`BlockIter`] walks that stream, while the private
+//! may straddle two words. [`PaletteIdIter`] walks that stream, while the private
 //! `BitStream` and `Packer` implement the two directions. Keeping both
 //! directions here means the word layout is stated once, next to itself.
 
@@ -83,8 +83,8 @@ impl<'a> BitStream<'a> {
     }
 
     /// Iterates over `volume` entries in storage order.
-    pub(crate) fn iter(self, volume: u64) -> BlockIter<'a> {
-        BlockIter::new(self, volume)
+    pub(crate) fn iter(self, volume: u64) -> PaletteIdIter<'a> {
+        PaletteIdIter::new(self, volume)
     }
 
     /// Entry `index`, or `None` when the payload does not reach it.
@@ -204,7 +204,7 @@ impl<B: AsRef<[u8]>> LongSource for Longs<B> {
 /// rustmatica.
 #[derive(Debug)]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
-pub struct BlockIter<'a> {
+pub struct PaletteIdIter<'a> {
     cursor: BitCursor,
     source: Longs<Bytes<'a>>,
     bits: u32,
@@ -212,7 +212,7 @@ pub struct BlockIter<'a> {
     remaining: u64,
 }
 
-impl<'a> BlockIter<'a> {
+impl<'a> PaletteIdIter<'a> {
     fn new(stream: BitStream<'a>, volume: u64) -> Self {
         Self {
             cursor: BitCursor::new(),
@@ -227,7 +227,7 @@ impl<'a> BlockIter<'a> {
     }
 }
 
-impl Iterator for BlockIter<'_> {
+impl Iterator for PaletteIdIter<'_> {
     type Item = PaletteId;
 
     #[inline]
@@ -246,7 +246,7 @@ impl Iterator for BlockIter<'_> {
     }
 }
 
-impl ExactSizeIterator for BlockIter<'_> {
+impl ExactSizeIterator for PaletteIdIter<'_> {
     #[inline]
     fn len(&self) -> usize {
         usize::try_from(self.remaining).unwrap_or(usize::MAX)
@@ -259,7 +259,7 @@ impl ExactSizeIterator for BlockIter<'_> {
 
 /// Packs palette indices into the `BlockStates` bit stream.
 ///
-/// The mirror of [`BlockIter`]: one continuous LSB-first stream of
+/// The mirror of [`PaletteIdIter`]: one continuous LSB-first stream of
 /// `bits`-wide entries, big-endian longs, entries straddling long boundaries.
 /// A long is returned the moment 64 bits have accumulated;
 /// [`Packer::finish`] flushes the trailing partial long, zero-padded.
@@ -312,7 +312,7 @@ impl Packer {
 
 #[cfg(test)]
 mod tests {
-    use super::{BitStream, BlockIter, Packer};
+    use super::{BitStream, Packer, PaletteIdIter};
     use crate::model::palette::PaletteId;
 
     #[test]
@@ -328,7 +328,7 @@ mod tests {
             }
         }
         let bytes = acc.to_be_bytes();
-        let iter = BlockIter::new(BitStream::borrowed(&bytes, 3), values.len() as u64);
+        let iter = PaletteIdIter::new(BitStream::borrowed(&bytes, 3), values.len() as u64);
         assert_eq!(iter.len(), values.len());
         let decoded: Vec<u32> = iter.collect();
         assert_eq!(decoded, values);
@@ -340,7 +340,7 @@ mod tests {
         let values: Vec<u32> = (0..20).map(|i| (i * 7 + 3) % 32).collect();
         let bytes = pack(&values, 5);
         let decoded: Vec<PaletteId> =
-            BlockIter::new(BitStream::borrowed(&bytes, 5), values.len() as u64).collect();
+            PaletteIdIter::new(BitStream::borrowed(&bytes, 5), values.len() as u64).collect();
         assert_eq!(decoded, values);
     }
 

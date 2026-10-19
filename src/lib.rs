@@ -6,13 +6,13 @@
 //! crate takes a different route:
 //!
 //! - the gzip member is decompressed once into a bounded buffer
-//!   ([`task::decompress::decompress_gzip_with_limit`]);
+//!   ([`task::decompress::gzip_with_limit`]);
 //! - the NBT payload is scanned by a hand-written forward-only cursor that
 //!   never builds a tree ([`model::document::Document::parse`]);
 //! - block state palettes are the only block data that is materialized;
 //!   the packed `BlockStates` payload is borrowed from the input buffer and
 //!   decoded on demand, either voxel by voxel by
-//!   [`model::region::Region::iter_blocks`] or one entry at a time by
+//!   [`model::region::Region::iter_palette_ids`] or one entry at a time by
 //!   [`model::region::Region::state_at`].
 //!
 //! Two read modes share that decoder:
@@ -21,12 +21,12 @@
 //!   random access to every region, including
 //!   [`model::region::Region::state_at`] in O(1). Memory is the decompressed
 //!   payload plus the palettes.
-//! - [`task::stream::StreamReader`] keeps memory bounded by the gzip buffer,
+//! - [`task::stream::Reader`] keeps memory bounded by the gzip buffer,
 //!   the current palette, and one region's packed payload, independent of the
 //!   schematic's volume. NBT field order does not matter: a region's payload
 //!   is held only until its other fields have been read, then decoded voxel by
 //!   voxel and released. `Metadata` may appear before or after `Regions`, so
-//!   [`task::stream::StreamReader::metadata`] returns `None` until it has been
+//!   [`task::stream::Reader::metadata`] returns `None` until it has been
 //!   scanned.
 //!
 //! Unknown fields (`Entities`, `TileEntities`, pending ticks, preview image
@@ -34,8 +34,8 @@
 //! a single linear scan of the decompressed bytes plus lazy iteration.
 //!
 //! The crate also writes schematics with the same discipline: a
-//! [`task::write::Layout`] answers point queries (`size`, `block_at`), and
-//! [`task::write::write()`] serializes it
+//! [`task::writer::Layout`] answers point queries (`size`, `block_at`), and
+//! [`task::writer::write()`] serializes it
 //! as a single-region file straight into any [`std::io::Write`] (file or
 //! network stream), with memory bounded by the palette rather than the
 //! volume — writing a 566x256x1423 layout (206 million voxels) peaks at a
@@ -56,7 +56,7 @@
 //!   [`model::document::Document`]): the litematic types and their invariants,
 //!   with no I/O;
 //! - tasks ([`model::document::Document::parse`],
-//!   [`task::stream::StreamReader`], [`task::write`]): byte movement,
+//!   [`task::stream::Reader`], [`task::writer`]): byte movement,
 //!   decompression, and serialization.
 //!
 //! Model types are defined once and shared by every task; no task carries a
@@ -68,18 +68,18 @@
 //!
 //! ```no_run
 //! use litematica::model::document::Document;
-//! use litematica::task::decompress::decompress_gzip_with_limit;
+//! use litematica::task::decompress::gzip_with_limit;
 //!
 //! # fn main() -> Result<(), litematica::error::Error> {
 //! let raw = std::fs::read("bridge.litematic")?;
-//! let nbt = decompress_gzip_with_limit(&raw, 512 * 1024 * 1024)?;
+//! let nbt = gzip_with_limit(&raw, 512 * 1024 * 1024)?;
 //! let doc = Document::parse(&nbt)?;
 //!
-//! println!("{} region(s), {} voxels total", doc.regions.len(), doc.total_volume());
+//! println!("{} region(s), {} voxels total", doc.regions.len(), doc.volume());
 //! for region in &doc.regions {
-//!     for index in region.iter_blocks() {
+//!     for index in region.iter_palette_ids() {
 //!         // Indices are not validated against the palette; bounds-check.
-//!         if let Some(state) = region.palette().get(index as usize) {
+//!         if let Some(state) = region.palette().states().get(index as usize) {
 //!             // inspect `state.name` and `state.properties`
 //!         }
 //!     }

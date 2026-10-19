@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use litematica::knowledge::mc::{BlockPos as McBlockPos, BlockSize as McBlockSize};
 use litematica::model::document::Document;
-use litematica::task::decompress::decompress_gzip_with_limit;
+use litematica::task::decompress::gzip_with_limit;
 use mcdata::util::BlockPos;
 use mcdata::{GenericBlockEntity, GenericBlockState, GenericEntity};
 use rustmatica::{Litematic, Region};
@@ -108,7 +108,7 @@ fn fill_region(region: &mut OracleRegion, rng: &mut Rng, states: &[GenericBlockS
 
 fn assert_matches_oracle(schem: &Schematic) {
     let bytes = schem.to_bytes().expect("serialize fixture");
-    let nbt = decompress_gzip_with_limit(&bytes, 1 << 40).expect("decompress fixture");
+    let nbt = gzip_with_limit(&bytes, 1 << 40).expect("decompress fixture");
     let doc = Document::parse(&nbt).expect("our parse");
     let oracle: Schematic = Litematic::from_bytes(&bytes).expect("oracle parse");
 
@@ -141,7 +141,7 @@ fn assert_matches_oracle(schem: &Schematic) {
 
     // Computed document values must match the oracle's formulas.
     assert_eq!(
-        doc.total_volume(),
+        doc.volume(),
         oracle
             .regions
             .iter()
@@ -149,7 +149,7 @@ fn assert_matches_oracle(schem: &Schematic) {
             .sum::<u64>()
     );
     assert_eq!(
-        doc.enclosing_size(),
+        doc.bounding_size(),
         Some(McBlockSize::new(
             enclosing.x as u32,
             enclosing.y as u32,
@@ -185,7 +185,7 @@ fn assert_matches_oracle(schem: &Schematic) {
             opalette.len(),
             "palette length of {name}"
         );
-        for (i, (mstate, ostate)) in mregion.palette().iter().zip(opalette).enumerate() {
+        for (i, (mstate, ostate)) in mregion.palette().states().iter().zip(opalette).enumerate() {
             assert_eq!(
                 mstate.name,
                 ostate.name.to_string(),
@@ -214,7 +214,7 @@ fn assert_matches_oracle(schem: &Schematic) {
         for (i, b) in opalette.iter().enumerate() {
             ptr_to_idx.insert(b as *const _, i as u32);
         }
-        let mut ours_iter = mregion.iter_blocks();
+        let mut ours_iter = mregion.iter_palette_ids();
         assert_eq!(ours_iter.len() as u64, mregion.volume());
         for (i, (_pos, block)) in oregion.blocks().enumerate() {
             let oidx = *ptr_to_idx

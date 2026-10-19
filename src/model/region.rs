@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::knowledge::mc::{BlockPos, BlockSize, BlockState};
 use crate::knowledge::nbt::{FieldEntry, FieldOutcome, FieldTable, Reader};
 use crate::knowledge::nbt::{SliceSource, Slot, Source, Tag};
-use crate::model::bitstream::{BitStream, BlockIter};
+use crate::model::bitstream::{BitStream, PaletteIdIter};
 use crate::model::palette::{Palette, PaletteId};
 
 // Region header
@@ -103,8 +103,8 @@ pub(crate) struct RegionParts {
 /// Validation lives here so the random-access and streaming readers cannot
 /// disagree about what a well-formed region is.
 pub(crate) struct Geometry {
-    pub(crate) dims: BlockSize,
-    pub(crate) bits: u32,
+    pub(crate) size: BlockSize,
+    pub(crate) bits_per_entry: u32,
     pub(crate) volume: u64,
 }
 
@@ -119,19 +119,19 @@ impl Geometry {
         payload_bytes: u64,
         offset: usize,
     ) -> Result<Self> {
-        let dims = BlockSize::of(size);
-        let volume128 = dims.volume();
-        let bits = palette.bits();
+        let size = BlockSize::of(size);
+        let volume128 = size.volume();
+        let bits_per_entry = palette.bits_per_entry();
 
         if volume128 > 0 && palette.is_empty() {
             return Err(Error::EmptyPalette { offset });
         }
-        if (1u64 << bits) < palette.len() as u64 {
+        if (1u64 << bits_per_entry) < palette.len() as u64 {
             return Err(Error::PaletteTooLarge { offset });
         }
         // Checked before the u64 overflow check so that a hostile file with a
         // huge claimed Size is always reported as truncated block data.
-        let required = (volume128 * u128::from(bits)).div_ceil(8);
+        let required = (volume128 * u128::from(bits_per_entry)).div_ceil(8);
         if u128::from(payload_bytes) < required {
             return Err(Error::TruncatedBlockStates {
                 have: payload_bytes,
@@ -140,7 +140,11 @@ impl Geometry {
             });
         }
         let volume = u64::try_from(volume128).map_err(|_| Error::VolumeOverflow { offset })?;
-        Ok(Self { dims, bits, volume })
+        Ok(Self {
+            size,
+            bits_per_entry,
+            volume,
+        })
     }
 }
 
@@ -152,7 +156,7 @@ impl Geometry {
 ///
 /// The block data itself is never expanded: palette identifiers are decoded
 /// from the packed `BlockStates` payload on demand, either one at a time in
-/// storage order through [`Region::iter_blocks`] or at random coordinates
+/// storage order through [`Region::iter_palette_ids`] or at random coordinates
 /// through [`Region::state_at`]. Both routes share one bit-stream decoder.
 ///
 /// A region either borrows the file's payload (`Document`) or owns it (the
@@ -166,9 +170,9 @@ pub struct Region<'a> {
     pub position: BlockPos,
     /// Size of the region as declared in the file. Components may be negative,
     /// which means the region extends in the negative axis direction; the box
-    /// actually addressed is [`Region::dims`].
+    /// actually addressed is [`Region::size`].
     pub declared_size: BlockPos,
-    dims: BlockSize,
+    size: BlockSize,
     palette: Palette,
     blocks: BitStream<'a>,
     volume: u64,
@@ -251,25 +255,25 @@ impl<'a> Region<'a> {
             name,
             position,
             declared_size: size,
-            dims: geometry.dims,
+            size: geometry.size,
             palette,
-            blocks: blocks.with_bits(geometry.bits),
+            blocks: blocks.with_bits(geometry.bits_per_entry),
             volume: geometry.volume,
         })
     }
 
     /// The block state palette, in file order. Palette identifiers yielded by
-    /// [`Region::iter_blocks`] refer to this slice.
-    pub fn palette(&self) -> &[BlockState] {
-        self.palette.states()
+    /// [`Region::iter_palette_ids`] index [`Palette::states`].
+    pub fn palette(&self) -> &Palette {
+        &self.palette
     }
 
     /// The absolute size per axis, with any negative direction folded away.
-    pub fn dims(&self) -> BlockSize {
-        self.dims
+    pub fn size(&self) -> BlockSize {
+        self.size
     }
 
-    /// The number of voxels in this region, `dims().volume()` narrowed to
+    /// The number of voxels in this region, `size().volume()` narrowed to
     /// `u64`.
     ///
     /// [`crate::model::document::Document::parse`] rejects regions whose
@@ -279,19 +283,19 @@ impl<'a> Region<'a> {
         self.volume
     }
 
-    /// Bits used per block entry in the `BlockStates` bit stream: the smallest
-    /// `n >= 2` such that `2^n >= palette().len()`.
+    /// Bits used per block entry in the `BlockStates` bit stream; the same rule
+    /// as [`Palette::bits_per_entry`].
     pub fn bits_per_entry(&self) -> u32 {
-        self.palette.bits()
+        self.palette.bits_per_entry()
     }
 
     /// The palette identifier stored at `pos`, in region-local coordinates, or
-    /// `None` when `pos` falls outside [`Region::dims`].
+    /// `None` when `pos` falls outside [`Region::size`].
     ///
     /// The cost is one bit-stream decode, independent of the region's volume;
     /// the packed payload is never expanded.
     pub fn palette_id_at(&self, pos: BlockPos) -> Option<PaletteId> {
-        let index = self.dims.index_of(pos)?;
+        let index = self.size.index_of(pos)?;
         self.blocks.entry(index)
     }
 
@@ -316,10 +320,10 @@ impl<'a> Region<'a> {
     ///
     /// Identifiers are not validated against the palette length: a hostile or
     /// corrupt file may yield identifiers `>= palette().len()`. Callers must
-    /// bounds-check, e.g. with `palette().get(id as usize)`, or use
+    /// bounds-check, e.g. with `palette().states().get(id as usize)`, or use
     /// [`Region::state_at`], which does it. This iterator never panics on such
     /// input.
-    pub fn iter_blocks(&self) -> BlockIter<'a> {
+    pub fn iter_palette_ids(&self) -> PaletteIdIter<'a> {
         self.blocks.clone().iter(self.volume)
     }
 
@@ -328,10 +332,10 @@ impl<'a> Region<'a> {
     ///
     /// Identifiers that do not name a palette entry — possible only for a
     /// malformed file — are skipped, so this iterator is total without
-    /// requiring the caller to bounds-check. Use [`Region::iter_blocks`] when
+    /// requiring the caller to bounds-check. Use [`Region::iter_palette_ids`] when
     /// the raw identifiers themselves matter.
     pub fn iter_states(&self) -> impl Iterator<Item = &BlockState> + '_ {
-        self.iter_blocks()
-            .filter_map(|id| self.palette().get(id as usize))
+        self.iter_palette_ids()
+            .filter_map(|id| self.palette().states().get(id as usize))
     }
 }

@@ -10,8 +10,8 @@ use flate2::{write::GzEncoder, Compression};
 use litematica::error::Error;
 use litematica::knowledge::mc::{BlockPos, BlockSize};
 use litematica::model::document::Document;
-use litematica::task::decompress::decompress_gzip_with_limit;
-use litematica::task::stream::StreamReader;
+use litematica::task::decompress::gzip_with_limit;
+use litematica::task::stream::Reader;
 
 // ---------------------------------------------------------------- builder
 
@@ -238,11 +238,11 @@ fn control_minimal_file_parses() {
     assert_eq!(region.volume(), 4);
     assert_eq!(region.bits_per_entry(), 2);
     assert_eq!(region.palette().len(), 2);
-    assert_eq!(region.palette()[1].name, "minecraft:stone");
-    let stream: Vec<u32> = region.iter_blocks().collect();
+    assert_eq!(region.palette().states()[1].name, "minecraft:stone");
+    let stream: Vec<u32> = region.iter_palette_ids().collect();
     assert_eq!(stream, vec![0, 1, 0, 1]);
-    assert_eq!(doc.total_volume(), 4);
-    assert_eq!(doc.enclosing_size(), Some(BlockSize::new(4, 1, 1)));
+    assert_eq!(doc.volume(), 4);
+    assert_eq!(doc.bounding_size(), Some(BlockSize::new(4, 1, 1)));
 }
 
 #[test]
@@ -477,44 +477,44 @@ fn malicious_sizes_are_not_trusted() {
 #[test]
 fn decompression_guards() {
     // Not gzip at all.
-    let err = decompress_gzip_with_limit(b"definitely not gzip", 1 << 20).expect_err("must fail");
-    assert!(matches!(err, Error::CorruptGzip(_)), "{err:?}");
+    let err = gzip_with_limit(b"definitely not gzip", 1 << 20).expect_err("must fail");
+    assert!(matches!(err, Error::CorruptGzip { .. }), "{err:?}");
 
     // Corrupted body of an otherwise valid stream, and a truncated stream.
     let mut gz = gzip(&minimal_valid());
     let mid = gz.len() / 2;
     gz[mid] ^= 0xff;
-    let err = decompress_gzip_with_limit(&gz, 1 << 20).expect_err("must fail");
-    assert!(matches!(err, Error::CorruptGzip(_)), "{err:?}");
+    let err = gzip_with_limit(&gz, 1 << 20).expect_err("must fail");
+    assert!(matches!(err, Error::CorruptGzip { .. }), "{err:?}");
 
     let gz = gzip(&minimal_valid());
-    let err = decompress_gzip_with_limit(&gz[..gz.len() / 2], 1 << 20).expect_err("must fail");
-    assert!(matches!(err, Error::CorruptGzip(_)), "{err:?}");
+    let err = gzip_with_limit(&gz[..gz.len() / 2], 1 << 20).expect_err("must fail");
+    assert!(matches!(err, Error::CorruptGzip { .. }), "{err:?}");
 
     // Output beyond the limit, including a zero limit; exactly the limit is
     // allowed.
     let data = vec![0u8; 1000];
     let gz = gzip(&data);
-    let err = decompress_gzip_with_limit(&gz, 10).expect_err("must fail");
+    let err = gzip_with_limit(&gz, 10).expect_err("must fail");
     assert!(
-        matches!(err, Error::SizeLimitExceeded { limit: 10 },),
+        matches!(err, Error::DecompressionLimitExceeded { limit: 10 },),
         "{err:?}"
     );
     assert!(err.to_string().contains("10"), "{err}");
 
-    let err = decompress_gzip_with_limit(&gz, 0).expect_err("must fail");
+    let err = gzip_with_limit(&gz, 0).expect_err("must fail");
     assert!(
-        matches!(err, Error::SizeLimitExceeded { limit: 0 }),
+        matches!(err, Error::DecompressionLimitExceeded { limit: 0 }),
         "{err:?}"
     );
 
-    let out = decompress_gzip_with_limit(&gz, 1000).expect("must succeed");
+    let out = gzip_with_limit(&gz, 1000).expect("must succeed");
     assert_eq!(out.len(), 1000);
 
     // The streaming reader applies the same limit while opening.
-    let err = StreamReader::open(Cursor::new(gz), 0).expect_err("limit must bite");
+    let err = Reader::open(Cursor::new(gz), 0).expect_err("limit must bite");
     assert!(
-        matches!(err, Error::SizeLimitExceeded { limit: 0 }),
+        matches!(err, Error::DecompressionLimitExceeded { limit: 0 }),
         "{err:?}"
     );
 }
@@ -532,12 +532,12 @@ fn out_of_range_indices_yield_without_panic() {
     fields.push(regions_field(&[spec]));
     let bytes = root(&fields);
     let doc = Document::parse(&bytes).expect("parse must succeed");
-    let stream: Vec<u32> = doc.regions[0].iter_blocks().collect();
+    let stream: Vec<u32> = doc.regions[0].iter_palette_ids().collect();
     assert_eq!(stream, vec![3, 3]);
     // The resolved-state iterator drops identifiers with no palette entry.
     assert_eq!(doc.regions[0].iter_states().count(), 0);
     // Bounds-checking is the caller's job.
-    assert!(doc.regions[0].palette().get(3).is_none());
+    assert!(doc.regions[0].palette().states().get(3).is_none());
     // The checked accessor treats the dangling index as absent.
     assert_eq!(doc.regions[0].state_at(BlockPos::new(0, 0, 0)), None);
 }
@@ -556,9 +556,9 @@ fn zero_volume_tolerates_empty_palette_and_states() {
     let bytes = root(&fields);
     let doc = Document::parse(&bytes).expect("zero volume must parse");
     assert_eq!(doc.regions[0].volume(), 0);
-    assert_eq!(doc.regions[0].iter_blocks().count(), 0);
-    assert_eq!(doc.total_volume(), 0);
-    assert_eq!(doc.enclosing_size(), Some(BlockSize::new(1, 3, 4)));
+    assert_eq!(doc.regions[0].iter_palette_ids().count(), 0);
+    assert_eq!(doc.volume(), 0);
+    assert_eq!(doc.bounding_size(), Some(BlockSize::new(1, 3, 4)));
 }
 
 #[test]

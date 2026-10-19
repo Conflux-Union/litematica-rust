@@ -14,7 +14,7 @@
 use std::time::Instant;
 
 use litematica::model::document::Document;
-use litematica::task::decompress::decompress_gzip_with_limit;
+use litematica::task::decompress::gzip_with_limit;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -66,7 +66,7 @@ fn main() {
     let total_start = Instant::now();
 
     let t0 = Instant::now();
-    let nbt = decompress_gzip_with_limit(&bytes_in, limit).unwrap_or_else(|e| {
+    let nbt = gzip_with_limit(&bytes_in, limit).unwrap_or_else(|e| {
         eprintln!("decompress failed: {e}");
         std::process::exit(1);
     });
@@ -85,7 +85,7 @@ fn main() {
     let mut regions = 0u64;
     for region in &doc.regions {
         regions += 1;
-        for index in region.iter_blocks() {
+        for index in region.iter_palette_ids() {
             volume += 1;
             checksum ^= u64::from(index);
             checksum = checksum.wrapping_mul(FNV_PRIME);
