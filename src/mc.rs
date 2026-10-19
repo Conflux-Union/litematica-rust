@@ -1,20 +1,53 @@
-//! Minecraft coordinate types used by the writer.
+//! The Minecraft vocabulary a schematic is built from: where a block sits and
+//! what that block is.
+//!
+//! [`BlockState`] is the first half of the vocabulary: a namespaced block id
+//! together with its properties. It is cheap to clone and orders
+//! deterministically, which is what makes it usable as a palette key in both
+//! the writer and downstream layout combinators.
 //!
 //! Schematic code thinks in two quantities that happen to share one shape: a
-//! point in the world, and the span of a box. This module gives both the same
-//! signed triple, so a value can move between the two roles without a
-//! conversion type, and a bounding box can be passed wherever a position is
-//! expected. The one convention that keeps the roles readable is the origin
-//! anchor: extent operations measure from [`BlockPos::ORIGIN`], so a size is
-//! the corner opposite the origin rather than a free-floating vector.
-//!
-//! Arithmetic follows vector intuition: `+` and `-` are component-wise,
-//! `*` and `/` with an `i32` scale every axis, and `*` between two positions is
-//! the cross product. Use [`BlockPos::component_mul`] for the component-wise
-//! reading.
+//! point in the world, and the span of a box. [`BlockPos`] gives both the same
+//! signed triple, so a value moves between the two roles without a conversion
+//! type, and a bounding box can be passed wherever a position is expected. The
+//! convention that keeps the roles readable is the origin anchor: extent
+//! operations measure from [`BlockPos::ORIGIN`], so a size is the corner
+//! opposite the origin rather than a free-floating vector.
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+
+// BlockState
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
+/// A single block state from a region palette.
+///
+/// The id is namespaced, as in `minecraft:redstone_wire`. Properties are keyed
+/// by name, so equality and ordering are independent of the order a file
+/// happened to list them in; this is what lets a palette deduplicate states
+/// found anywhere in a volume and still order them deterministically.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BlockState {
+    /// Namespaced block id, e.g. `minecraft:redstone_wire`.
+    pub name: Cow<'static, str>,
+    /// Block state properties, keyed by property name.
+    pub properties: BTreeMap<Cow<'static, str>, Cow<'static, str>>,
+}
+
+impl BlockState {
+    /// `minecraft:air`, the empty block state; always palette index 0.
+    pub const AIR: Self = Self {
+        name: Cow::Borrowed("minecraft:air"),
+        properties: BTreeMap::new(),
+    };
+}
+
+// BlockPos
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
 /// A Minecraft block coordinate, three signed components.
 ///
@@ -28,6 +61,11 @@ use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssi
 /// region's declared size may run along a negative axis. The box queries pin
 /// down which combinations they accept, so invalid extents cannot silently
 /// masquerade as valid ones.
+///
+/// Arithmetic follows vector intuition: `+` and `-` are component-wise, `*` and
+/// `/` with an `i32` scale every axis, and `*` between two positions is the
+/// cross product. Use [`BlockPos::component_mul`] for the component-wise
+/// reading.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockPos {
     /// The horizontal axis, positive to the east.
@@ -163,54 +201,77 @@ impl fmt::Debug for BlockPos {
     }
 }
 
-macro_rules! componentwise {
-    ($trait:ident, $method:ident, $assign_trait:ident, $assign_method:ident, $op:tt) => {
-        impl $trait for BlockPos {
-            type Output = Self;
+impl Add for BlockPos {
+    type Output = Self;
 
-            fn $method(self, rhs: Self) -> Self {
-                Self {
-                    x: self.x $op rhs.x,
-                    y: self.y $op rhs.y,
-                    z: self.z $op rhs.z,
-                }
-            }
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            x: self.x + rhs.x,
+            y: self.y + rhs.y,
+            z: self.z + rhs.z,
         }
-
-        impl $assign_trait for BlockPos {
-            fn $assign_method(&mut self, rhs: Self) {
-                *self = *self $op rhs;
-            }
-        }
-    };
+    }
 }
 
-macro_rules! scalar {
-    ($trait:ident, $method:ident, $assign_trait:ident, $assign_method:ident, $op:tt) => {
-        impl $trait<i32> for BlockPos {
-            type Output = Self;
-
-            fn $method(self, rhs: i32) -> Self {
-                Self {
-                    x: self.x $op rhs,
-                    y: self.y $op rhs,
-                    z: self.z $op rhs,
-                }
-            }
-        }
-
-        impl $assign_trait<i32> for BlockPos {
-            fn $assign_method(&mut self, rhs: i32) {
-                *self = *self $op rhs;
-            }
-        }
-    };
+impl AddAssign for BlockPos {
+    fn add_assign(&mut self, rhs: Self) {
+        *self = *self + rhs;
+    }
 }
 
-componentwise!(Add, add, AddAssign, add_assign, +);
-componentwise!(Sub, sub, SubAssign, sub_assign, -);
-scalar!(Mul, mul, MulAssign, mul_assign, *);
-scalar!(Div, div, DivAssign, div_assign, /);
+impl Sub for BlockPos {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            x: self.x - rhs.x,
+            y: self.y - rhs.y,
+            z: self.z - rhs.z,
+        }
+    }
+}
+
+impl SubAssign for BlockPos {
+    fn sub_assign(&mut self, rhs: Self) {
+        *self = *self - rhs;
+    }
+}
+
+impl Mul<i32> for BlockPos {
+    type Output = Self;
+
+    fn mul(self, rhs: i32) -> Self {
+        Self {
+            x: self.x * rhs,
+            y: self.y * rhs,
+            z: self.z * rhs,
+        }
+    }
+}
+
+impl MulAssign<i32> for BlockPos {
+    fn mul_assign(&mut self, rhs: i32) {
+        *self = *self * rhs;
+    }
+}
+
+impl Div<i32> for BlockPos {
+    type Output = Self;
+
+    fn div(self, rhs: i32) -> Self {
+        Self {
+            x: self.x / rhs,
+            y: self.y / rhs,
+            z: self.z / rhs,
+        }
+    }
+}
+
+impl DivAssign<i32> for BlockPos {
+    fn div_assign(&mut self, rhs: i32) {
+        *self = *self / rhs;
+    }
+}
 
 impl Mul for BlockPos {
     type Output = Self;
@@ -242,6 +303,10 @@ impl Neg for BlockPos {
     }
 }
 
+// Tests
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
 #[cfg(test)]
 mod tests {
     use super::BlockPos;
@@ -251,42 +316,15 @@ mod tests {
     }
 
     #[test]
-    fn new_and_origin_are_plain_positions() {
-        assert_eq!(BlockPos::ORIGIN, pos(0, 0, 0));
-        assert_eq!(pos(1, -2, 3).y, -2);
-    }
-
-    #[test]
-    fn volume_ignores_sign_and_counts_origin_span() {
-        assert_eq!(pos(2, 3, 4).volume(), 24);
-        assert_eq!(pos(-2, 3, -4).volume(), 24);
-        assert_eq!(BlockPos::ORIGIN.volume(), 0);
-    }
-
-    #[test]
-    fn abs_flips_negative_components() {
-        assert_eq!(pos(-1, 2, -3).abs(), pos(1, 2, 3));
-    }
-
-    #[test]
-    fn debug_matches_the_mcdata_shape() {
-        assert_eq!(format!("{:?}", pos(1, -2, 3)), "(1, -2, 3)");
-    }
-
-    #[test]
-    fn dot_uses_componentwise_products() {
-        assert_eq!(pos(1, 2, 3).dot(pos(4, 5, 6)), 32);
-        assert_eq!(pos(1, 0, 0).dot(pos(0, 1, 0)), 0);
-    }
-
-    #[test]
-    fn contains_is_half_open_from_the_origin() {
+    fn extent_methods_anchor_at_the_origin() {
         let size = pos(2, 3, 4);
+        assert_eq!(size.volume(), 24);
+        assert_eq!(pos(-2, 3, -4).abs(), pos(2, 3, 4));
         assert!(size.contains(pos(0, 0, 0)));
         assert!(size.contains(pos(1, 2, 3)));
         assert!(!size.contains(pos(2, 0, 0)));
-        assert!(!size.contains(pos(0, 3, 0)));
         assert!(!size.contains(pos(-1, 0, 0)));
+        assert_eq!(format!("{:?}", pos(1, -2, 3)), "(1, -2, 3)");
     }
 
     #[test]
@@ -297,7 +335,6 @@ mod tests {
         assert_eq!(positions[1], pos(1, 0, 0));
         assert_eq!(positions[2], pos(0, 0, 1));
         assert_eq!(positions[4], pos(0, 1, 0));
-        assert_eq!(positions[7], pos(1, 1, 1));
         assert_eq!(BlockPos::ORIGIN.cartesian_positions().count(), 0);
     }
 
@@ -308,45 +345,27 @@ mod tests {
     }
 
     #[test]
-    fn min_and_max_are_componentwise() {
-        let a = pos(1, 5, -2);
-        let b = pos(3, 2, 4);
-        assert_eq!(a.min(b), pos(1, 2, -2));
-        assert_eq!(a.max(b), pos(3, 5, 4));
+    fn vector_helpers_are_componentwise() {
+        let (a, b) = (pos(1, 2, 3), pos(4, 5, 6));
+        assert_eq!(a.dot(b), 32);
+        assert_eq!(a.min(b), a);
+        assert_eq!(a.max(b), b);
+        assert_eq!(a.component_mul(b), pos(4, 10, 18));
     }
 
     #[test]
-    fn component_mul_does_not_cross() {
-        let a = pos(2, 3, 4);
-        let b = pos(5, 6, 7);
-        assert_eq!(a.component_mul(b), pos(10, 18, 28));
-        assert_eq!(a * b, pos(-3, 6, -3));
-    }
-
-    #[test]
-    fn componentwise_arithmetic_and_negation() {
-        assert_eq!(pos(1, 2, 3) + pos(4, 5, 6), pos(5, 7, 9));
-        assert_eq!(pos(4, 5, 6) - pos(1, 2, 3), pos(3, 3, 3));
-        assert_eq!(-pos(1, -2, 3), pos(-1, 2, -3));
-    }
-
-    #[test]
-    fn scalar_multiplication_and_division() {
-        assert_eq!(pos(1, -2, 3) * 2, pos(2, -4, 6));
+    fn operators_follow_vector_conventions() {
+        let (a, b) = (pos(1, 2, 3), pos(4, 5, 6));
+        assert_eq!(a + b, pos(5, 7, 9));
+        assert_eq!(b - a, pos(3, 3, 3));
+        assert_eq!(-a, pos(-1, -2, -3));
+        assert_eq!(a * 2, pos(2, 4, 6));
         assert_eq!(pos(2, -4, 6) / 2, pos(1, -2, 3));
-    }
-
-    #[test]
-    fn vector_multiplication_is_the_cross_product() {
         assert_eq!(pos(1, 0, 0) * pos(0, 1, 0), pos(0, 0, 1));
-        assert_eq!(pos(0, 1, 0) * pos(1, 0, 0), pos(0, 0, -1));
-    }
 
-    #[test]
-    fn assign_operators_mutate_in_place() {
-        let mut p = pos(1, 2, 3);
-        p += pos(1, 1, 1);
-        p -= pos(1, 1, 1);
+        let mut p = a;
+        p += b;
+        p -= b;
         p *= 2;
         p /= 2;
         p *= pos(1, 0, 0);

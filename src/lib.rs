@@ -59,10 +59,11 @@ mod error;
 mod nbt;
 mod parse;
 mod region;
-pub mod write;
 use flate2::read::GzDecoder;
 use std::io::Read;
 
+pub mod mc;
+pub mod write;
 pub use error::{Error, Result};
 pub use flate2::Compression;
 pub use region::{BlockIter, BlockState, Region};

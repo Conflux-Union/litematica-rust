@@ -8,11 +8,9 @@
 //! may over-approximate, and its default implementation discovers the palette
 //! with one extra scan.
 
-pub mod mcdata;
-
 use self::encode::{empty_list, Encode};
-use self::mcdata::{util::BlockPos, BlockState};
 use crate::error::{Error, Result};
+use crate::mc::{BlockPos, BlockState};
 use crate::nbt::{Writer, TAG_COMPOUND, TAG_END, TAG_INT, TAG_LIST};
 use crate::nbt::{TAG_LONG, TAG_LONG_ARRAY, TAG_STRING};
 use flate2::write::GzEncoder;
@@ -219,11 +217,11 @@ impl WriteOptions {
 /// # use litematica::write::{write, Layout, WriteOptions};
 /// # struct MyLayout;
 /// # impl Layout for MyLayout {
-/// #     fn size(&self) -> litematica::write::mcdata::util::BlockPos {
-/// #         litematica::write::mcdata::util::BlockPos::new(16, 16, 16)
+/// #     fn size(&self) -> litematica::mc::BlockPos {
+/// #         litematica::mc::BlockPos::new(16, 16, 16)
 /// #     }
-/// #     fn block_at(&self, pos: litematica::write::mcdata::util::BlockPos)
-/// #         -> Option<litematica::write::mcdata::BlockState> { None }
+/// #     fn block_at(&self, pos: litematica::mc::BlockPos)
+/// #         -> Option<litematica::mc::BlockState> { None }
 /// # }
 /// # fn main() -> Result<(), litematica::Error> {
 /// let layout = MyLayout;
@@ -601,9 +599,8 @@ impl Packer {
 
 #[cfg(test)]
 mod tests {
-    use super::mcdata::util::BlockPos;
-    use super::mcdata::BlockState;
     use super::{Layout, Palette};
+    use crate::mc::{BlockPos, BlockState};
 
     fn st(name: &str, props: &[(&str, &str)]) -> BlockState {
         BlockState {

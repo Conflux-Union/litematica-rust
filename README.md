@@ -62,8 +62,7 @@ the crate streams the file out with memory bounded by the palette, not the
 volume — suited to procedural generation and network sinks alike.
 
 ```rust
-use litematica::write::mcdata::util::BlockPos;
-use litematica::write::mcdata::BlockState;
+use litematica::mc::{BlockPos, BlockState};
 use litematica::write::{write, Layout, WriteOptions};
 
 struct MyLayout {

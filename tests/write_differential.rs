@@ -8,8 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use litematica::write::mcdata::util::BlockPos;
-use litematica::write::mcdata::BlockState;
+use litematica::mc::{BlockPos, BlockState};
 use litematica::write::{write, Layout, WriteOptions};
 use litematica::{decompress_gzip_with_limit, Document};
 use rustmatica::{Litematic, Region};
