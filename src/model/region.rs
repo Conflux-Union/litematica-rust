@@ -5,14 +5,13 @@
 //! reader obtains one that owns its payload. Both answer the same queries and
 //! walk the same storage order; only the byte storage differs.
 
-use std::fmt;
-
 use crate::error::{Error, Result};
 use crate::knowledge::mc::{BlockPos, BlockSize, BlockState};
 use crate::knowledge::nbt::{FieldEntry, FieldOutcome, FieldTable, Reader};
 use crate::knowledge::nbt::{SliceSource, Slot, Source, Tag};
 use crate::model::bitstream::{BitStream, PaletteIdIter};
 use crate::model::palette::{Palette, PaletteId};
+use std::fmt;
 
 // Region header
 //

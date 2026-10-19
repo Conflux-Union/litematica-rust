@@ -7,9 +7,8 @@
 //! `BitStream` and `Packer` implement the two directions. Keeping both
 //! directions here means the word layout is stated once, next to itself.
 
-use std::sync::Arc;
-
 use crate::model::palette::PaletteId;
+use std::sync::Arc;
 
 // Unpacking
 //

@@ -16,16 +16,15 @@
 //! caller learns about the boundary without this module owning the region
 //! collection.
 
-use std::borrow::Cow;
-use std::collections::BTreeMap;
-use std::io::Write as IoWrite;
-
 use crate::error::{Error, Quantity, Result};
 use crate::knowledge::mc::{BlockPos, BlockSize, BlockState};
 use crate::knowledge::nbt::{Decode, Encode, FieldEntry, FieldOutcome, FieldTable};
 use crate::knowledge::nbt::{Reader, Slot, Source, Tag, Writer};
 use crate::model::document::Metadata;
-use crate::model::palette::Palette;
+use crate::model::palette::{OrderedPalette, Palette};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::io::Write as IoWrite;
 
 // Root fields
 //
@@ -291,8 +290,7 @@ impl<S: Source> Decode<S> for Palette {
 impl Encode for Palette {
     const TAG: Tag = Tag::List;
 
-    /// Writes the palette in its own order; a written palette already begins
-    /// with air.
+    /// Writes the palette in its own order.
     fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
         let len = i32::try_from(self.len()).map_err(|_| Error::DimensionOverflow {
             quantity: Quantity::PaletteLength,
@@ -300,6 +298,15 @@ impl Encode for Palette {
         })?;
         out.list(Tag::Compound, len)?;
         self.states().iter().try_for_each(|state| state.body(out))
+    }
+}
+
+impl Encode for OrderedPalette {
+    const TAG: Tag = Tag::List;
+
+    /// Writes the canonical order; an ordered palette already begins with air.
+    fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
+        Encode::body(&**self, out)
     }
 }
 

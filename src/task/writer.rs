@@ -12,7 +12,7 @@ use crate::error::{Error, Quantity, Result};
 use crate::knowledge::mc::{BlockPos, BlockSize, BlockState, PositionIter};
 use crate::knowledge::nbt::{Encode, Tag, Writer};
 use crate::model::bitstream::Packer;
-use crate::model::palette::{Palette, PaletteId};
+use crate::model::palette::{OrderedPalette, PaletteId};
 use crate::model::region::Region;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -109,7 +109,7 @@ impl Layout for Region<'_> {
 
 /// Resolves the identifier written at `pos`: air is 0, and any other state
 /// must be covered by the palette.
-fn resolve_id<L: Layout>(palette: &Palette, layout: &L, pos: BlockPos) -> Result<PaletteId> {
+fn resolve_id<L: Layout>(palette: &OrderedPalette, layout: &L, pos: BlockPos) -> Result<PaletteId> {
     let Some(state) = layout.block_at(pos) else {
         return Ok(0);
     };
@@ -218,7 +218,7 @@ pub fn write<L: Layout, W: IoWrite>(layout: &L, options: &WriteOptions, sink: W)
 struct Schematic<'a, L: Layout> {
     layout: &'a L,
     options: &'a WriteOptions,
-    palette: Palette,
+    palette: OrderedPalette,
     size: BlockSize,
     volume: i32,
     longs: i32,
@@ -231,7 +231,7 @@ impl<'a, L: Layout> Schematic<'a, L> {
     fn new(layout: &'a L, options: &'a WriteOptions, total_blocks: &'a Cell<i64>) -> Result<Self> {
         let size = layout.size();
         let volume = Self::checked_volume(size)?;
-        let palette = Palette::from_declared(layout.block_palette());
+        let palette = OrderedPalette::new(layout.block_palette());
         // `volume <= i32::MAX` and `bits <= 32` bound this well below i32::MAX;
         // the checked conversion keeps the written length prefix honest.
         let longs = (u128::from(volume as u32) * u128::from(palette.bits_per_entry())).div_ceil(64);
@@ -299,7 +299,7 @@ impl<L: Layout> Encode for Schematic<'_, L> {
 /// One region: its box, palette, block states, and tile entities.
 struct RegionNbt<'a, L: Layout> {
     layout: &'a L,
-    palette: &'a Palette,
+    palette: &'a OrderedPalette,
     size: BlockSize,
     longs: i32,
     total_blocks: &'a Cell<i64>,
@@ -331,7 +331,7 @@ impl<L: Layout> Encode for RegionNbt<'_, L> {
 /// The packed block states of a region, pulled one long at a time.
 struct BlockStates<'a, L: Layout> {
     layout: &'a L,
-    palette: &'a Palette,
+    palette: &'a OrderedPalette,
     size: BlockSize,
     longs: i32,
     total_blocks: &'a Cell<i64>,
@@ -349,7 +349,7 @@ impl<L: Layout> Encode for BlockStates<'_, L> {
 /// Packs palette ids into longs, one word per step, counting non-air blocks.
 struct Packed<'a, L: Layout> {
     layout: &'a L,
-    palette: &'a Palette,
+    palette: &'a OrderedPalette,
     positions: PositionIter,
     packer: Packer,
     finished: bool,
@@ -360,7 +360,7 @@ impl<'a, L: Layout> Packed<'a, L> {
     /// Prepares the stream for `layout`, walking `size` in storage order.
     fn new(
         layout: &'a L,
-        palette: &'a Palette,
+        palette: &'a OrderedPalette,
         size: BlockSize,
         total_blocks: &'a Cell<i64>,
     ) -> Self {

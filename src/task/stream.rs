@@ -20,15 +20,13 @@
 //! geometry validation, and bit-level cursor, so they agree on every decoded
 //! value; only the storage strategy differs.
 
-use std::io::{BufReader, Read};
-
-use flate2::read::GzDecoder;
-
 use crate::error::{Error, Result};
 use crate::knowledge::nbt::{FieldOutcome, IoSource, Reader as NbtReader, Slot, Source, Tag};
 use crate::model::document::Metadata;
 use crate::model::region::{Region, RegionHeader, RegionParts};
 use crate::model::schema::RootFields;
+use flate2::read::GzDecoder;
+use std::io::{BufReader, Read};
 
 /// A buffered gzip stream, the byte source a [`Reader`] consumes.
 type GzipSource<R> = IoSource<BufReader<GzDecoder<R>>>;

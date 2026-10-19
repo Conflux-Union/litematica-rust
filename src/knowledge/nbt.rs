@@ -11,10 +11,9 @@
 //! bytes. An id read from a file is validated once, at [`Tag::from_id`], and
 //! from then on every comparison and dispatch is spelled by name.
 
+use crate::error::{Error, Result};
 use std::io::Read as IoRead;
 use std::io::Write as IoWrite;
-
-use crate::error::{Error, Result};
 
 /// Maximum NBT nesting depth accepted by [`Reader::skip_value`].
 pub(crate) const MAX_DEPTH: usize = 64;
