@@ -14,6 +14,18 @@
 //!   decoded on demand, either voxel by voxel by [`Region::iter_blocks`] or
 //!   one entry at a time by [`Region::block_at`].
 //!
+//! Two read modes share that decoder:
+//!
+//! - [`Document`] decompresses the whole file once and gives random access to
+//!   every region, including [`Region::block_at`] in O(1). Memory is the
+//!   decompressed payload plus the palettes.
+//! - [`StreamReader`] keeps memory bounded by the gzip buffer, the current
+//!   palette, and one region's packed payload, independent of the schematic's
+//!   volume. NBT field order does not matter: a region's payload is held only
+//!   until its other fields have been read, then decoded voxel by voxel and
+//!   released. `Metadata` may appear before or after `Regions`, so
+//!   [`StreamReader::metadata`] returns `None` until it has been scanned.
+//!
 //! Unknown fields (`Entities`, `TileEntities`, pending ticks, preview image
 //! data, ...) are skipped in O(length) without allocation, so parsing cost is
 //! a single linear scan of the decompressed bytes plus lazy iteration.
@@ -60,6 +72,7 @@ mod error;
 mod nbt;
 mod parse;
 mod region;
+mod stream;
 use crate::mc::{BlockPos, BlockSize};
 use flate2::read::GzDecoder;
 use std::io::Read;
@@ -69,6 +82,7 @@ pub mod write;
 pub use error::{Error, Result};
 pub use flate2::Compression;
 pub use region::{BlockIter, BlockState, Region};
+pub use stream::{StreamReader, StreamRegion};
 
 /// Decompresses a single gzip member with a hard cap on the output size.
 ///

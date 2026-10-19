@@ -4,7 +4,7 @@ use std::fmt;
 
 use crate::error::{Error, Result};
 use crate::mc::{BlockPos, BlockSize};
-use crate::nbt::{Decode, Reader, Tag};
+use crate::nbt::{Decode, Reader, SliceSource, Source, Tag};
 
 // Block state
 //
@@ -20,10 +20,10 @@ pub struct BlockState {
     pub properties: Vec<(String, String)>,
 }
 
-impl<'a> Decode<'a> for BlockState {
+impl<S: Source> Decode<S> for BlockState {
     /// Reads one palette entry: a compound with a `Name` and an optional
     /// `Properties` compound.
-    fn decode(r: &mut Reader<'a>, _field: &'static str, enclosing: usize) -> Result<Self> {
+    fn decode(r: &mut Reader<S>, _field: &'static str, enclosing: usize) -> Result<Self> {
         let depth = r.nested(enclosing)?;
         let entry_offset = r.pos();
         let mut name: Option<String> = None;
@@ -53,7 +53,7 @@ impl<'a> Decode<'a> for BlockState {
 
 impl BlockState {
     /// Reads a `Properties` compound: a map from property name to string value.
-    fn decode_properties(r: &mut Reader<'_>, tag: Tag) -> Result<Vec<(String, String)>> {
+    fn decode_properties<S: Source>(r: &mut Reader<S>, tag: Tag) -> Result<Vec<(String, String)>> {
         r.expect("palette entry Properties", tag, Tag::Compound)?;
         let mut properties = Vec::new();
         loop {
@@ -111,7 +111,7 @@ impl<'a> Region<'a> {
     /// Reads a region compound's fields. `name` is the compound's member name
     /// in `Regions`; `region_offset` anchors errors about missing fields.
     pub(crate) fn decode(
-        r: &mut Reader<'a>,
+        r: &mut Reader<SliceSource<'a>>,
         name: String,
         region_offset: usize,
         enclosing: usize,
@@ -183,36 +183,15 @@ impl<'a> Region<'a> {
         block_states: &'a [u8],
         offset: usize,
     ) -> Result<Self> {
-        let dims = BlockSize::of(size);
-        let volume128 = dims.volume();
-        let bits = palette.bits();
-
-        if volume128 > 0 && palette.states().is_empty() {
-            return Err(Error::EmptyPalette { offset });
-        }
-        if (1u64 << bits) < palette.states().len() as u64 {
-            return Err(Error::PaletteTooLarge { offset });
-        }
-        // Checked before the u64 overflow check so that a hostile file with a
-        // huge claimed Size is always reported as truncated block data.
-        let required = (volume128 * u128::from(bits)).div_ceil(8);
-        if (block_states.len() as u128) < required {
-            return Err(Error::TruncatedBlockStates {
-                have: block_states.len() as u64,
-                need: required,
-                offset,
-            });
-        }
-        let volume = u64::try_from(volume128).map_err(|_| Error::VolumeOverflow { offset })?;
-
+        let geometry = region_geometry(size, &palette, block_states.len() as u64, offset)?;
         Ok(Self {
             name,
             position,
             size,
-            dims,
+            dims: geometry.dims,
             palette,
-            blocks: BitStream::new(block_states, bits),
-            volume,
+            blocks: BitStream::new(block_states, geometry.bits),
+            volume: geometry.volume,
         })
     }
 
@@ -281,6 +260,49 @@ impl<'a> Region<'a> {
     }
 }
 
+/// The facts both read modes derive before touching block data: the addressed
+/// span, the bit width, and the voxel count.
+///
+/// Validation lives here so the random-access and streaming readers cannot
+/// disagree about what a well-formed region is.
+pub(crate) struct Geometry {
+    pub(crate) dims: BlockSize,
+    pub(crate) bits: u32,
+    pub(crate) volume: u64,
+}
+
+/// Validates a region against its palette and packed payload, and derives the
+/// facts every block read needs.
+pub(crate) fn region_geometry(
+    size: BlockPos,
+    palette: &Palette,
+    payload_bytes: u64,
+    offset: usize,
+) -> Result<Geometry> {
+    let dims = BlockSize::of(size);
+    let volume128 = dims.volume();
+    let bits = palette.bits();
+
+    if volume128 > 0 && palette.states().is_empty() {
+        return Err(Error::EmptyPalette { offset });
+    }
+    if (1u64 << bits) < palette.states().len() as u64 {
+        return Err(Error::PaletteTooLarge { offset });
+    }
+    // Checked before the u64 overflow check so that a hostile file with a
+    // huge claimed Size is always reported as truncated block data.
+    let required = (volume128 * u128::from(bits)).div_ceil(8);
+    if u128::from(payload_bytes) < required {
+        return Err(Error::TruncatedBlockStates {
+            have: payload_bytes,
+            need: required,
+            offset,
+        });
+    }
+    let volume = u64::try_from(volume128).map_err(|_| Error::VolumeOverflow { offset })?;
+    Ok(Geometry { dims, bits, volume })
+}
+
 // Palette
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
@@ -292,14 +314,14 @@ impl<'a> Region<'a> {
 /// lookup needs it; deriving it per entry would repeat the same four
 /// comparisons for the whole volume.
 #[derive(Clone)]
-struct Palette {
+pub(crate) struct Palette {
     states: Vec<BlockState>,
     bits: u32,
 }
 
-impl<'a> Decode<'a> for Palette {
+impl<S: Source> Decode<S> for Palette {
     /// Reads a `BlockStatePalette`: a list of palette entry compounds.
-    fn decode(r: &mut Reader<'a>, _field: &'static str, enclosing: usize) -> Result<Self> {
+    fn decode(r: &mut Reader<S>, _field: &'static str, enclosing: usize) -> Result<Self> {
         let elem = r.tag()?;
         r.expect("BlockStatePalette element", elem, Tag::Compound)?;
         let count = r.count()?;
@@ -328,12 +350,12 @@ impl Palette {
     }
 
     /// The states in file order; index 0 is the first entry.
-    fn states(&self) -> &[BlockState] {
+    pub(crate) fn states(&self) -> &[BlockState] {
         &self.states
     }
 
     /// Bits per `BlockStates` entry.
-    fn bits(&self) -> u32 {
+    pub(crate) fn bits(&self) -> u32 {
         self.bits
     }
 }
@@ -374,13 +396,12 @@ impl<'a> BitStream<'a> {
         let long = usize::try_from(bit / 64).ok()?;
         let shift = (bit % 64) as u32;
         let first = u64::from_be_bytes(*self.longs.get(long)?);
-        let mut cursor = BitCursor {
+        let mut source = SliceLongs {
             stream: self,
-            next_long: long + 1,
-            cur: first >> shift,
-            cur_bits: 64 - shift,
+            next: long + 1,
         };
-        Some(cursor.next())
+        let mut cursor = BitCursor::with_remainder(first >> shift, 64 - shift);
+        cursor.next(self.bits, self.mask, &mut source).ok()
     }
 
     /// The `index`th long, zero-filled when the payload is shorter.
@@ -398,49 +419,74 @@ impl<'a> BitStream<'a> {
     }
 }
 
-/// A forward cursor over a [`BitStream`], buffering one long at a time.
+/// A source of 64-bit words for [`BitCursor`].
+///
+/// The slice-backed random reader and the streaming reader supply words from
+/// different places, but decode entries through the same cursor.
+pub(crate) trait LongSource {
+    /// The next word, least significant byte of the stream first.
+    fn next_long(&mut self) -> Result<u64>;
+}
+
+/// A forward cursor over a continuous bit stream, buffering one word.
 ///
 /// Sequential iteration is the cursor's natural use: each step consumes the
 /// low `bits` of the buffer and refills only when the next entry crosses a
 /// long boundary.
-#[derive(Debug)]
-struct BitCursor<'a> {
-    stream: BitStream<'a>,
-    next_long: usize,
+#[derive(Debug, Default)]
+pub(crate) struct BitCursor {
     cur: u64,
     cur_bits: u32,
 }
 
-impl<'a> BitCursor<'a> {
-    fn new(stream: BitStream<'a>) -> Self {
-        Self {
-            stream,
-            next_long: 1,
-            cur: stream.long(0),
-            cur_bits: 64,
-        }
+impl BitCursor {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn with_remainder(cur: u64, cur_bits: u32) -> Self {
+        Self { cur, cur_bits }
     }
 
     #[inline]
-    fn next(&mut self) -> u32 {
-        if self.cur_bits >= self.stream.bits {
+    pub(crate) fn next(
+        &mut self,
+        bits: u32,
+        mask: u64,
+        source: &mut impl LongSource,
+    ) -> Result<u32> {
+        if self.cur_bits >= bits {
             // Fast path: enough buffered bits for this entry.
-            let value = (self.cur & self.stream.mask) as u32;
-            self.cur >>= self.stream.bits;
-            self.cur_bits -= self.stream.bits;
-            return value;
+            let value = (self.cur & mask) as u32;
+            self.cur >>= bits;
+            self.cur_bits -= bits;
+            return Ok(value);
         }
-        // Slow path: the entry straddles the long boundary, low bits from
-        // the buffer, the rest from the next long.
+        // Slow path: the entry straddles the word boundary, low bits from
+        // the buffer, the rest from the next word.
         let low = self.cur_bits;
-        let mut value = self.cur & self.stream.mask;
-        self.cur = self.stream.long(self.next_long);
-        self.next_long += 1;
+        let mut value = self.cur & mask;
+        self.cur = source.next_long()?;
         self.cur_bits = 64;
-        value |= (self.cur & (self.stream.mask >> low)) << low;
-        self.cur >>= self.stream.bits - low;
-        self.cur_bits -= self.stream.bits - low;
-        value as u32
+        value |= (self.cur & (mask >> low)) << low;
+        self.cur >>= bits - low;
+        self.cur_bits -= bits - low;
+        Ok(value as u32)
+    }
+}
+
+/// A [`LongSource`] reading words borrowed from a [`BitStream`].
+#[derive(Debug)]
+struct SliceLongs<'a> {
+    stream: BitStream<'a>,
+    next: usize,
+}
+
+impl LongSource for SliceLongs<'_> {
+    fn next_long(&mut self) -> Result<u64> {
+        let word = self.stream.long(self.next);
+        self.next += 1;
+        Ok(word)
     }
 }
 
@@ -459,14 +505,20 @@ impl<'a> BitCursor<'a> {
 #[derive(Debug)]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct BlockIter<'a> {
-    cursor: BitCursor<'a>,
+    cursor: BitCursor,
+    source: SliceLongs<'a>,
+    bits: u32,
+    mask: u64,
     remaining: u64,
 }
 
 impl<'a> BlockIter<'a> {
     pub(crate) fn new(stream: BitStream<'a>, volume: u64) -> Self {
         Self {
-            cursor: BitCursor::new(stream),
+            cursor: BitCursor::new(),
+            source: SliceLongs { stream, next: 0 },
+            bits: stream.bits,
+            mask: stream.mask,
             remaining: volume,
         }
     }
@@ -481,7 +533,9 @@ impl Iterator for BlockIter<'_> {
             return None;
         }
         self.remaining -= 1;
-        Some(self.cursor.next())
+        self.cursor
+            .next(self.bits, self.mask, &mut self.source)
+            .ok()
     }
 
     #[inline]
@@ -496,6 +550,28 @@ impl ExactSizeIterator for BlockIter<'_> {
     fn len(&self) -> usize {
         usize::try_from(self.remaining).unwrap_or(usize::MAX)
     }
+}
+
+/// Decodes every palette index of a packed payload, calling `f` once per
+/// voxel.
+///
+/// This is the sequential counterpart of [`BlockIter`] for callers that own
+/// the payload bytes rather than borrowing them, such as the streaming
+/// reader. Indices are passed straight to `f` and are never collected.
+pub(crate) fn decode_payload(
+    bytes: &[u8],
+    bits: u32,
+    volume: u64,
+    mut f: impl FnMut(u32) -> Result<()>,
+) -> Result<()> {
+    let stream = BitStream::new(bytes, bits);
+    let mask = stream.mask;
+    let mut cursor = BitCursor::new();
+    let mut source = SliceLongs { stream, next: 0 };
+    for _ in 0..volume {
+        f(cursor.next(bits, mask, &mut source)?)?;
+    }
+    Ok(())
 }
 
 // Tests

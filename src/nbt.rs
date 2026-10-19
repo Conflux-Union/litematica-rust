@@ -11,6 +11,7 @@
 //! bytes. An id read from a file is validated once, at [`Tag::from_id`], and
 //! from then on every comparison and dispatch is spelled by name.
 
+use std::io::Read as IoRead;
 use std::io::Write as IoWrite;
 
 use crate::error::{Error, Result};
@@ -177,25 +178,25 @@ impl Encode for String {
 /// payload; `enclosing` is the depth of the container holding the value, so a
 /// compound can derive the depth of its own fields and hand unknown members
 /// to [`Reader::skip_value`].
-pub(crate) trait Decode<'a>: Sized {
+pub(crate) trait Decode<S: Source>: Sized {
     /// Reads this value's payload, without a tag id or a name.
-    fn decode(r: &mut Reader<'a>, field: &'static str, enclosing: usize) -> Result<Self>;
+    fn decode(r: &mut Reader<S>, field: &'static str, enclosing: usize) -> Result<Self>;
 }
 
-impl<'a> Decode<'a> for i32 {
-    fn decode(r: &mut Reader<'a>, _field: &'static str, _enclosing: usize) -> Result<Self> {
+impl<S: Source> Decode<S> for i32 {
+    fn decode(r: &mut Reader<S>, _field: &'static str, _enclosing: usize) -> Result<Self> {
         r.i32()
     }
 }
 
-impl<'a> Decode<'a> for i64 {
-    fn decode(r: &mut Reader<'a>, _field: &'static str, _enclosing: usize) -> Result<Self> {
+impl<S: Source> Decode<S> for i64 {
+    fn decode(r: &mut Reader<S>, _field: &'static str, _enclosing: usize) -> Result<Self> {
         r.i64()
     }
 }
 
-impl<'a> Decode<'a> for String {
-    fn decode(r: &mut Reader<'a>, _field: &'static str, _enclosing: usize) -> Result<Self> {
+impl<S: Source> Decode<S> for String {
+    fn decode(r: &mut Reader<S>, _field: &'static str, _enclosing: usize) -> Result<Self> {
         r.string()
     }
 }
@@ -204,26 +205,35 @@ impl<'a> Decode<'a> for String {
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
-/// A forward-only cursor over an uncompressed NBT buffer.
-pub(crate) struct Reader<'a> {
+/// A byte source that an NBT [`Reader`] consumes.
+///
+pub(crate) trait Source {
+    /// Reads exactly `out.len()` bytes into `out`.
+    fn read_exact(&mut self, out: &mut [u8]) -> Result<()>;
+
+    /// Advances past `n` bytes without materializing them.
+    fn skip(&mut self, n: u64) -> Result<()>;
+
+    /// Number of bytes consumed so far.
+    fn pos(&self) -> usize;
+}
+
+/// A [`Source`] over an in-memory buffer.
+///
+/// Keeps borrowed data addressable, which is what the random-access region
+/// reader needs for its zero-copy `BlockStates` view.
+pub(crate) struct SliceSource<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
-impl<'a> Reader<'a> {
-    /// Creates a reader positioned at the start of `buf`.
+impl<'a> SliceSource<'a> {
+    /// Creates a source positioned at the start of `buf`.
     pub(crate) fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
-    /// The current byte offset.
-    pub(crate) fn pos(&self) -> usize {
-        self.pos
-    }
-
-    /// Consumes and returns the next `n` bytes as a slice borrowed from the
-    /// input buffer, or fails with [`Error::UnexpectedEof`].
-    #[inline]
+    /// Borrows the next `n` bytes directly from the buffer.
     pub(crate) fn take(&mut self, n: u64) -> Result<&'a [u8]> {
         let end = self.pos as u64 + n;
         if end > self.buf.len() as u64 {
@@ -233,27 +243,151 @@ impl<'a> Reader<'a> {
         self.pos = end as usize;
         Ok(&self.buf[start..self.pos])
     }
+}
+
+impl Source for SliceSource<'_> {
+    fn read_exact(&mut self, out: &mut [u8]) -> Result<()> {
+        let bytes = self.take(out.len() as u64)?;
+        out.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn skip(&mut self, n: u64) -> Result<()> {
+        self.take(n).map(|_| ())
+    }
+
+    fn pos(&self) -> usize {
+        self.pos
+    }
+}
+
+/// A [`Source`] over any `std::io::Read`, with a cap on consumed bytes.
+///
+/// The streaming entry point wraps a gzip decoder in a buffered reader, so
+/// this type adds only the byte counter used in diagnostics and the cap that
+/// stops a hostile member from inflating without bound.
+pub(crate) struct IoSource<R> {
+    inner: R,
+    pos: u64,
+    limit: u64,
+    scratch: Box<[u8]>,
+}
+
+impl<R: IoRead> IoSource<R> {
+    /// Wraps `inner`, failing once more than `limit` bytes are consumed.
+    pub(crate) fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            pos: 0,
+            limit,
+            scratch: vec![0u8; 64 * 1024].into_boxed_slice(),
+        }
+    }
+
+    fn check(&self, n: u64) -> Result<()> {
+        if self.pos.saturating_add(n) > self.limit {
+            return Err(Error::SizeLimitExceeded { limit: self.limit });
+        }
+        Ok(())
+    }
+}
+
+/// Maps an I/O failure to the NBT-level error that describes it.
+fn map_io(error: std::io::Error, offset: usize) -> Error {
+    match error.kind() {
+        std::io::ErrorKind::UnexpectedEof => Error::UnexpectedEof { offset },
+        _ => Error::CorruptGzip(error),
+    }
+}
+
+impl<R: IoRead> Source for IoSource<R> {
+    fn read_exact(&mut self, out: &mut [u8]) -> Result<()> {
+        let n = out.len() as u64;
+        self.check(n)?;
+        let offset = self.pos as usize;
+        self.inner
+            .read_exact(out)
+            .map_err(|error| map_io(error, offset))?;
+        self.pos += n;
+        Ok(())
+    }
+
+    fn skip(&mut self, n: u64) -> Result<()> {
+        self.check(n)?;
+        let mut left = n;
+        while left > 0 {
+            let take = left.min(self.scratch.len() as u64) as usize;
+            let offset = self.pos as usize;
+            let chunk = &mut self.scratch[..take];
+            self.inner
+                .read_exact(chunk)
+                .map_err(|error| map_io(error, offset))?;
+            self.pos += take as u64;
+            left -= take as u64;
+        }
+        Ok(())
+    }
+
+    fn pos(&self) -> usize {
+        usize::try_from(self.pos).unwrap_or(usize::MAX)
+    }
+}
+
+/// A forward-only cursor over an NBT byte source.
+///
+/// The source is generic so the same schema decoders serve both the
+/// random-access reader (a [`SliceSource`]) and the streaming reader (an
+/// [`IoSource`]); only payload-owning fields such as `BlockStates` branch on
+/// the concrete source.
+pub(crate) struct Reader<S> {
+    src: S,
+}
+
+impl<S: Source> Reader<S> {
+    /// Creates a reader positioned at the start of `src`.
+    pub(crate) fn new(src: S) -> Self {
+        Self { src }
+    }
+
+    /// The current byte offset.
+    pub(crate) fn pos(&self) -> usize {
+        self.src.pos()
+    }
+
+    /// Reads exactly `out.len()` bytes.
+    #[inline]
+    pub(crate) fn read_exact(&mut self, out: &mut [u8]) -> Result<()> {
+        self.src.read_exact(out)
+    }
+
+    /// Advances past `n` bytes.
+    #[inline]
+    pub(crate) fn skip(&mut self, n: u64) -> Result<()> {
+        self.src.skip(n)
+    }
 
     /// Reads one unsigned byte.
     #[inline]
     pub(crate) fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
+        let mut b = [0u8; 1];
+        self.read_exact(&mut b)?;
+        Ok(b[0])
     }
 
     /// Reads one big-endian `i32`.
     #[inline]
     pub(crate) fn i32(&mut self) -> Result<i32> {
-        let b = self.take(4)?;
-        Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        let mut b = [0u8; 4];
+        self.read_exact(&mut b)?;
+        Ok(i32::from_be_bytes(b))
     }
 
     /// Reads one big-endian `i64`.
     #[inline]
     pub(crate) fn i64(&mut self) -> Result<i64> {
-        let b = self.take(8)?;
-        Ok(i64::from_be_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
+        let mut b = [0u8; 8];
+        self.read_exact(&mut b)?;
+        Ok(i64::from_be_bytes(b))
     }
 
     /// Reads an NBT string (u16 length prefix + bytes) and decodes it as
@@ -261,15 +395,17 @@ impl<'a> Reader<'a> {
     /// standard UTF-8 only in encodings that never appear in litematic files,
     /// so a lossy decode is sufficient here.
     pub(crate) fn string(&mut self) -> Result<String> {
-        let b = self.take(2)?;
-        let n = u16::from_be_bytes([b[0], b[1]]) as u64;
-        let bytes = self.take(n)?;
-        Ok(String::from_utf8_lossy(bytes).into_owned())
+        let mut len = [0u8; 2];
+        self.read_exact(&mut len)?;
+        let n = u16::from_be_bytes(len) as usize;
+        let mut bytes = vec![0u8; n];
+        self.read_exact(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// Reads an i32 element or byte count and rejects negative values.
     pub(crate) fn count(&mut self) -> Result<usize> {
-        let offset = self.pos;
+        let offset = self.pos();
         let n = self.i32()?;
         if n < 0 {
             return Err(Error::NegativeLength { length: n, offset });
@@ -280,7 +416,7 @@ impl<'a> Reader<'a> {
     /// Reads a tag id and resolves it to a [`Tag`], rejecting ids outside the
     /// tag space.
     pub(crate) fn tag(&mut self) -> Result<Tag> {
-        let offset = self.pos;
+        let offset = self.pos();
         let id = self.u8()?;
         Tag::from_id(id).ok_or(Error::InvalidTagId { id, offset })
     }
@@ -291,7 +427,7 @@ impl<'a> Reader<'a> {
             return Err(Error::UnexpectedTag {
                 field,
                 tag: actual.id(),
-                offset: self.pos,
+                offset: self.pos(),
             });
         }
         Ok(())
@@ -302,7 +438,7 @@ impl<'a> Reader<'a> {
     pub(crate) fn nested(&self, enclosing: usize) -> Result<usize> {
         let depth = enclosing + 1;
         if depth > MAX_DEPTH {
-            return Err(Error::DepthLimitExceeded { offset: self.pos });
+            return Err(Error::DepthLimitExceeded { offset: self.pos() });
         }
         Ok(depth)
     }
@@ -312,12 +448,12 @@ impl<'a> Reader<'a> {
     /// size; compounds and lists walk their headers only.
     pub(crate) fn skip_value(&mut self, tag: Tag, enclosing_depth: usize) -> Result<()> {
         if let Some(n) = tag.scalar_size() {
-            return self.take(n).map(|_| ());
+            return self.skip(n);
         }
         match tag {
             Tag::ByteArray => {
                 let n = self.count()?;
-                self.take(n as u64)?;
+                self.skip(n as u64)?;
             }
             Tag::String => {
                 self.string()?;
@@ -331,7 +467,7 @@ impl<'a> Reader<'a> {
                         return Err(Error::UnexpectedTag {
                             field: "list element",
                             tag: elem.id(),
-                            offset: self.pos,
+                            offset: self.pos(),
                         });
                     }
                     for _ in 0..count {
@@ -352,22 +488,31 @@ impl<'a> Reader<'a> {
             }
             Tag::IntArray => {
                 let n = self.count()?;
-                self.take(n as u64 * 4)?;
+                self.skip(n as u64 * 4)?;
             }
             Tag::LongArray => {
                 let n = self.count()?;
-                self.take(n as u64 * 8)?;
+                self.skip(n as u64 * 8)?;
             }
             // Scalars were handled above; this arm keeps the match exhaustive.
             Tag::End | Tag::Byte | Tag::Short | Tag::Int | Tag::Long | Tag::Float | Tag::Double => {
                 return Err(Error::UnexpectedTag {
                     field: "value",
                     tag: tag.id(),
-                    offset: self.pos,
+                    offset: self.pos(),
                 });
             }
         }
         Ok(())
+    }
+}
+
+impl<'a> Reader<SliceSource<'a>> {
+    /// Consumes and returns the next `n` bytes as a slice borrowed from the
+    /// underlying buffer.
+    #[inline]
+    pub(crate) fn take(&mut self, n: u64) -> Result<&'a [u8]> {
+        self.src.take(n)
     }
 }
 
@@ -504,7 +649,7 @@ impl<W: IoWrite> Writer<W> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Encode, Reader, Tag, Writer, MAX_DEPTH};
+    use super::{Encode, Reader, SliceSource, Tag, Writer, MAX_DEPTH};
     use crate::Error;
 
     #[test]
@@ -529,7 +674,7 @@ mod tests {
         w.end().unwrap();
         let buf = w.into_inner().unwrap();
 
-        let mut r = Reader::new(&buf);
+        let mut r = Reader::new(SliceSource::new(&buf));
         assert_eq!(r.tag().unwrap(), Tag::Compound);
         assert_eq!(r.string().unwrap(), "");
         assert_eq!(r.tag().unwrap(), Tag::Int);
@@ -555,7 +700,7 @@ mod tests {
         w.end().unwrap();
         let buf = w.into_inner().unwrap();
 
-        let mut r = Reader::new(&buf);
+        let mut r = Reader::new(SliceSource::new(&buf));
         assert_eq!(r.tag().unwrap(), Tag::Compound);
         r.string().unwrap();
         let tag = r.tag().unwrap();
@@ -603,7 +748,7 @@ mod tests {
 
     #[test]
     fn reader_rejects_unknown_tag_ids() {
-        let mut r = Reader::new(&[13]);
+        let mut r = Reader::new(SliceSource::new(&[13]));
         assert!(matches!(
             r.tag(),
             Err(Error::InvalidTagId { id: 13, offset: 0 })
@@ -626,11 +771,13 @@ mod tests {
         // The compound passed to `skip_value` is itself the first level, so
         // `MAX_DEPTH - 1` nested fields reach the limit exactly.
         let bytes = nested(MAX_DEPTH - 1);
-        Reader::new(&bytes).skip_value(Tag::Compound, 0).unwrap();
+        Reader::new(SliceSource::new(&bytes))
+            .skip_value(Tag::Compound, 0)
+            .unwrap();
 
         let bytes = nested(MAX_DEPTH);
         assert!(matches!(
-            Reader::new(&bytes).skip_value(Tag::Compound, 0),
+            Reader::new(SliceSource::new(&bytes)).skip_value(Tag::Compound, 0),
             Err(Error::DepthLimitExceeded { .. })
         ));
     }

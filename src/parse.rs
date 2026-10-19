@@ -13,7 +13,7 @@
 
 use crate::error::{Error, Result};
 use crate::mc::BlockPos;
-use crate::nbt::{Decode, Reader, Tag};
+use crate::nbt::{Decode, Reader, SliceSource, Source, Tag};
 use crate::region::Region;
 use crate::Document;
 
@@ -36,7 +36,7 @@ impl<'a> Document<'a> {
     /// and skipped. All errors report the byte offset at which they were
     /// detected.
     pub fn parse(buf: &'a [u8]) -> Result<Self> {
-        let mut r = Reader::new(buf);
+        let mut r = Reader::new(SliceSource::new(buf));
         let root_offset = r.pos();
         let root_tag = r.tag()?;
         if root_tag != Tag::Compound {
@@ -52,9 +52,13 @@ impl<'a> Document<'a> {
     }
 }
 
-impl<'a> Decode<'a> for Document<'a> {
+impl<'a> Decode<SliceSource<'a>> for Document<'a> {
     /// Reads the root compound's fields.
-    fn decode(r: &mut Reader<'a>, _field: &'static str, enclosing: usize) -> Result<Self> {
+    fn decode(
+        r: &mut Reader<SliceSource<'a>>,
+        _field: &'static str,
+        enclosing: usize,
+    ) -> Result<Self> {
         let depth = r.nested(enclosing)?;
         let mut minecraft_data_version = 0i32;
         let mut version = 0i32;
@@ -103,7 +107,7 @@ impl<'a> Decode<'a> for Document<'a> {
         })?;
 
         Ok(Document {
-            metadata: fields.into_metadata(minecraft_data_version, version, sub_version),
+            metadata: fields.to_metadata(minecraft_data_version, version, sub_version),
             regions: regions.0,
         })
     }
@@ -113,13 +117,13 @@ impl<'a> Decode<'a> for Document<'a> {
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
-impl<'a> Decode<'a> for BlockPos {
+impl<S: Source> Decode<S> for BlockPos {
     /// Reads the `{x, y, z}` compound that `Position`, `Size`, and
     /// `EnclosingSize` are all written as. Unknown members are skipped.
     ///
     /// A `Size`-shaped field stays signed here, exactly as declared; use
     /// [`crate::mc::BlockSize::of`] where it becomes a span.
-    fn decode(r: &mut Reader<'a>, field: &'static str, enclosing: usize) -> Result<Self> {
+    fn decode(r: &mut Reader<S>, field: &'static str, enclosing: usize) -> Result<Self> {
         let depth = r.nested(enclosing)?;
         let mut values: [Option<i32>; 3] = [None, None, None];
         loop {
@@ -155,7 +159,7 @@ impl<'a> Decode<'a> for BlockPos {
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
 /// The `Metadata` compound, before the root-level versions are joined to it.
-struct MetadataFields {
+pub(crate) struct MetadataFields {
     name: String,
     description: String,
     author: String,
@@ -170,7 +174,7 @@ struct MetadataFields {
 impl MetadataFields {
     /// Reads `TotalBlocks`, which the Litematica mod writes as an Int and
     /// rustmatica writes as a Long. Both are accepted.
-    fn decode_total_blocks(r: &mut Reader<'_>, tag: Tag) -> Result<i64> {
+    fn decode_total_blocks<S: Source>(r: &mut Reader<S>, tag: Tag) -> Result<i64> {
         match tag {
             Tag::Int => Ok(i64::from(r.i32()?)),
             Tag::Long => r.i64(),
@@ -183,16 +187,16 @@ impl MetadataFields {
     }
 
     /// Combines this compound with the versions declared beside it at the root.
-    fn into_metadata(
-        self,
+    pub(crate) fn to_metadata(
+        &self,
         minecraft_data_version: i32,
         version: i32,
         sub_version: Option<i32>,
     ) -> crate::Metadata {
         crate::Metadata {
-            name: self.name,
-            description: self.description,
-            author: self.author,
+            name: self.name.clone(),
+            description: self.description.clone(),
+            author: self.author.clone(),
             minecraft_data_version,
             version,
             sub_version,
@@ -206,9 +210,9 @@ impl MetadataFields {
     }
 }
 
-impl<'a> Decode<'a> for MetadataFields {
+impl<S: Source> Decode<S> for MetadataFields {
     /// Reads the `Metadata` compound.
-    fn decode(r: &mut Reader<'a>, _field: &'static str, enclosing: usize) -> Result<Self> {
+    fn decode(r: &mut Reader<S>, _field: &'static str, enclosing: usize) -> Result<Self> {
         let depth = r.nested(enclosing)?;
         let mut name: Option<String> = None;
         let mut description: Option<String> = None;
@@ -285,9 +289,13 @@ impl<'a> Decode<'a> for MetadataFields {
 /// The `Regions` compound: a map from region name to region.
 struct Regions<'a>(Vec<Region<'a>>);
 
-impl<'a> Decode<'a> for Regions<'a> {
+impl<'a> Decode<SliceSource<'a>> for Regions<'a> {
     /// Reads every region in file order, passing each its member name.
-    fn decode(r: &mut Reader<'a>, _field: &'static str, enclosing: usize) -> Result<Self> {
+    fn decode(
+        r: &mut Reader<SliceSource<'a>>,
+        _field: &'static str,
+        enclosing: usize,
+    ) -> Result<Self> {
         let depth = r.nested(enclosing)?;
         let mut regions = Vec::new();
         loop {

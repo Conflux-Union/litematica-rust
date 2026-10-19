@@ -55,6 +55,36 @@ for region in &doc.regions {
 }
 ```
 
+## Streaming reads
+
+When memory must stay bounded regardless of file size, use `StreamReader`.
+It inflates the gzip member through a small fixed buffer and hands out one
+region at a time; a region's packed payload is held only until its other
+fields have been read, then decoded voxel by voxel and released. Peak memory
+is O(buffer + palette + one region payload). NBT field order does not matter.
+
+```rust
+use litematica::StreamReader;
+
+let file = std::fs::File::open("bridge.litematic")?;
+let mut reader = StreamReader::open(file, 512 * 1024 * 1024)?; // hard cap
+while let Some(mut region) = reader.next_region()? {
+    region.read_blocks(|_index| {
+        // One palette index at a time, in storage order.
+        Ok(())
+    })?;
+}
+// Metadata may trail the regions, so it is read once the stream is exhausted.
+if let Some(metadata) = reader.metadata() {
+    println!("{}", metadata.name);
+}
+```
+
+Streaming is forward-only, but NBT compounds are unordered: fields may arrive
+in any order, including `BlockStates` before `Size` or `BlockStatePalette`.
+The reader holds the current region's payload while its header is still
+arriving, which keeps the decode order-independent without seeking.
+
 ## Writing
 
 Serialization is declarative: implement `Layout` with two point queries and
@@ -122,6 +152,9 @@ the Litematica mod and rustmatica.
 - `decompress_gzip_with_limit(input, limit)` — single-member gzip inflation
   with an enforced output cap (fails *while* decompressing, not after).
 - `Document::parse(buf)` — one-pass scan; borrows `buf`.
+- `StreamReader::open(read, limit)` — forward-only gzip stream;
+  `next_region()` yielding `StreamRegion` with `read_blocks(fn)`, and
+  `metadata() -> Option<&Metadata>` once the header has been scanned.
 - `Document::total_volume()`, `Document::enclosing_size() -> Option<BlockSize>`
   — computed with the same formulas as Litematica/rustmatica; the size is a
   non-negative span, unlike the declared `Metadata::enclosing_size`.
@@ -189,8 +222,10 @@ palette. Writer memory is O(palette) regardless of volume.
 
 ## Status
 
-Reading is complete and production-ready. Writing is a newer addition:
-single-region, declarative `Layout` input, no entities or tile entities yet.
+Reading is complete and production-ready, in two modes: `Document` for
+random access to a decompressed buffer, and `StreamReader` for bounded-memory
+sequential reads of large files. Writing is a newer addition: single-region,
+declarative `Layout` input, no entities or tile entities yet.
 
 ## License
 
