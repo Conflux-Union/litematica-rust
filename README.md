@@ -1,232 +1,139 @@
 # litematica
 
-Streaming, low-memory reader and writer for Minecraft [Litematica](https://github.com/masa-tools/litematica)
-`.litematic` schematic files (format version 6).
+Streaming, low-memory reader and writer for Minecraft `.litematic` schematic files (format version 6).
 
-## Why
+## Design goals
 
-Tree-based parsers such as [rustmatica](https://crates.io/crates/rustmatica)
-deserialize the whole NBT structure and then expand the packed block data into
-a `Vec` with one entry per voxel. For a large schematic (for example a
-566×256×1423 bridge: 206 million voxels, 232 MB of decompressed NBT) that
-peaks at roughly **15.4 GiB of RSS**, which rules them out for server-side
-use.
+The crate serves three distinct use cases: pure streaming reads whose memory does not grow with file size, compact random access over decompressed data, and streaming writes from procedural or composite layouts. All three share one set of format semantics and safety boundaries: input is never trusted unconditionally, no read expands the full volume, and errors point at the byte where they were detected.
 
-This crate takes a different route:
-
-- the gzip member is inflated once into a caller-bounded buffer;
-- the decompressed NBT is scanned by a hand-written, forward-only cursor that
-  never builds a tree — unknown fields (`Entities`, `TileEntities`, pending
-  ticks, `PreviewImageData`, ...) are skipped by length in O(1);
-- only the block state palettes are materialized (they are tiny);
-- the packed `BlockStates` payload is borrowed as a `&[u8]` slice from the
-  input buffer and decoded voxel by voxel on demand, so block data is never
-  copied or expanded.
-
-Peak RSS is therefore roughly *decompressed file size + epsilon*, and parse
-errors carry byte offsets for diagnosing hostile files.
+The design separates where data comes from from how it is stored: the read side promises only to produce the next block or the block at a coordinate, and the write side asks a layout for its bounds, a single block, and the set of states it may produce, so volume never enters the memory budget. Positions, spans, and block states each have a distinct type, and the format invariants live on those types; composite layouts assemble by unioning state sets instead of materializing intermediate results.
 
 ## Installation
 
-```toml
-[dependencies]
-litematica = "0.1"
+```sh
+cargo add litematica
 ```
 
 Requires Rust 1.88 or newer.
 
-## Usage
+## Basic types
+
+Three types carry the Minecraft vocabulary. `BlockState` is a namespaced id plus a property map, cheap to clone and deterministically ordered, so it can key a palette. `BlockPos` is a signed world position and supports vector arithmetic, while `BlockSize` is a non-negative cell count per axis, anchored at the origin and half-open, and owns storage-order indexing. Keeping position and span apart stops a signed file size from being used as an index bound, and lets either value move through a query without a conversion type.
 
 ```rust
-use litematica::{decompress_gzip_with_limit, Document};
+use litematica::mc::{BlockPos, BlockSize, BlockState};
 
-let raw = std::fs::read("bridge.litematic")?;
-let nbt = decompress_gzip_with_limit(&raw, 512 * 1024 * 1024)?; // hard cap
-let doc = Document::parse(&nbt)?;
+let stone = BlockState {
+    name: "minecraft:stone".into(),
+    properties: Default::default(),
+};
 
-println!("{} region(s), {} voxels", doc.regions.len(), doc.total_volume());
-for region in &doc.regions {
-    for index in region.iter_blocks() {
-        // Indices are not validated against the palette; bounds-check.
-        if let Some(state) = region.palette().get(index as usize) {
-            // inspect `state.name` and `state.properties`
-        }
-    }
-}
+let pos = BlockPos::new(3, 2, 5);
+let size = BlockSize::of(BlockPos::new(16, -4, 8)); // negative axes fold into spans
+
+assert_eq!(BlockState::AIR.name, "minecraft:air");
+assert_eq!(stone.name, "minecraft:stone");
+assert_eq!(size.volume(), 16 * 4 * 8);
+assert!(size.contains(pos));
+assert_eq!(size.index_of(pos), Some((2 * 8 + 5) * 16 + 3));
+assert_eq!(size.position_at(0), Some(BlockPos::ORIGIN));
 ```
 
-## Streaming reads
+## Pure streaming reads
 
-When memory must stay bounded regardless of file size, use `StreamReader`.
-It inflates the gzip member through a small fixed buffer and hands out one
-region at a time; a region's packed payload is held only until its other
-fields have been read, then decoded voxel by voxel and released. Peak memory
-is O(buffer + palette + one region payload). NBT field order does not matter.
+Use `StreamReader` when the file is much larger than available memory. It inflates the gzip stream through a fixed-size buffer and yields one region at a time, keeping a region's packed payload only until that region is consumed. Peak memory is independent of file size: the buffer, the palette, and one region. NBT field order does not matter; a `Metadata` compound that trails the regions becomes available once the stream is exhausted.
 
 ```rust
 use litematica::StreamReader;
+use std::fs::File;
 
-let file = std::fs::File::open("bridge.litematic")?;
-let mut reader = StreamReader::open(file, 512 * 1024 * 1024)?; // hard cap
-while let Some(mut region) = reader.next_region()? {
-    region.read_blocks(|_index| {
-        // One palette index at a time, in storage order.
-        Ok(())
-    })?;
-}
-// Metadata may trail the regions, so it is read once the stream is exhausted.
-if let Some(metadata) = reader.metadata() {
-    println!("{}", metadata.name);
+fn main() -> litematica::Result<()> {
+    let file = File::open("bridge.litematic")?;
+    let mut reader = StreamReader::open(file, 512 * 1024 * 1024)?;
+
+    while let Some(mut region) = reader.next_region()? {
+        let mut counts = vec![0u64; region.palette().len()];
+        region.read_blocks(|index| {
+            // A corrupt file may yield an out-of-range index; get_mut ignores it.
+            if let Some(count) = counts.get_mut(index as usize) {
+                *count += 1;
+            }
+            Ok(())
+        })?;
+        println!("{}: {} voxels", region.name(), region.volume());
+    }
+
+    if let Some(metadata) = reader.metadata() {
+        println!("{}", metadata.name);
+    }
+    Ok(())
 }
 ```
 
-Streaming is forward-only, but NBT compounds are unordered: fields may arrive
-in any order, including `BlockStates` before `Size` or `BlockStatePalette`.
-The reader holds the current region's payload while its header is still
-arriving, which keeps the decode order-independent without seeking.
+## Compact random access
 
-## Writing
+Use `Document` when the data can reside in memory as a whole but blocks should not be expanded per voxel. It keeps only the decompressed bytes and the palettes, decoding a block at query time, so a lookup does not depend on a region's volume. This suits repeated random access to one schematic; the tradeoff is holding the full decompressed buffer, which must outlive the document.
 
-Serialization is declarative: implement `Layout` with two point queries and
-the crate streams the file out with memory bounded by the palette, not the
-volume — suited to procedural generation and network sinks alike.
+```rust
+use litematica::mc::BlockPos;
+use litematica::{decompress_gzip_with_limit, Document};
+
+fn main() -> litematica::Result<()> {
+    let raw = std::fs::read("map.litematic")?;
+    let nbt = decompress_gzip_with_limit(&raw, 512 * 1024 * 1024)?;
+    let doc = Document::parse(&nbt)?;
+
+    for region in &doc.regions {
+        let pos = BlockPos::new(3, 4, 5);
+        let state = region.block_at(pos);
+        println!("{} {:?}", region.name, state);
+    }
+
+    println!("enclosing size: {:?}", doc.enclosing_size());
+    Ok(())
+}
+```
+
+## Composite streaming writes
+
+The writer never requires a materialized volume; it treats a `Layout` as a queryable source: declare the bounding box, return a block per coordinate, and declare the set of states that may occur. Procedural generation, overlays, and template stitching all fit the same interface; a composite layout only has to union its children's state sets, after which the writer pulls voxels in storage order and streams compressed output. Peak memory is the palette, independent of volume. Output is currently a single region without entities or block entities.
 
 ```rust
 use litematica::mc::{BlockPos, BlockState};
 use litematica::write::{write, Layout, WriteOptions};
+use std::collections::HashSet;
 
-struct MyLayout {
-    stone: BlockState,
+/// One layer of stone on the floor, air everywhere else.
+struct Floor {
+    state: BlockState,
 }
 
-impl Layout for MyLayout {
+impl Layout for Floor {
     fn size(&self) -> BlockPos {
         BlockPos::new(16, 16, 16)
     }
 
     fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
-        // None means air; return your own state storage.
-        (pos.y == 0).then(|| self.stone.clone())
+        (pos.y == 0).then(|| self.state.clone())
+    }
+
+    fn block_palette(&self) -> HashSet<BlockState> {
+        // Declaring the set analytically skips the full-box discovery scan;
+        // over-approximation is allowed.
+        HashSet::from([BlockState::AIR, self.state.clone()])
     }
 }
 
-# fn main() -> Result<(), litematica::Error> {
-let options = WriteOptions::new(4189, "my build"); // data version 4189 = 1.21.4
-let mut file = std::io::Cursor::new(Vec::new()); // any `std::io::Write` works
-write(&MyLayout { stone: BlockState { name: "minecraft:stone".into(), properties: Default::default() } }, &options, &mut file)?;
-# Ok(())
-# }
+fn main() -> litematica::Result<()> {
+    let layout = Floor {
+        state: BlockState {
+            name: "minecraft:stone".into(),
+            properties: Default::default(),
+        },
+    };
+
+    let options = WriteOptions::new(4189, "floor"); // 4189 = 1.21.4
+    write(&layout, &options, std::fs::File::create("floor.litematic")?)?;
+    Ok(())
+}
 ```
-
-Design notes:
-
-- `Layout::block_at` may return `None` (air) or one of the states
-  `Layout::block_palette` declares; the default `block_palette`
-  implementation discovers it with one extra scan, and over-approximation is
-  allowed.
-- The writer enforces the format invariants itself: air is pinned to palette
-  index 0, duplicate states collapse, and the bit width matches the reader's
-  rule. A state not covered by the declared palette fails with
-  `Error::BlockNotInPalette` naming the block and position.
-- v1 writing scope is a single region without entities or tile entities.
-
-## Format notes
-
-`.litematic` files are gzipped, big-endian Java NBT with a root compound
-containing `MinecraftDataVersion`, `Version`, `SubVersion`, a `Metadata`
-compound, and a `Regions` compound. Each region carries `Position`,
-`Size` (components may be negative), `BlockStatePalette` (a list of
-`{ Name, Properties }` compounds), and `BlockStates`, a long array.
-
-The long array is one continuous bit stream: within a big-endian `i64`, bit 0
-is the least significant bit, and the first bit in the stream is the lowest
-bit of the first entry. Entries use `n` bits each, where `n` is the smallest
-value ≥ 2 with `2^n >= palette.len()`; entries may straddle long boundaries.
-The voxel at local coordinates `(x, y, z)` is entry
-`y*(sx*sz) + z*sx + x` (x fastest, y slowest), which yields exactly
-`|size.x| * |size.y| * |size.z|` entries. This matches the bit layout used by
-the Litematica mod and rustmatica.
-
-## API overview
-
-- `decompress_gzip_with_limit(input, limit)` — single-member gzip inflation
-  with an enforced output cap (fails *while* decompressing, not after).
-- `Document::parse(buf)` — one-pass scan; borrows `buf`.
-- `StreamReader::open(read, limit)` — forward-only gzip stream;
-  `next_region()` yielding `StreamRegion` with `read_blocks(fn)`, and
-  `metadata() -> Option<&Metadata>` once the header has been scanned.
-- `Document::total_volume()`, `Document::enclosing_size() -> Option<BlockSize>`
-  — computed with the same formulas as Litematica/rustmatica; the size is a
-  non-negative span, unlike the declared `Metadata::enclosing_size`.
-- `Metadata` — name/description/author, data and format versions, declared
-  counts and sizes, timestamps.
-- `Region` — `name`, `position`, `size` as stored (possibly negative),
-  `palette()`, `dims()`, `volume()`, `bits_per_entry()`, and
-  `iter_blocks() -> impl Iterator<Item = u32> + ExactSizeIterator`.
-- `BlockState` — `name` plus `properties` in file order.
-- `Layout` — `size()`, `block_at(pos) -> Option<BlockState>`, and a default
-  `block_palette()` discovery scan; the declarative source for writing.
-- `write(layout, &options, sink)` — single-region streaming serialization
-  into any `Write`; `WriteOptions` carries name/author/description, the
-  Minecraft data version, timestamps, and the gzip level.
-- Errors: a `thiserror` enum, parse variants carry byte offsets;
-  `Result<T>` alias included.
-
-## Performance
-
-Measured with `examples/bench.rs` on a real 566×256×1423 bridge schematic:
-7.4 MiB gzipped, 221 MiB of decompressed NBT, 1 region, 206,187,008 voxels.
-Peak RSS is read from `VmHWM`.
-
-| stage | wall time |
-| --- | --- |
-| decompress (single-member gzip, capped) | 193 ms |
-| parse (tree-less scan) | 0 ms (below timer resolution) |
-| iterate all 206M voxels | 223 ms |
-| total | 417 ms |
-
-Peak RSS: **231 MiB** (242,167,808 bytes) — roughly the decompressed size
-plus epsilon.
-
-### Comparison with rustmatica
-
-`examples/diff_real.rs` runs this crate and
-[rustmatica](https://crates.io/crates/rustmatica) 0.5.2 side by side on the
-same real file and asserts voxel-exact equality: both report 1 region,
-volume 206,187,008, and block checksum `11145073651595385200`. Results from
-one differential run (same machine):
-
-| | this crate | rustmatica 0.5.2 |
-| --- | --- | --- |
-| wall time | 411 ms | 10,316 ms (~25× slower) |
-| peak RSS | 231 MiB | 16.0 GiB (~71× more) |
-
-A repeat of the differential run on the same machine gave 15.44 GiB /
-12.45 s for rustmatica; absolute numbers move a little between runs, but
-the gap of roughly two orders of magnitude in both time and memory does
-not.
-
-### Writing
-
-`examples/write_bench.rs` serializes a procedurally generated hollow sphere
-in the same 566×256×1423 envelope (206,187,008 voxels), then the file is
-read back by this crate with exact volume agreement:
-
-| stage | wall time |
-| --- | --- |
-| stream-write 206M voxels (queries + packing + gzip 6) | 12.2 s |
-| read back (decompress + parse + iterate) | 89 ms |
-
-Peak RSS while writing: **2.5 MiB** — the rust runtime baseline plus the
-palette. Writer memory is O(palette) regardless of volume.
-
-## Status
-
-Reading is complete and production-ready, in two modes: `Document` for
-random access to a decompressed buffer, and `StreamReader` for bounded-memory
-sequential reads of large files. Writing is a newer addition: single-region,
-declarative `Layout` input, no entities or tile entities yet.
-
-## License
-
-MIT OR Apache-2.0.
