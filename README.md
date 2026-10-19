@@ -29,7 +29,6 @@ Three types carry the Minecraft vocabulary. `BlockState` is a namespaced id plus
 use litematica::knowledge::mc::{BlockPos, BlockSize, BlockState};
 
 let stone: BlockState = "minecraft:stone".into();
-
 let pos = BlockPos::new(3, 2, 5);
 let size = BlockSize::of(BlockPos::new(16, -4, 8)); // negative axes fold into spans
 
@@ -61,7 +60,6 @@ fn count_air(path: &str) -> litematica::error::Result<()> {
             .count();
         println!("{}: {} air of {} voxels", region.name, air, region.volume());
     }
-
     if let Some(metadata) = reader.metadata() {
         println!("{}", metadata.name);
     }
@@ -88,7 +86,6 @@ fn inspect(path: &str) -> litematica::error::Result<()> {
         let state = region.state_at(pos);
         println!("{} {:?}", region.name, state);
     }
-
     println!("enclosing size: {:?}", doc.bounding_size());
     Ok(())
 }
@@ -118,8 +115,6 @@ impl Layout for Floor {
     }
 
     fn block_palette(&self) -> HashSet<BlockState> {
-        // Declaring the set analytically skips the full-box discovery scan;
-        // over-approximation is allowed.
         HashSet::from([BlockState::AIR, self.state.clone()])
     }
 }
