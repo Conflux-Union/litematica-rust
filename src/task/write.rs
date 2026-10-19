@@ -8,12 +8,12 @@
 //! may over-approximate, and its default implementation discovers the palette
 //! with one extra scan.
 
-use crate::bitstream::Packer;
 use crate::error::{Error, Result};
-use crate::mc::{BlockPos, BlockSize, BlockState, PositionIter};
-use crate::nbt::{Encode, Tag, Writer};
-use crate::palette::{Palette, PaletteId};
-use crate::region::Region;
+use crate::knowledge::mc::{BlockPos, BlockSize, BlockState, PositionIter};
+use crate::knowledge::nbt::{Encode, Tag, Writer};
+use crate::model::bitstream::Packer;
+use crate::model::palette::{Palette, PaletteId};
+use crate::model::region::Region;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::cell::Cell;
@@ -184,16 +184,16 @@ impl WriteOptions {
 /// # Example
 ///
 /// ```no_run
-/// # use litematica::write::{write, Layout, WriteOptions};
+/// # use litematica::task::write::{write, Layout, WriteOptions};
 /// # struct MyLayout;
 /// # impl Layout for MyLayout {
-/// #     fn size(&self) -> litematica::mc::BlockSize {
-/// #         litematica::mc::BlockSize::new(16, 16, 16)
+/// #     fn size(&self) -> litematica::knowledge::mc::BlockSize {
+/// #         litematica::knowledge::mc::BlockSize::new(16, 16, 16)
 /// #     }
-/// #     fn block_at(&self, pos: litematica::mc::BlockPos)
-/// #         -> Option<litematica::mc::BlockState> { None }
+/// #     fn block_at(&self, pos: litematica::knowledge::mc::BlockPos)
+/// #         -> Option<litematica::knowledge::mc::BlockState> { None }
 /// # }
-/// # fn main() -> Result<(), litematica::Error> {
+/// # fn main() -> Result<(), litematica::error::Error> {
 /// let layout = MyLayout;
 /// let options = WriteOptions::new(4189, "my build");
 /// let file = std::fs::File::create("my_build.litematic")?;
@@ -459,7 +459,7 @@ impl Encode for MetadataNbt<'_> {
 #[cfg(test)]
 mod tests {
     use super::Layout;
-    use crate::mc::{BlockPos, BlockSize, BlockState};
+    use crate::knowledge::mc::{BlockPos, BlockSize, BlockState};
 
     fn air() -> BlockState {
         BlockState::AIR

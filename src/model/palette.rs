@@ -14,7 +14,7 @@
 //! is derived from the palette length. Neither rule belongs to Minecraft's
 //! vocabulary; both belong to the file format.
 
-use crate::mc::BlockState;
+use crate::knowledge::mc::BlockState;
 
 // Palette
 //
@@ -136,7 +136,7 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::Palette;
-    use crate::mc::BlockState;
+    use crate::knowledge::mc::BlockState;
 
     fn st(name: &str) -> BlockState {
         BlockState {

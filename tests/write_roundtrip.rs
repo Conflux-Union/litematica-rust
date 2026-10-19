@@ -1,15 +1,17 @@
 //! Round-trip and error-path tests for the streaming writer.
 //!
 //! Layouts are hand-built tables (a grid of palette indices), serialized
-//! with `litematica::write`, then parsed back with `Document::parse` and
+//! with `litematica::task::write`, then parsed back with `Document::parse` and
 //! checked field by field: metadata, region layout, palette order
 //! (air pinned to index 0, rest sorted), and the voxel-by-voxel stream.
 
 use std::collections::HashSet;
 
-use litematica::mc::{BlockPos, BlockSize, BlockState};
-use litematica::write::{write, Layout, WriteOptions};
-use litematica::{decompress_gzip_with_limit, Document, Error};
+use litematica::error::Error;
+use litematica::knowledge::mc::{BlockPos, BlockSize, BlockState};
+use litematica::model::document::Document;
+use litematica::task::decompress::decompress_gzip_with_limit;
+use litematica::task::write::{write, Layout, WriteOptions};
 
 fn st(name: &str, props: &[(&str, &str)]) -> BlockState {
     BlockState {

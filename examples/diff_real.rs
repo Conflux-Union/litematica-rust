@@ -18,7 +18,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use litematica::{decompress_gzip_with_limit, Document};
+use litematica::model::document::Document;
+use litematica::task::decompress::decompress_gzip_with_limit;
 use mcdata::GenericBlockState;
 use rustmatica::Litematic;
 

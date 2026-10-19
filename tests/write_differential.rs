@@ -1,16 +1,17 @@
 //! Differential tests for the streaming writer against `rustmatica` 0.5 as
 //! an independent oracle.
 //!
-//! Random layouts are serialized with `litematica::write`; the resulting
+//! Random layouts are serialized with `litematica::task::write`; the resulting
 //! bytes must be readable by both rustmatica and this crate's own parser,
 //! and every consumer must agree on metadata, palette order, bit width and
 //! the voxel-by-voxel state stream.
 
 use std::collections::{HashMap, HashSet};
 
-use litematica::mc::{BlockPos, BlockSize, BlockState};
-use litematica::write::{write, Layout, WriteOptions};
-use litematica::{decompress_gzip_with_limit, Document};
+use litematica::knowledge::mc::{BlockPos, BlockSize, BlockState};
+use litematica::model::document::Document;
+use litematica::task::decompress::decompress_gzip_with_limit;
+use litematica::task::write::{write, Layout, WriteOptions};
 use rustmatica::{Litematic, Region};
 
 type Schematic = Litematic<CowStrState, CowEntity, CowBlockEntity>;
@@ -134,7 +135,7 @@ fn expected_file_palette(table: &Table) -> Vec<BlockState> {
 }
 
 /// A palette entry as `(name, properties)`, the shape both sides share.
-fn read_view(state: &litematica::BlockState) -> (String, Vec<(String, String)>) {
+fn read_view(state: &litematica::knowledge::mc::BlockState) -> (String, Vec<(String, String)>) {
     let props = state
         .properties
         .iter()

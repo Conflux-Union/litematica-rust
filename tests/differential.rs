@@ -12,8 +12,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use litematica::mc::{BlockPos as McBlockPos, BlockSize as McBlockSize};
-use litematica::{decompress_gzip_with_limit, Document};
+use litematica::knowledge::mc::{BlockPos as McBlockPos, BlockSize as McBlockSize};
+use litematica::model::document::Document;
+use litematica::task::decompress::decompress_gzip_with_limit;
 use mcdata::util::BlockPos;
 use mcdata::{GenericBlockEntity, GenericBlockState, GenericEntity};
 use rustmatica::{Litematic, Region};
@@ -66,7 +67,7 @@ fn oracle_num_bits(palette_len: usize) -> u32 {
     n
 }
 
-fn sorted_props(state: &litematica::BlockState) -> Vec<(String, String)> {
+fn sorted_props(state: &litematica::knowledge::mc::BlockState) -> Vec<(String, String)> {
     state
         .properties
         .iter()
@@ -158,7 +159,7 @@ fn assert_matches_oracle(schem: &Schematic) {
 
     // Regions: same set of names, same layout, same palettes, same streams.
     assert_eq!(doc.regions.len(), oracle.regions.len());
-    let ours: HashMap<&str, &litematica::Region> =
+    let ours: HashMap<&str, &litematica::model::region::Region> =
         doc.regions.iter().map(|r| (r.name.as_str(), r)).collect();
     assert_eq!(ours.len(), doc.regions.len(), "duplicate region names");
 

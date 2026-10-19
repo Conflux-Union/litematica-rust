@@ -3,13 +3,13 @@
 //!
 //! A litematic region stores palette identifiers as a continuous LSB-first bit
 //! stream carried by big-endian longs: entry `i` starts at bit `i * width` and
-//! may straddle two words. [`BitStream`] is the immutable view, [`BlockIter`]
-//! walks it, and [`Packer`] produces it. Keeping both directions here means
-//! the word layout is stated once, next to itself.
+//! may straddle two words. [`BlockIter`] walks that stream, while the private
+//! `BitStream` and `Packer` implement the two directions. Keeping both
+//! directions here means the word layout is stated once, next to itself.
 
 use std::sync::Arc;
 
-use crate::palette::PaletteId;
+use crate::model::palette::PaletteId;
 
 // Unpacking
 //
@@ -313,7 +313,7 @@ impl Packer {
 #[cfg(test)]
 mod tests {
     use super::{BitStream, BlockIter, Packer};
-    use crate::palette::PaletteId;
+    use crate::model::palette::PaletteId;
 
     #[test]
     fn iter_decodes_lsb_first_stream() {

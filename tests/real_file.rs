@@ -15,7 +15,9 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use litematica::{decompress_gzip_with_limit, Document, StreamReader};
+use litematica::model::document::Document;
+use litematica::task::decompress::decompress_gzip_with_limit;
+use litematica::task::stream::StreamReader;
 
 #[test]
 #[ignore = "set LITEMATICA_TEST_FILE to a real .litematic file to run this"]

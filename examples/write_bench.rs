@@ -15,8 +15,8 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use litematica::mc::{BlockPos, BlockSize, BlockState};
-use litematica::write::{write, Layout, WriteOptions};
+use litematica::knowledge::mc::{BlockPos, BlockSize, BlockState};
+use litematica::task::write::{write, Layout, WriteOptions};
 
 /// Peak resident set size in bytes (Linux only, from VmHWM).
 fn peak_rss_bytes() -> Option<u64> {
@@ -65,7 +65,7 @@ impl Layout for HollowSphere {
     }
 }
 
-fn main() -> Result<(), litematica::Error> {
+fn main() -> Result<(), litematica::error::Error> {
     let out_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "write_bench.litematic".to_string());

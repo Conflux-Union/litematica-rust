@@ -20,13 +20,12 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::Write as IoWrite;
 
-use crate::document::Metadata;
 use crate::error::{Error, Result};
-use crate::mc::{BlockPos, BlockSize, BlockState};
-use crate::nbt::{
-    Decode, Encode, FieldEntry, FieldOutcome, FieldTable, Reader, Slot, Source, Tag, Writer,
-};
-use crate::palette::Palette;
+use crate::knowledge::mc::{BlockPos, BlockSize, BlockState};
+use crate::knowledge::nbt::{Decode, Encode, FieldEntry, FieldOutcome, FieldTable};
+use crate::knowledge::nbt::{Reader, Slot, Source, Tag, Writer};
+use crate::model::document::Metadata;
+use crate::model::palette::Palette;
 
 // Root fields
 //

@@ -7,8 +7,11 @@
 use std::io::{Cursor, Write as _};
 
 use flate2::{write::GzEncoder, Compression};
-use litematica::mc::{BlockPos, BlockSize};
-use litematica::{decompress_gzip_with_limit, Document, Error, StreamReader};
+use litematica::error::Error;
+use litematica::knowledge::mc::{BlockPos, BlockSize};
+use litematica::model::document::Document;
+use litematica::task::decompress::decompress_gzip_with_limit;
+use litematica::task::stream::StreamReader;
 
 // ---------------------------------------------------------------- builder
 

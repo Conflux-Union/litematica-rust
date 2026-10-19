@@ -1,6 +1,6 @@
 //! Error types for this crate.
 
-use crate::mc::{BlockPos, BlockState};
+use crate::knowledge::mc::{BlockPos, BlockState};
 use std::io;
 
 /// Convenient result alias used throughout this crate.

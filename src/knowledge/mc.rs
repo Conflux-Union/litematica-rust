@@ -15,9 +15,8 @@
 //!
 //! This module contains world definitions only. File-format concepts built on
 //! top of them — the palette that numbers states, the bit stream that packs
-//! those numbers — live beside the tasks that need them. Every reader and
-//! writer reaches these types through the same names; no task defines a
-//! look-alike of its own.
+//! those numbers — live in the model layer. Every reader and writer reaches
+//! these types through the same names; no task defines a look-alike of its own.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;

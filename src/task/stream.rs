@@ -1,7 +1,7 @@
 //! Sequential, bounded-memory reading of `.litematic` files.
 //!
-//! The counterpart of [`crate::Document`]: instead of borrowing a fully
-//! decompressed buffer, a [`StreamReader`] pulls the gzip member through a
+//! The counterpart of [`crate::model::document::Document`]: instead of
+//! borrowing a fully decompressed buffer, a [`StreamReader`] pulls the gzip member through a
 //! small buffer and hands out one [`Region`] at a time. A region's palette is
 //! materialized (it is small) and its packed `BlockStates` payload is held
 //! only while that region is alive, then released. Peak memory is
@@ -15,20 +15,20 @@
 //! cost is that the payload of the region being read is resident; nothing
 //! larger is.
 //!
-//! Random access remains the job of [`crate::Document`]. The two modes share
-//! the same [`Region`] type, NBT decoders, header accumulators, geometry
-//! validation, and bit-level cursor, so they agree on every decoded value;
-//! only the storage strategy differs.
+//! Random access remains the job of [`crate::model::document::Document`]. The
+//! two modes share the same [`Region`] type, NBT decoders, header accumulators,
+//! geometry validation, and bit-level cursor, so they agree on every decoded
+//! value; only the storage strategy differs.
 
 use std::io::{BufReader, Read};
 
 use flate2::read::GzDecoder;
 
-use crate::document::Metadata;
 use crate::error::{Error, Result};
-use crate::nbt::{FieldOutcome, IoSource, Reader, Slot, Source, Tag};
-use crate::region::{Region, RegionHeader, RegionParts};
-use crate::schema::RootFields;
+use crate::knowledge::nbt::{FieldOutcome, IoSource, Reader, Slot, Source, Tag};
+use crate::model::document::Metadata;
+use crate::model::region::{Region, RegionHeader, RegionParts};
+use crate::model::schema::RootFields;
 
 /// A buffered gzip stream, the byte source a [`StreamReader`] consumes.
 type GzipSource<R> = IoSource<BufReader<GzDecoder<R>>>;

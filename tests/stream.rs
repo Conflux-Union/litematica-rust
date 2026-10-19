@@ -13,8 +13,9 @@
 use std::io::{Cursor, Write as _};
 
 use flate2::{write::GzEncoder, Compression};
-use litematica::mc::{BlockPos, BlockSize};
-use litematica::{Document, StreamReader};
+use litematica::knowledge::mc::{BlockPos, BlockSize};
+use litematica::model::document::Document;
+use litematica::task::stream::StreamReader;
 
 // NBT fixture builder
 //
@@ -312,7 +313,9 @@ fn three_regions() -> Vec<RegionSpec<'static>> {
     ]
 }
 
-fn palette_view(palette: &[litematica::BlockState]) -> Vec<(String, Vec<(String, String)>)> {
+fn palette_view(
+    palette: &[litematica::knowledge::mc::BlockState],
+) -> Vec<(String, Vec<(String, String)>)> {
     palette
         .iter()
         .map(|state| {

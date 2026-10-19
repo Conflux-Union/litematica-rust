@@ -882,7 +882,7 @@ impl<W: IoWrite> Writer<W> {
 #[cfg(test)]
 mod tests {
     use super::{Encode, Reader, SliceSource, Tag, Writer, MAX_DEPTH};
-    use crate::Error;
+    use crate::error::Error;
 
     #[test]
     fn tag_ids_round_trip_and_reject_unknown_values() {

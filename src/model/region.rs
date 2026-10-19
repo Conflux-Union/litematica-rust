@@ -7,11 +7,12 @@
 
 use std::fmt;
 
-use crate::bitstream::{BitStream, BlockIter};
 use crate::error::{Error, Result};
-use crate::mc::{BlockPos, BlockSize, BlockState};
-use crate::nbt::{FieldEntry, FieldOutcome, FieldTable, Reader, SliceSource, Slot, Source, Tag};
-use crate::palette::{Palette, PaletteId};
+use crate::knowledge::mc::{BlockPos, BlockSize, BlockState};
+use crate::knowledge::nbt::{FieldEntry, FieldOutcome, FieldTable, Reader};
+use crate::knowledge::nbt::{SliceSource, Slot, Source, Tag};
+use crate::model::bitstream::{BitStream, BlockIter};
+use crate::model::palette::{Palette, PaletteId};
 
 // Region header
 //
@@ -271,7 +272,8 @@ impl<'a> Region<'a> {
     /// The number of voxels in this region, `dims().volume()` narrowed to
     /// `u64`.
     ///
-    /// [`crate::Document::parse`] rejects regions whose volume does not fit
+    /// [`crate::model::document::Document::parse`] rejects regions whose
+    /// volume does not fit
     /// into a `u64`, so this value is exact for any parsed region.
     pub fn volume(&self) -> u64 {
         self.volume
