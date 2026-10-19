@@ -167,4 +167,16 @@ pub enum Error {
         /// Byte offset of the palette list.
         offset: usize,
     },
+
+    /// A region's packed payload is too long to address on this platform.
+    #[error(
+        "BlockStates payload of {longs} longs exceeds the platform address space \
+         at byte offset {offset}"
+    )]
+    PayloadTooLarge {
+        /// The declared number of longs.
+        longs: usize,
+        /// Byte offset of the payload length.
+        offset: usize,
+    },
 }

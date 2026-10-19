@@ -8,8 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use litematica::write::mcdata::util::BlockPos;
-use litematica::write::mcdata::BlockState;
+use litematica::mc::{BlockPos, BlockSize, BlockState};
 use litematica::write::{write, Layout, WriteOptions};
 use litematica::{decompress_gzip_with_limit, Document};
 use rustmatica::{Litematic, Region};
@@ -83,7 +82,7 @@ impl Table {
                 )
             })
             .collect();
-        let mut grid = Vec::with_capacity(size.volume() as usize);
+        let mut grid = Vec::with_capacity(BlockSize::of(size).volume() as usize);
         for y in 0..size.y {
             for z in 0..size.z {
                 for x in 0..size.x {
@@ -100,8 +99,7 @@ impl Table {
     }
 
     fn voxel_index(&self, pos: BlockPos) -> usize {
-        let size = self.size;
-        ((pos.y * size.z + pos.z) * size.x + pos.x) as usize
+        BlockSize::of(self.size).index_of(pos).unwrap() as usize
     }
 }
 
@@ -200,11 +198,7 @@ fn assert_written_file_matches(table: &Table, options: &WriteOptions) {
         "oracle enclosing size follows the mod formula"
     );
     // We store the region size verbatim; the field is never validated.
-    assert_eq!(
-        doc.metadata.enclosing_size,
-        Some([sx, sy, sz]),
-        "declared enclosing size mirrors Region.Size"
-    );
+    assert_eq!(doc.metadata.enclosing_size, Some(BlockPos::new(sx, sy, sz)));
 
     // Region layout.
     let oregion: &OracleRegion = &oracle.regions[0];
@@ -215,7 +209,7 @@ fn assert_written_file_matches(table: &Table, options: &WriteOptions) {
         (oregion.position.x, oregion.position.y, oregion.position.z),
         (0, 0, 0)
     );
-    assert_eq!(region.position, [0, 0, 0]);
+    assert_eq!(region.position, BlockPos::new(0, 0, 0));
     assert_eq!(
         (oregion.size.x, oregion.size.y, oregion.size.z),
         (sx, sy, sz)

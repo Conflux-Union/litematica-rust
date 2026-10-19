@@ -12,6 +12,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use litematica::mc::{BlockPos as McBlockPos, BlockSize as McBlockSize};
 use litematica::{decompress_gzip_with_limit, Document};
 use mcdata::util::BlockPos;
 use mcdata::{GenericBlockEntity, GenericBlockState, GenericEntity};
@@ -132,7 +133,7 @@ fn assert_matches_oracle(schem: &Schematic) {
         Some(i64::from(oracle.total_volume()))
     );
     let enclosing = oracle.enclosing_size();
-    let enclosing = [enclosing.x, enclosing.y, enclosing.z];
+    let enclosing = McBlockPos::new(enclosing.x, enclosing.y, enclosing.z);
     assert_eq!(doc.metadata.enclosing_size, Some(enclosing));
 
     // Computed document values must match the oracle's formulas.
@@ -144,7 +145,14 @@ fn assert_matches_oracle(schem: &Schematic) {
             .map(|r| u64::from(r.size.volume()))
             .sum::<u64>()
     );
-    assert_eq!(doc.enclosing_size(), Some(enclosing));
+    assert_eq!(
+        doc.enclosing_size(),
+        Some(McBlockSize::new(
+            enclosing.x as u32,
+            enclosing.y as u32,
+            enclosing.z as u32
+        ))
+    );
 
     // Regions: same set of names, same layout, same palettes, same streams.
     assert_eq!(doc.regions.len(), oracle.regions.len());
@@ -159,12 +167,12 @@ fn assert_matches_oracle(schem: &Schematic) {
             .unwrap_or_else(|| panic!("region {name} missing in our parse"));
         assert_eq!(
             mregion.position,
-            [oregion.position.x, oregion.position.y, oregion.position.z],
+            McBlockPos::new(oregion.position.x, oregion.position.y, oregion.position.z),
             "position of {name}"
         );
         assert_eq!(
             mregion.size,
-            [oregion.size.x, oregion.size.y, oregion.size.z],
+            McBlockPos::new(oregion.size.x, oregion.size.y, oregion.size.z),
             "size of {name}"
         );
 
@@ -243,7 +251,7 @@ fn palette_size_sweep() {
 }
 
 #[test]
-fn odd_dimensions_cross_long_boundaries() {
+fn dimension_edges_match_the_oracle() {
     let mut seed = 0x1234_5678_9abc_def1u64;
     for (sx, sy, sz) in [
         (5, 3, 7),
@@ -269,6 +277,29 @@ fn odd_dimensions_cross_long_boundaries() {
         schem.regions.push(region);
         assert_matches_oracle(&schem);
     }
+
+    // Zero axes: no block can be set, so the palette stays at just air and
+    // BlockStates is empty.
+    let mut schem = base_schematic("zero axis".to_string());
+    schem.regions.push(Region::new(
+        "x zero",
+        BlockPos::new(1, 2, 3),
+        BlockPos::new(0, 4, 6),
+    ));
+    schem.regions.push(Region::new(
+        "y zero",
+        BlockPos::new(-2, -3, -4),
+        BlockPos::new(5, 0, 3),
+    ));
+    schem.regions.push(Region::new(
+        "z zero",
+        BlockPos::new(7, 8, 9),
+        BlockPos::new(5, 4, 0),
+    ));
+    let mut live = Region::new("live", BlockPos::new(-1, -1, -1), BlockPos::new(3, 3, 3));
+    live.set_block(BlockPos::new(1, 1, 1), st("minecraft:stone", &[]));
+    schem.regions.push(live);
+    assert_matches_oracle(&schem);
 }
 
 #[test]
@@ -356,32 +387,6 @@ fn property_states_round_trip() {
         st("minecraft:snow", &[("layers", "8")]),
     );
     schem.regions.push(region);
-    assert_matches_oracle(&schem);
-}
-
-#[test]
-fn zero_axis_regions() {
-    let mut schem = base_schematic("zero axis".to_string());
-    // No blocks can be set in a region with a zero axis; the palette stays at
-    // just air and BlockStates is empty.
-    schem.regions.push(Region::new(
-        "x zero",
-        BlockPos::new(1, 2, 3),
-        BlockPos::new(0, 4, 6),
-    ));
-    schem.regions.push(Region::new(
-        "y zero",
-        BlockPos::new(-2, -3, -4),
-        BlockPos::new(5, 0, 3),
-    ));
-    schem.regions.push(Region::new(
-        "z zero",
-        BlockPos::new(7, 8, 9),
-        BlockPos::new(5, 4, 0),
-    ));
-    let mut live = Region::new("live", BlockPos::new(-1, -1, -1), BlockPos::new(3, 3, 3));
-    live.set_block(BlockPos::new(1, 1, 1), st("minecraft:stone", &[]));
-    schem.regions.push(live);
     assert_matches_oracle(&schem);
 }
 

@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use litematica::{decompress_gzip_with_limit, Document};
+use litematica::{decompress_gzip_with_limit, Document, StreamReader};
 
 #[test]
 #[ignore = "set LITEMATICA_TEST_FILE to a real .litematic file to run this"]
@@ -64,6 +64,51 @@ fn real_file_parse_and_iterate() {
     if std::env::var_os("LITEMATICA_DIFF_RUSTMATICA").is_some() {
         diff_against_rustmatica(&raw, &doc);
     }
+}
+
+/// Runs both readers over a real file and compares them voxel by voxel.
+///
+/// This is the check that field order and per-region buffering do not change
+/// what is decoded: the streaming path must agree with the random-access path
+/// for every region and every voxel.
+#[test]
+#[ignore = "set LITEMATICA_TEST_FILE to a real .litematic file to run this"]
+fn real_file_stream_matches_document() {
+    let Some(path) = std::env::var_os("LITEMATICA_TEST_FILE") else {
+        eprintln!("LITEMATICA_TEST_FILE not set; skipping");
+        return;
+    };
+    let raw = std::fs::read(&path).expect("read test file");
+    let nbt = decompress_gzip_with_limit(&raw, 8 << 30).expect("decompress");
+    let doc = Document::parse(&nbt).expect("parse");
+
+    let file = std::fs::File::open(&path).expect("open test file");
+    let mut reader = StreamReader::open(file, 8 << 30).expect("stream open");
+    let mut count = 0usize;
+    while let Some(mut region) = reader.next_region().expect("region") {
+        let expected = &doc.regions[count];
+        assert_eq!(region.name(), expected.name);
+        assert_eq!(region.position(), expected.position);
+        assert_eq!(region.size(), expected.size);
+        assert_eq!(region.dims(), expected.dims());
+        assert_eq!(region.volume(), expected.volume());
+        assert_eq!(region.palette(), expected.palette());
+
+        let name = region.name().to_owned();
+        let mut voxels = expected.iter_blocks();
+        let mut seen = 0u64;
+        region
+            .read_blocks(|index| {
+                assert_eq!(Some(index), voxels.next(), "voxel {seen} of {name}");
+                seen += 1;
+                Ok(())
+            })
+            .expect("stream payload");
+        assert!(voxels.next().is_none(), "region {name} is longer");
+        count += 1;
+    }
+    assert_eq!(count, doc.regions.len(), "region count");
+    assert_eq!(reader.metadata(), Some(&doc.metadata));
 }
 
 /// Full per-voxel comparison against the rustmatica oracle. Memory hungry:

@@ -7,8 +7,7 @@
 
 use std::collections::HashSet;
 
-use litematica::write::mcdata::util::BlockPos;
-use litematica::write::mcdata::BlockState;
+use litematica::mc::{BlockPos, BlockSize, BlockState};
 use litematica::write::{write, Layout, WriteOptions};
 use litematica::{decompress_gzip_with_limit, Document, Error};
 
@@ -55,7 +54,7 @@ struct Table {
 impl Table {
     /// Builds a table filled by `fill(pos)` returning a state index or AIR.
     fn filled(size: BlockPos, states: Vec<BlockState>, fill: impl Fn(BlockPos) -> u8) -> Self {
-        let mut grid = Vec::with_capacity(size.volume() as usize);
+        let mut grid = Vec::with_capacity(BlockSize::of(size).volume() as usize);
         for y in 0..size.y {
             for z in 0..size.z {
                 for x in 0..size.x {
@@ -72,8 +71,7 @@ impl Table {
     }
 
     fn voxel_index(&self, pos: BlockPos) -> usize {
-        let size = self.size;
-        ((pos.y * size.z + pos.z) * size.x + pos.x) as usize
+        BlockSize::of(self.size).index_of(pos).unwrap() as usize
     }
 }
 
@@ -161,6 +159,20 @@ fn assert_voxels_match(table: &Table, doc: &Document<'_>) {
         .collect();
     let got: Vec<u32> = region.iter_blocks().collect();
     assert_eq!(got, expect, "voxel stream");
+
+    // Random access must agree with the sequential stream entry by entry.
+    let positions = BlockSize::of(table.size).cartesian_positions();
+    for (i, pos) in positions.enumerate() {
+        assert_eq!(region.index_at(pos), Some(expect[i]), "index at {pos:?}");
+        assert_eq!(
+            read_view(region.block_at(pos).expect("in-bounds position")),
+            write_view(&expected_palette[expect[i] as usize]),
+            "state at {pos:?}"
+        );
+    }
+    let outside = BlockPos::new(table.size.x, 0, 0);
+    assert_eq!(region.index_at(outside), None);
+    assert_eq!(region.block_at(outside), None);
 }
 
 #[test]
@@ -202,13 +214,13 @@ fn round_trip_full_layout() {
     assert_eq!(m.total_blocks, Some(non_air));
     assert_eq!(m.time_created, 1_700_000_000_123);
     assert_eq!(m.time_modified, 1_700_000_000_456);
-    assert_eq!(m.enclosing_size, Some([5, 3, 7]));
+    assert_eq!(m.enclosing_size, Some(BlockPos::new(5, 3, 7)));
 
     assert_eq!(doc.regions.len(), 1);
     let region = &doc.regions[0];
     assert_eq!(region.name, "多区域 schematic ✓");
-    assert_eq!(region.position, [0, 0, 0]);
-    assert_eq!(region.size, [5, 3, 7]);
+    assert_eq!(region.position, BlockPos::new(0, 0, 0));
+    assert_eq!(region.size, BlockPos::new(5, 3, 7));
     assert_eq!(region.volume(), 105);
     let expected_palette = expected_file_palette(&table);
     let got: Vec<_> = region.palette().iter().map(read_view).collect();
@@ -267,7 +279,9 @@ fn round_trip_over_approximated_palette_keeps_unused_entries() {
 }
 
 #[test]
-fn round_trip_zero_axis_writes_empty_block_states() {
+fn round_trip_degenerate_volumes() {
+    // A zero axis has no voxels; `EnclosingSize` mirrors `Region.Size`
+    // verbatim, zero axes included.
     let table = Table::filled(BlockPos::new(4, 0, 2), vec![], |_| AIR);
     let rt = RoundTrip::run(&table, &WriteOptions::new(4189, "flat"));
     let doc = rt.doc();
@@ -279,12 +293,9 @@ fn round_trip_zero_axis_writes_empty_block_states() {
     assert_eq!(region.iter_blocks().len(), 0);
     assert_eq!(doc.metadata.total_blocks, Some(0));
     assert_eq!(doc.metadata.total_volume, Some(0));
-    // `EnclosingSize` mirrors `Region.Size` verbatim, zero axes included.
-    assert_eq!(doc.metadata.enclosing_size, Some([4, 0, 2]));
-}
+    assert_eq!(doc.metadata.enclosing_size, Some(BlockPos::new(4, 0, 2)));
 
-#[test]
-fn round_trip_all_air_uses_two_bit_entries() {
+    // All air still uses the 2-bit floor rather than a zero-width palette.
     let table = Table::filled(BlockPos::new(3, 3, 3), vec![], |_| AIR);
     let rt = RoundTrip::run(&table, &WriteOptions::new(4189, "air only"));
     let doc = rt.doc();
@@ -293,21 +304,6 @@ fn round_trip_all_air_uses_two_bit_entries() {
     assert_eq!(region.palette().len(), 1);
     assert_eq!(read_view(&region.palette()[0]), write_view(&air()));
     assert_eq!(doc.metadata.total_blocks, Some(0));
-}
-
-#[test]
-fn write_errors_when_block_not_in_declared_palette() {
-    let states = vec![st("minecraft:stone", &[]), st("litematica:missing", &[])];
-    let mut table = Table::filled(BlockPos::new(2, 1, 2), states, |pos| (pos.x % 2) as u8);
-    table.declared = Some(vec![st("minecraft:stone", &[])]); // misses index 1
-    let err = write(&table, &WriteOptions::new(4189, "bad palette"), Vec::new()).unwrap_err();
-    match err {
-        Error::BlockNotInPalette { name, x, y, z } => {
-            assert_eq!(name, "litematica:missing");
-            assert_eq!([x, y, z], [1, 0, 0]);
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
 }
 
 /// A lazy layout answering every query with one state; for overflow tests
@@ -339,7 +335,21 @@ fn sparse(size: BlockPos) -> Sparse {
 }
 
 #[test]
-fn write_errors_when_volume_exceeds_i32() {
+fn write_rejections() {
+    // A state outside the declared palette reports its position.
+    let states = vec![st("minecraft:stone", &[]), st("litematica:missing", &[])];
+    let mut table = Table::filled(BlockPos::new(2, 1, 2), states, |pos| (pos.x % 2) as u8);
+    table.declared = Some(vec![st("minecraft:stone", &[])]); // misses index 1
+    let err = write(&table, &WriteOptions::new(4189, "bad palette"), Vec::new()).unwrap_err();
+    match err {
+        Error::BlockNotInPalette { name, x, y, z } => {
+            assert_eq!(name, "litematica:missing");
+            assert_eq!([x, y, z], [1, 0, 0]);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    // A volume beyond the format's i32 limit and a negative axis.
     let err = write(
         &sparse(BlockPos::new(65536, 65536, 1)),
         &WriteOptions::new(4189, "huge"),
@@ -347,10 +357,7 @@ fn write_errors_when_volume_exceeds_i32() {
     )
     .unwrap_err();
     assert!(matches!(err, Error::DimensionOverflow { .. }));
-}
 
-#[test]
-fn write_errors_when_axis_is_negative() {
     let err = write(
         &sparse(BlockPos::new(-1, 1, 1)),
         &WriteOptions::new(4189, "negative"),

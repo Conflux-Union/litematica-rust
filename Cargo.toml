@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 # slice::as_chunks, used by the block iterator, was stabilized in 1.88.
 rust-version = "1.88"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/Conflux-Union/litematica-rust"
 readme = "README.md"
 description = "Streaming, low-memory reader and writer for Minecraft .litematic schematic files"

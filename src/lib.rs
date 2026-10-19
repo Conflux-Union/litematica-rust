@@ -11,7 +11,20 @@
 //!   never builds a tree ([`Document::parse`]);
 //! - block state palettes are the only block data that is materialized;
 //!   the packed `BlockStates` payload is borrowed from the input buffer and
-//!   decoded voxel by voxel by [`Region::iter_blocks`].
+//!   decoded on demand, either voxel by voxel by [`Region::iter_blocks`] or
+//!   one entry at a time by [`Region::block_at`].
+//!
+//! Two read modes share that decoder:
+//!
+//! - [`Document`] decompresses the whole file once and gives random access to
+//!   every region, including [`Region::block_at`] in O(1). Memory is the
+//!   decompressed payload plus the palettes.
+//! - [`StreamReader`] keeps memory bounded by the gzip buffer, the current
+//!   palette, and one region's packed payload, independent of the schematic's
+//!   volume. NBT field order does not matter: a region's payload is held only
+//!   until its other fields have been read, then decoded voxel by voxel and
+//!   released. `Metadata` may appear before or after `Regions`, so
+//!   [`StreamReader::metadata`] returns `None` until it has been scanned.
 //!
 //! Unknown fields (`Entities`, `TileEntities`, pending ticks, preview image
 //! data, ...) are skipped in O(length) without allocation, so parsing cost is
@@ -55,17 +68,24 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod bitstream;
 mod error;
 mod nbt;
 mod parse;
 mod region;
-pub mod write;
+mod schema;
+mod stream;
+use crate::mc::{BlockPos, BlockSize};
 use flate2::read::GzDecoder;
 use std::io::Read;
 
+pub mod mc;
+pub mod write;
+pub use bitstream::BlockIter;
 pub use error::{Error, Result};
 pub use flate2::Compression;
-pub use region::{BlockIter, BlockState, Region};
+pub use region::{BlockState, Region};
+pub use stream::{StreamReader, StreamRegion};
 
 /// Decompresses a single gzip member with a hard cap on the output size.
 ///
@@ -77,19 +97,13 @@ pub use region::{BlockIter, BlockState, Region};
 ///
 /// Trailing bytes after the first gzip member are ignored.
 pub fn decompress_gzip_with_limit(input: &[u8], limit: u64) -> Result<Vec<u8>> {
-    const CHUNK: usize = 64 * 1024;
+    // `Take` stops inflating as soon as one byte past the cap arrives, so the
+    // bound is enforced during decompression rather than after it.
+    let mut decoder = GzDecoder::new(input).take(limit.saturating_add(1));
     let mut out = Vec::new();
-    let mut decoder = GzDecoder::new(input);
-    let mut chunk = vec![0u8; CHUNK];
-    loop {
-        let n = decoder.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        if out.len() as u64 + n as u64 > limit {
-            return Err(Error::SizeLimitExceeded { limit });
-        }
-        out.extend_from_slice(&chunk[..n]);
+    decoder.read_to_end(&mut out)?;
+    if out.len() as u64 > limit {
+        return Err(Error::SizeLimitExceeded { limit });
     }
     Ok(out)
 }
@@ -125,7 +139,7 @@ pub struct Metadata {
     /// (`Metadata.TimeModified`).
     pub time_modified: i64,
     /// Enclosing size claimed by the file (`Metadata.EnclosingSize`).
-    pub enclosing_size: Option<[i32; 3]>,
+    pub enclosing_size: Option<BlockPos>,
 }
 
 /// A parsed litematic document.
@@ -155,6 +169,10 @@ impl Document<'_> {
 
     /// Size of the axis-aligned box enclosing all regions, per axis.
     ///
+    /// The result is a span, so it is non-negative per axis even when regions
+    /// extend in negative directions. This is distinct from
+    /// [`Metadata::enclosing_size`], which mirrors the value a file declares.
+    ///
     /// This replicates the Litematica mod / rustmatica formula: for each
     /// region and axis, `mn = min(pos, pos + size + 1)` and
     /// `mx = max(pos, pos + size - 1)`; the document bounds start at the
@@ -162,23 +180,29 @@ impl Document<'_> {
     /// `|mx - mn + 1|`.
     ///
     /// Returns `None` if the document has no regions.
-    pub fn enclosing_size(&self) -> Option<[i32; 3]> {
+    pub fn enclosing_size(&self) -> Option<BlockSize> {
         if self.regions.is_empty() {
             return None;
         }
         let mut lo = [0i64; 3];
         let mut hi = [0i64; 3];
         for region in &self.regions {
+            let p = [
+                i64::from(region.position.x),
+                i64::from(region.position.y),
+                i64::from(region.position.z),
+            ];
+            let s = [
+                i64::from(region.size.x),
+                i64::from(region.size.y),
+                i64::from(region.size.z),
+            ];
             for axis in 0..3 {
-                let p = i64::from(region.position[axis]);
-                let s = i64::from(region.size[axis]);
-                lo[axis] = lo[axis].min(p.min(p + s + 1));
-                hi[axis] = hi[axis].max(p.max(p + s - 1));
+                lo[axis] = lo[axis].min(p[axis].min(p[axis] + s[axis] + 1));
+                hi[axis] = hi[axis].max(p[axis].max(p[axis] + s[axis] - 1));
             }
         }
-        let extent = |axis: usize| {
-            (hi[axis] - lo[axis] + 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-        };
-        Some([extent(0), extent(1), extent(2)])
+        let extent = |axis: usize| (hi[axis] - lo[axis] + 1).clamp(0, i64::from(u32::MAX)) as u32;
+        Some(BlockSize::new(extent(0), extent(1), extent(2)))
     }
 }

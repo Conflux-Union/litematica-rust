@@ -15,8 +15,7 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use litematica::write::mcdata::util::BlockPos;
-use litematica::write::mcdata::BlockState;
+use litematica::mc::{BlockPos, BlockState};
 use litematica::write::{write, Layout, WriteOptions};
 
 /// Peak resident set size in bytes (Linux only, from VmHWM).
