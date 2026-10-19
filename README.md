@@ -23,10 +23,7 @@ Three types carry the Minecraft vocabulary. `BlockState` is a namespaced id plus
 ```rust
 use litematica::knowledge::mc::{BlockPos, BlockSize, BlockState};
 
-let stone = BlockState {
-    name: "minecraft:stone".into(),
-    properties: Default::default(),
-};
+let stone: BlockState = "minecraft:stone".into();
 
 let pos = BlockPos::new(3, 2, 5);
 let size = BlockSize::of(BlockPos::new(16, -4, 8)); // negative axes fold into spans
@@ -46,23 +43,20 @@ Use `StreamReader` when the file is much larger than available memory. It inflat
 ```rust
 use litematica::task::stream::StreamReader;
 
-fn main() -> litematica::error::Result<()> {
-    let file = std::fs::File::open("bridge.litematic")?;
-    let mut reader = StreamReader::open(file, 512 * 1024 * 1024)?;
+let file = std::fs::File::open("bridge.litematic")?;
+let mut reader = StreamReader::open(file, 512 * 1024 * 1024)?;
 
-    for region in &mut reader {
-        let region = region?;
-        let air = region
-            .iter_states()
-            .filter(|state| state.name == "minecraft:air")
-            .count();
-        println!("{}: {} air of {} voxels", region.name, air, region.volume());
-    }
+for region in &mut reader {
+    let region = region?;
+    let air = region
+        .iter_states()
+        .filter(|state| state.name == "minecraft:air")
+        .count();
+    println!("{}: {} air of {} voxels", region.name, air, region.volume());
+}
 
-    if let Some(metadata) = reader.metadata() {
-        println!("{}", metadata.name);
-    }
-    Ok(())
+if let Some(metadata) = reader.metadata() {
+    println!("{}", metadata.name);
 }
 ```
 
@@ -75,20 +69,17 @@ use litematica::knowledge::mc::BlockPos;
 use litematica::model::document::Document;
 use litematica::task::decompress::decompress_gzip_with_limit;
 
-fn main() -> litematica::error::Result<()> {
-    let raw = std::fs::read("map.litematic")?;
-    let nbt = decompress_gzip_with_limit(&raw, 512 * 1024 * 1024)?;
-    let doc = Document::parse(&nbt)?;
+let raw = std::fs::read("map.litematic")?;
+let nbt = decompress_gzip_with_limit(&raw, 512 * 1024 * 1024)?;
+let doc = Document::parse(&nbt)?;
 
-    for region in &doc.regions {
-        let pos = BlockPos::new(3, 4, 5);
-        let state = region.state_at(pos);
-        println!("{} {:?}", region.name, state);
-    }
-
-    println!("enclosing size: {:?}", doc.enclosing_size());
-    Ok(())
+for region in &doc.regions {
+    let pos = BlockPos::new(3, 4, 5);
+    let state = region.state_at(pos);
+    println!("{} {:?}", region.name, state);
 }
+
+println!("enclosing size: {:?}", doc.enclosing_size());
 ```
 
 ## Composite streaming writes
@@ -123,10 +114,7 @@ impl Layout for Floor {
 
 fn main() -> litematica::error::Result<()> {
     let layout = Floor {
-        state: BlockState {
-            name: "minecraft:stone".into(),
-            properties: Default::default(),
-        },
+        state: "minecraft:stone".into(),
     };
 
     let options = WriteOptions::new(4189, "floor"); // 4189 = 1.21.4

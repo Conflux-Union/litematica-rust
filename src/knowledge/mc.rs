@@ -49,6 +49,31 @@ impl BlockState {
     };
 }
 
+impl From<&'static str> for BlockState {
+    /// A state with the given id and no properties.
+    ///
+    /// Only static names convert this way, so a literal is borrowed instead of
+    /// copied into the state.
+    fn from(name: &'static str) -> Self {
+        Self {
+            name: Cow::Borrowed(name),
+            properties: BTreeMap::new(),
+        }
+    }
+}
+
+impl From<String> for BlockState {
+    /// A state with the given owned id and no properties.
+    ///
+    /// The name moves into the state, so a dynamically built id costs no copy.
+    fn from(name: String) -> Self {
+        Self {
+            name: Cow::Owned(name),
+            properties: BTreeMap::new(),
+        }
+    }
+}
+
 // BlockPos
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
