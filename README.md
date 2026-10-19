@@ -41,22 +41,26 @@ assert_eq!(size.position_at(0), Some(BlockPos::ORIGIN));
 Use `Reader` when the file is much larger than available memory. It inflates the gzip stream through a fixed-size buffer and yields one region at a time, keeping a region's packed payload only until that region is consumed. Peak memory is independent of file size: the buffer, the palette, and one region. NBT field order does not matter; a `Metadata` compound that trails the regions becomes available once the stream is exhausted.
 
 ```rust
+use litematica::knowledge::mc::BlockState;
 use litematica::task::stream::Reader;
 
-let file = std::fs::File::open("bridge.litematic")?;
-let mut reader = Reader::open(file, 512 * 1024 * 1024)?;
+fn count_air(path: &str) -> litematica::error::Result<()> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = Reader::open(file, 512 * 1024 * 1024)?;
 
-for region in &mut reader {
-    let region = region?;
-    let air = region
-        .iter_states()
-        .filter(|state| state.name == "minecraft:air")
-        .count();
-    println!("{}: {} air of {} voxels", region.name, air, region.volume());
-}
+    for region in &mut reader {
+        let region = region?;
+        let air = region
+            .iter_states()
+            .filter(|&state| state == &BlockState::AIR)
+            .count();
+        println!("{}: {} air of {} voxels", region.name, air, region.volume());
+    }
 
-if let Some(metadata) = reader.metadata() {
-    println!("{}", metadata.name);
+    if let Some(metadata) = reader.metadata() {
+        println!("{}", metadata.name);
+    }
+    Ok(())
 }
 ```
 
@@ -69,17 +73,20 @@ use litematica::knowledge::mc::BlockPos;
 use litematica::model::document::Document;
 use litematica::task::decompress::gzip_with_limit;
 
-let raw = std::fs::read("map.litematic")?;
-let nbt = gzip_with_limit(&raw, 512 * 1024 * 1024)?;
-let doc = Document::parse(&nbt)?;
+fn inspect(path: &str) -> litematica::error::Result<()> {
+    let raw = std::fs::read(path)?;
+    let nbt = gzip_with_limit(&raw, 512 * 1024 * 1024)?;
+    let doc = Document::parse(&nbt)?;
 
-for region in &doc.regions {
-    let pos = BlockPos::new(3, 4, 5);
-    let state = region.state_at(pos);
-    println!("{} {:?}", region.name, state);
+    for region in &doc.regions {
+        let pos = BlockPos::new(3, 4, 5);
+        let state = region.state_at(pos);
+        println!("{} {:?}", region.name, state);
+    }
+
+    println!("enclosing size: {:?}", doc.bounding_size());
+    Ok(())
 }
-
-println!("enclosing size: {:?}", doc.bounding_size());
 ```
 
 ## Composite streaming writes
@@ -112,13 +119,13 @@ impl Layout for Floor {
     }
 }
 
-fn main() -> litematica::error::Result<()> {
+fn write_floor(path: &str) -> litematica::error::Result<()> {
     let layout = Floor {
         state: "minecraft:stone".into(),
     };
 
     let options = WriteOptions::new("floor", 4189); // 4189 = 1.21.4
-    write(&layout, &options, std::fs::File::create("floor.litematic")?)?;
+    write(&layout, &options, std::fs::File::create(path)?)?;
     Ok(())
 }
 ```

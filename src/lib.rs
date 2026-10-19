@@ -95,3 +95,9 @@ pub mod error;
 pub mod knowledge;
 pub mod model;
 pub mod task;
+
+/// Compiles every example in `README.md` as a doctest, so the documented API
+/// cannot drift from the real one.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeExamples;
