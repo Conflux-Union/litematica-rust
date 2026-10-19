@@ -45,21 +45,18 @@ Use `StreamReader` when the file is much larger than available memory. It inflat
 
 ```rust
 use litematica::task::stream::StreamReader;
-use std::fs::File;
 
 fn main() -> litematica::error::Result<()> {
-    let file = File::open("bridge.litematic")?;
+    let file = std::fs::File::open("bridge.litematic")?;
     let mut reader = StreamReader::open(file, 512 * 1024 * 1024)?;
 
-    while let Some(region) = reader.next_region()? {
-        let mut counts = vec![0u64; region.palette().len()];
-        for index in region.iter_blocks() {
-            // A corrupt file may yield an out-of-range index; get_mut ignores it.
-            if let Some(count) = counts.get_mut(index as usize) {
-                *count += 1;
-            }
-        }
-        println!("{}: {} voxels", region.name, region.volume());
+    for region in &mut reader {
+        let region = region?;
+        let air = region
+            .iter_states()
+            .filter(|state| state.name == "minecraft:air")
+            .count();
+        println!("{}: {} air of {} voxels", region.name, air, region.volume());
     }
 
     if let Some(metadata) = reader.metadata() {

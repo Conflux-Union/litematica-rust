@@ -342,11 +342,8 @@ fn stream_matches_document_region_by_region() {
     let mut reader = open(&gzip(&raw));
     assert_eq!(reader.metadata(), Some(&doc.metadata));
 
-    for (spec, doc_region) in specs.iter().zip(&doc.regions) {
-        let region = reader
-            .next_region()
-            .expect("region header")
-            .expect("region present");
+    for ((spec, doc_region), streamed) in specs.iter().zip(&doc.regions).zip(&mut reader) {
+        let region = streamed.expect("region present");
 
         assert_eq!(region.name, spec.name);
         assert_eq!(region.position, spec.position);
@@ -359,13 +356,24 @@ fn stream_matches_document_region_by_region() {
             palette_view(doc_region.palette())
         );
 
-        let streamed: Vec<u32> = region.iter_blocks().collect();
-        assert_eq!(streamed, spec.indices, "voxel stream of {}", spec.name);
+        let ids: Vec<u32> = region.iter_blocks().collect();
+        assert_eq!(ids, spec.indices, "voxel stream of {}", spec.name);
         let random: Vec<u32> = doc_region.iter_blocks().collect();
-        assert_eq!(streamed, random, "stream vs Document for {}", spec.name);
+        assert_eq!(ids, random, "stream vs Document for {}", spec.name);
+
+        let states: Vec<&str> = region
+            .iter_states()
+            .map(|state| state.name.as_ref())
+            .collect();
+        let expected: Vec<&str> = spec
+            .indices
+            .iter()
+            .map(|&id| spec.palette[id as usize].0)
+            .collect();
+        assert_eq!(states, expected, "resolved states of {}", spec.name);
     }
 
-    assert!(reader.next_region().expect("end of regions").is_none());
+    assert!(reader.next().is_none());
 }
 
 #[test]

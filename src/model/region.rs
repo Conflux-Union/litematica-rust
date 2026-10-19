@@ -322,4 +322,16 @@ impl<'a> Region<'a> {
     pub fn iter_blocks(&self) -> BlockIter<'a> {
         self.blocks.clone().iter(self.volume)
     }
+
+    /// Iterates over every voxel of the region in storage order, yielding
+    /// resolved block states.
+    ///
+    /// Identifiers that do not name a palette entry — possible only for a
+    /// malformed file — are skipped, so this iterator is total without
+    /// requiring the caller to bounds-check. Use [`Region::iter_blocks`] when
+    /// the raw identifiers themselves matter.
+    pub fn iter_states(&self) -> impl Iterator<Item = &BlockState> + '_ {
+        self.iter_blocks()
+            .filter_map(|id| self.palette().get(id as usize))
+    }
 }

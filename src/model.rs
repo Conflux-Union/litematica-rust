@@ -7,6 +7,11 @@
 //! never own a byte stream or a decompressor. Tasks consume them and add those
 //! behaviors.
 
+pub mod bitstream;
+pub mod palette;
+pub mod region;
+pub(crate) mod schema;
+
 pub mod document {
     //! The parsed model of a litematic file: its metadata and its regions.
     //!
@@ -122,9 +127,3 @@ pub mod document {
         }
     }
 }
-
-pub mod bitstream;
-pub mod palette;
-pub mod region;
-
-pub(crate) mod schema;

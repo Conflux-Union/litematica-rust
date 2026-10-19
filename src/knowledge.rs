@@ -6,5 +6,4 @@
 //! knows about regions, files, palettes, or tasks.
 
 pub mod mc;
-
 pub(crate) mod nbt;

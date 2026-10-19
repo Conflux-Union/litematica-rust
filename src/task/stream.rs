@@ -186,6 +186,26 @@ impl<R: Read> StreamReader<R> {
     }
 }
 
+impl<R: Read> Iterator for StreamReader<R> {
+    type Item = Result<Region<'static>>;
+
+    /// Yields regions until the end of `Regions`.
+    ///
+    /// An error ends the iteration: the stream cannot be resumed after a parse
+    /// failure, so every later call returns `None`. Once exhausted, a trailing
+    /// `Metadata` has been scanned and is available through
+    /// [`StreamReader::metadata`].
+    fn next(&mut self) -> Option<Self::Item> {
+        let region = self.next_region();
+        if region.is_err() {
+            self.done = true;
+        }
+        region.transpose()
+    }
+}
+
+impl<R: Read> std::iter::FusedIterator for StreamReader<R> {}
+
 /// Reads a `BlockStates` long array into owned bytes.
 ///
 /// The buffer grows in chunks and is never pre-allocated at the claimed

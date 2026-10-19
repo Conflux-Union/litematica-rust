@@ -534,6 +534,8 @@ fn out_of_range_indices_yield_without_panic() {
     let doc = Document::parse(&bytes).expect("parse must succeed");
     let stream: Vec<u32> = doc.regions[0].iter_blocks().collect();
     assert_eq!(stream, vec![3, 3]);
+    // The resolved-state iterator drops identifiers with no palette entry.
+    assert_eq!(doc.regions[0].iter_states().count(), 0);
     // Bounds-checking is the caller's job.
     assert!(doc.regions[0].palette().get(3).is_none());
     // The checked accessor treats the dangling index as absent.

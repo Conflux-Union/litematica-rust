@@ -8,6 +8,7 @@
 
 pub mod stream;
 pub mod write;
+
 pub mod decompress {
     //! Bounded decompression, the entry point shared by both readers.
 
