@@ -194,4 +194,4 @@ single-region, declarative `Layout` input, no entities or tile entities yet.
 
 ## License
 
-Apache-2.0.
+MIT OR Apache-2.0.
