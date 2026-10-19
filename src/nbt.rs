@@ -1,10 +1,15 @@
-//! Minimal big-endian Java NBT serialization primitives.
+//! Big-endian NBT primitives shared by the litematic reader and writer.
 //!
-//! The reader never builds a tree: values are decoded in place and unknown
-//! subtrees are skipped in O(length) without allocation, so a decompressed
-//! litematic buffer is scanned exactly once. The writer is its mirror image:
-//! a forward-only encoder that streams values to any `std::io::Write`
-//! without buffering a tree.
+//! The crate never builds an NBT tree. Reading is a forward-only cursor that
+//! decodes known values in place and skips unknown subtrees in O(length), so
+//! a decompressed litematic buffer is scanned exactly once. Writing is the
+//! mirror image: a forward-only encoder that pushes values straight to any
+//! `std::io::Write`, which lets a `TAG_Long_Array` stream word by word instead
+//! of being materialized.
+//!
+//! Both directions name tags through [`Tag`], a closed enum, rather than raw
+//! bytes. An id read from a file is validated once, at [`Tag::from_id`], and
+//! from then on every comparison and dispatch is spelled by name.
 
 use std::io::Write as IoWrite;
 
@@ -13,33 +18,155 @@ use crate::error::{Error, Result};
 /// Maximum NBT nesting depth accepted by [`Reader::skip_value`].
 pub(crate) const MAX_DEPTH: usize = 64;
 
-pub(crate) const TAG_END: u8 = 0;
-pub(crate) const TAG_INT: u8 = 3;
-pub(crate) const TAG_LONG: u8 = 4;
-pub(crate) const TAG_BYTE_ARRAY: u8 = 7;
-pub(crate) const TAG_STRING: u8 = 8;
-pub(crate) const TAG_LIST: u8 = 9;
-pub(crate) const TAG_COMPOUND: u8 = 10;
-pub(crate) const TAG_INT_ARRAY: u8 = 11;
-pub(crate) const TAG_LONG_ARRAY: u8 = 12;
+// Tag
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
-/// Payload size in bytes for fixed-size scalar tags, indexed by tag id.
-/// Entries are `None` for tags with variable or prefixed sizes.
-const SCALAR_SIZE: [Option<u64>; 13] = [
-    None,    // 0 end (never a standalone value)
-    Some(1), // 1 byte
-    Some(2), // 2 short
-    Some(4), // 3 int
-    Some(8), // 4 long
-    Some(4), // 5 float
-    Some(8), // 6 double
-    None,    // 7 byte array
-    None,    // 8 string
-    None,    // 9 list
-    None,    // 10 compound
-    None,    // 11 int array
-    None,    // 12 long array
-];
+/// The thirteen NBT tag ids, as a closed set.
+///
+/// Keeping the tag space in an enum means every consumer states intent in
+/// names (`Tag::Compound`) and a tag id read from a file is validated exactly
+/// once, at [`Tag::from_id`]. The representation stays `u8` on the wire, so
+/// the enum converts cheaply in both directions.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tag {
+    /// Closes a compound, or marks an empty list element type.
+    End = 0,
+    /// A signed 8-bit integer.
+    Byte = 1,
+    /// A signed 16-bit integer.
+    Short = 2,
+    /// A signed 32-bit integer.
+    Int = 3,
+    /// A signed 64-bit integer.
+    Long = 4,
+    /// An IEEE 754 single-precision float.
+    Float = 5,
+    /// An IEEE 754 double-precision float.
+    Double = 6,
+    /// A length-prefixed array of bytes.
+    ByteArray = 7,
+    /// A length-prefixed UTF-8 string.
+    String = 8,
+    /// A homogeneous sequence of values.
+    List = 9,
+    /// A sequence of named tags.
+    Compound = 10,
+    /// A length-prefixed array of 32-bit integers.
+    IntArray = 11,
+    /// A length-prefixed array of 64-bit integers.
+    LongArray = 12,
+}
+
+impl Tag {
+    /// The tag id written to or read from the wire.
+    pub(crate) const fn id(self) -> u8 {
+        self as u8
+    }
+
+    /// Resolves a wire id, or `None` when it is outside the tag space.
+    pub(crate) const fn from_id(id: u8) -> Option<Self> {
+        match id {
+            0 => Some(Self::End),
+            1 => Some(Self::Byte),
+            2 => Some(Self::Short),
+            3 => Some(Self::Int),
+            4 => Some(Self::Long),
+            5 => Some(Self::Float),
+            6 => Some(Self::Double),
+            7 => Some(Self::ByteArray),
+            8 => Some(Self::String),
+            9 => Some(Self::List),
+            10 => Some(Self::Compound),
+            11 => Some(Self::IntArray),
+            12 => Some(Self::LongArray),
+            _ => None,
+        }
+    }
+
+    /// Payload size of a fixed-width scalar, or `None` for tags whose payload
+    /// is length-prefixed or structural.
+    ///
+    /// Skipping uses this to jump over scalars in one step instead of
+    /// matching each tag individually.
+    const fn scalar_size(self) -> Option<u64> {
+        match self {
+            Self::Byte => Some(1),
+            Self::Short => Some(2),
+            Self::Int | Self::Float => Some(4),
+            Self::Long | Self::Double => Some(8),
+            Self::End
+            | Self::ByteArray
+            | Self::String
+            | Self::List
+            | Self::Compound
+            | Self::IntArray
+            | Self::LongArray => None,
+        }
+    }
+}
+
+// Encode
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
+/// A value that knows its own NBT shape.
+///
+/// This is the crate's polymorphic seam: a scalar writes a payload, a
+/// compound opens its fields and closes itself, a list declares its element
+/// type. A schema node therefore states *what it is* rather than making a
+/// caller restate its tag and field order, and [`Encode::encode`] contributes
+/// the shared tag-name header as a template method.
+pub(crate) trait Encode {
+    /// The tag this value is written as.
+    const TAG: Tag;
+
+    /// Writes this tag's payload, without a tag id or a name.
+    fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()>;
+
+    /// Writes this value as the named tag `name`.
+    fn encode<W: IoWrite>(&self, name: &str, out: &mut Writer<W>) -> Result<()> {
+        out.tag(Self::TAG, name)?;
+        self.body(out)
+    }
+}
+
+impl Encode for i32 {
+    const TAG: Tag = Tag::Int;
+
+    fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
+        out.int(*self)
+    }
+}
+
+impl Encode for i64 {
+    const TAG: Tag = Tag::Long;
+
+    fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
+        out.long(*self)
+    }
+}
+
+impl Encode for str {
+    const TAG: Tag = Tag::String;
+
+    fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
+        out.string(self)
+    }
+}
+
+impl Encode for String {
+    const TAG: Tag = Tag::String;
+
+    fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
+        out.string(self)
+    }
+}
+
+// Reader
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
 /// A forward-only cursor over an uncompressed NBT buffer.
 pub(crate) struct Reader<'a> {
@@ -114,14 +241,12 @@ impl<'a> Reader<'a> {
         Ok(n as usize)
     }
 
-    /// Reads a tag id byte and validates that it is in 0..=12.
-    pub(crate) fn tag_id(&mut self) -> Result<u8> {
+    /// Reads a tag id and resolves it to a [`Tag`], rejecting ids outside the
+    /// tag space.
+    pub(crate) fn tag(&mut self) -> Result<Tag> {
         let offset = self.pos;
         let id = self.u8()?;
-        if id > TAG_LONG_ARRAY {
-            return Err(Error::InvalidTagId { id, offset });
-        }
-        Ok(id)
+        Tag::from_id(id).ok_or(Error::InvalidTagId { id, offset })
     }
 
     /// Computes the depth of a nested container, enforcing [`MAX_DEPTH`].
@@ -136,27 +261,27 @@ impl<'a> Reader<'a> {
     /// Skips the payload of `tag`, which is a value nested inside a container
     /// at `enclosing_depth`. Sized arrays jump directly by length * element
     /// size; compounds and lists walk their headers only.
-    pub(crate) fn skip_value(&mut self, tag: u8, enclosing_depth: usize) -> Result<()> {
-        if let Some(n) = SCALAR_SIZE[tag as usize] {
+    pub(crate) fn skip_value(&mut self, tag: Tag, enclosing_depth: usize) -> Result<()> {
+        if let Some(n) = tag.scalar_size() {
             return self.take(n).map(|_| ());
         }
         match tag {
-            TAG_BYTE_ARRAY => {
+            Tag::ByteArray => {
                 let n = self.count()?;
                 self.take(n as u64)?;
             }
-            TAG_STRING => {
+            Tag::String => {
                 self.string()?;
             }
-            TAG_LIST => {
-                let elem = self.tag_id()?;
+            Tag::List => {
+                let elem = self.tag()?;
                 let count = self.count()?;
                 if count > 0 {
                     let depth = self.descend(enclosing_depth)?;
-                    if elem == TAG_END {
+                    if elem == Tag::End {
                         return Err(Error::UnexpectedTag {
                             field: "list element",
-                            tag: elem,
+                            tag: elem.id(),
                             offset: self.pos,
                         });
                     }
@@ -165,30 +290,30 @@ impl<'a> Reader<'a> {
                     }
                 }
             }
-            TAG_COMPOUND => {
+            Tag::Compound => {
                 let depth = self.descend(enclosing_depth)?;
                 loop {
-                    let t = self.tag_id()?;
-                    if t == TAG_END {
+                    let t = self.tag()?;
+                    if t == Tag::End {
                         break;
                     }
                     self.string()?;
                     self.skip_value(t, depth)?;
                 }
             }
-            TAG_INT_ARRAY => {
+            Tag::IntArray => {
                 let n = self.count()?;
                 self.take(n as u64 * 4)?;
             }
-            TAG_LONG_ARRAY => {
+            Tag::LongArray => {
                 let n = self.count()?;
                 self.take(n as u64 * 8)?;
             }
-            // Unreachable for validated ids: every id is covered above.
-            _ => {
+            // Scalars were handled above; this arm keeps the match exhaustive.
+            Tag::End | Tag::Byte | Tag::Short | Tag::Int | Tag::Long | Tag::Float | Tag::Double => {
                 return Err(Error::UnexpectedTag {
                     field: "value",
-                    tag,
+                    tag: tag.id(),
                     offset: self.pos,
                 });
             }
@@ -197,7 +322,17 @@ impl<'a> Reader<'a> {
     }
 }
 
+// Writer
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
 /// A forward-only NBT encoder writing big-endian values to a sink.
+///
+/// Methods come in two layers. The structural layer (`root`, `tag`,
+/// `compound`, `list`, `end`, `long_array`) opens and closes the document
+/// shape; the scalar layer (`int`, `long`, `string`) writes one named
+/// field. Callers therefore express the schema top-down instead of emitting
+/// raw tag bytes themselves.
 pub(crate) struct Writer<W: IoWrite> {
     out: W,
 }
@@ -217,45 +352,94 @@ impl<W: IoWrite> Writer<W> {
 
     /// Writes one tag id byte.
     #[inline]
-    pub(crate) fn u8(&mut self, v: u8) -> Result<()> {
-        self.put(&[v])
+    fn tag_id(&mut self, tag: Tag) -> Result<()> {
+        self.put(&[tag.id()])
     }
 
-    /// Writes one big-endian `i32`.
-    #[inline]
-    pub(crate) fn i32(&mut self, v: i32) -> Result<()> {
-        self.put(&v.to_be_bytes())
-    }
-
-    /// Writes one big-endian `i64`.
-    #[inline]
-    pub(crate) fn i64(&mut self, v: i64) -> Result<()> {
-        self.put(&v.to_be_bytes())
-    }
-
-    /// Writes an NBT string: `u16` byte-length prefix plus UTF-8 payload.
-    pub(crate) fn string(&mut self, s: &str) -> Result<()> {
-        let bytes = s.as_bytes();
-        let len =
-            u16::try_from(bytes.len()).map_err(|_| Error::StringTooLong { len: bytes.len() })?;
-        self.put(&len.to_be_bytes())?;
-        self.put(bytes)
-    }
-
-    /// Writes a named-tag header: tag id byte followed by the field name.
-    pub(crate) fn named(&mut self, tag: u8, name: &str) -> Result<()> {
-        self.u8(tag)?;
-        self.string(name)
+    /// Writes a tag id and a length-prefixed name.
+    pub(crate) fn tag(&mut self, tag: Tag, name: &str) -> Result<()> {
+        self.tag_id(tag)?;
+        self.put_string(name)
     }
 
     /// Writes the root compound header: `TAG_Compound` with an empty name.
     pub(crate) fn root(&mut self) -> Result<()> {
-        self.named(TAG_COMPOUND, "")
+        self.tag(Tag::Compound, "")
+    }
+
+    /// Opens a named compound.
+    pub(crate) fn compound(&mut self, name: &str) -> Result<()> {
+        self.tag(Tag::Compound, name)
     }
 
     /// Writes a `TAG_End` marker closing the innermost compound.
     pub(crate) fn end(&mut self) -> Result<()> {
-        self.u8(TAG_END)
+        self.tag_id(Tag::End)
+    }
+
+    /// Writes a list payload header: its element tag and element count.
+    pub(crate) fn list(&mut self, element: Tag, len: i32) -> Result<()> {
+        self.tag_id(element)?;
+        self.put_i32(len)
+    }
+
+    /// Writes an empty named list.
+    pub(crate) fn empty_list(&mut self, name: &str) -> Result<()> {
+        self.tag(Tag::List, name)?;
+        self.list(Tag::End, 0)
+    }
+
+    /// Writes an `i32` payload.
+    pub(crate) fn int(&mut self, value: i32) -> Result<()> {
+        self.put_i32(value)
+    }
+
+    /// Writes an `i64` payload.
+    pub(crate) fn long(&mut self, value: i64) -> Result<()> {
+        self.put_i64(value)
+    }
+
+    /// Writes a length-prefixed UTF-8 payload.
+    pub(crate) fn string(&mut self, value: &str) -> Result<()> {
+        self.put_string(value)
+    }
+
+    /// Writes a `TAG_Long_Array` payload whose words are pulled on demand.
+    ///
+    /// The length goes out first, then one word at a time, so an array far
+    /// larger than memory can still be serialized. A failing word stops the
+    /// stream and is returned as the call's error, leaving the sink partially
+    /// written exactly as any other mid-document failure would.
+    pub(crate) fn long_array<I>(&mut self, len: i32, words: I) -> Result<()>
+    where
+        I: IntoIterator<Item = Result<i64>>,
+    {
+        self.put_i32(len)?;
+        for word in words {
+            self.put_i64(word?)?;
+        }
+        Ok(())
+    }
+
+    /// Writes an `i32` payload.
+    #[inline]
+    fn put_i32(&mut self, value: i32) -> Result<()> {
+        self.put(&value.to_be_bytes())
+    }
+
+    /// Writes an `i64` payload.
+    #[inline]
+    fn put_i64(&mut self, value: i64) -> Result<()> {
+        self.put(&value.to_be_bytes())
+    }
+
+    /// Writes a length-prefixed UTF-8 payload.
+    fn put_string(&mut self, value: &str) -> Result<()> {
+        let bytes = value.as_bytes();
+        let len =
+            u16::try_from(bytes.len()).map_err(|_| Error::StringTooLong { len: bytes.len() })?;
+        self.put(&len.to_be_bytes())?;
+        self.put(bytes)
     }
 
     /// Flushes and returns the underlying sink.
@@ -265,40 +449,50 @@ impl<W: IoWrite> Writer<W> {
     }
 }
 
+// Tests
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
 #[cfg(test)]
 mod tests {
-    use super::{
-        Reader, Writer, SCALAR_SIZE, TAG_COMPOUND, TAG_END, TAG_INT, TAG_LONG, TAG_LONG_ARRAY,
-        TAG_STRING,
-    };
+    use super::{Encode, Reader, Tag, Writer, MAX_DEPTH};
     use crate::Error;
+
+    #[test]
+    fn tag_ids_round_trip_and_reject_unknown_values() {
+        for id in 0..=12 {
+            let tag = Tag::from_id(id).unwrap();
+            assert_eq!(tag.id(), id);
+        }
+        assert_eq!(Tag::from_id(13), None);
+        assert_eq!(Tag::from_id(u8::MAX), None);
+    }
 
     #[test]
     fn writer_scalars_round_trip_through_reader() {
         let mut w = Writer::new(Vec::new());
         w.root().unwrap();
-        w.named(TAG_INT, "a").unwrap();
-        w.i32(-5).unwrap();
-        w.named(TAG_STRING, "\u{540d}\u{5b57}").unwrap();
-        w.string("h\u{e9}llo \u{2713}").unwrap();
-        w.named(TAG_LONG, "c").unwrap();
-        w.i64(i64::MIN).unwrap();
+        (-5).encode("a", &mut w).unwrap();
+        "h\u{e9}llo \u{2713}"
+            .encode("\u{540d}\u{5b57}", &mut w)
+            .unwrap();
+        i64::MIN.encode("c", &mut w).unwrap();
         w.end().unwrap();
         let buf = w.into_inner().unwrap();
 
         let mut r = Reader::new(&buf);
-        assert_eq!(r.tag_id().unwrap(), TAG_COMPOUND);
+        assert_eq!(r.tag().unwrap(), Tag::Compound);
         assert_eq!(r.string().unwrap(), "");
-        assert_eq!(r.tag_id().unwrap(), TAG_INT);
+        assert_eq!(r.tag().unwrap(), Tag::Int);
         assert_eq!(r.string().unwrap(), "a");
         assert_eq!(r.i32().unwrap(), -5);
-        assert_eq!(r.tag_id().unwrap(), TAG_STRING);
+        assert_eq!(r.tag().unwrap(), Tag::String);
         assert_eq!(r.string().unwrap(), "\u{540d}\u{5b57}");
         assert_eq!(r.string().unwrap(), "h\u{e9}llo \u{2713}");
-        assert_eq!(r.tag_id().unwrap(), TAG_LONG);
+        assert_eq!(r.tag().unwrap(), Tag::Long);
         assert_eq!(r.string().unwrap(), "c");
         assert_eq!(r.i64().unwrap(), i64::MIN);
-        assert_eq!(r.tag_id().unwrap(), TAG_END);
+        assert_eq!(r.tag().unwrap(), Tag::End);
         assert_eq!(r.pos(), buf.len());
     }
 
@@ -306,22 +500,31 @@ mod tests {
     fn writer_long_array_round_trips_and_skips() {
         let mut w = Writer::new(Vec::new());
         w.root().unwrap();
-        w.named(TAG_LONG_ARRAY, "data").unwrap();
-        w.i32(3).unwrap();
-        w.i64(0x0102_0304_0506_0708).unwrap();
-        w.i64(-1).unwrap();
-        w.i64(0).unwrap();
+        let words = [Ok(0x0102_0304_0506_0708), Ok(-1), Ok(0)];
+        w.tag(Tag::LongArray, "data").unwrap();
+        w.long_array(words.len() as i32, words).unwrap();
         w.end().unwrap();
         let buf = w.into_inner().unwrap();
 
         let mut r = Reader::new(&buf);
-        assert_eq!(r.tag_id().unwrap(), TAG_COMPOUND);
+        assert_eq!(r.tag().unwrap(), Tag::Compound);
         r.string().unwrap();
-        let tag = r.tag_id().unwrap();
+        let tag = r.tag().unwrap();
         r.string().unwrap(); // skip_value skips payloads only, not names
         r.skip_value(tag, 1).unwrap();
-        assert_eq!(r.tag_id().unwrap(), TAG_END);
+        assert_eq!(r.tag().unwrap(), Tag::End);
         assert_eq!(r.pos(), buf.len());
+    }
+
+    #[test]
+    fn long_array_propagates_element_errors() {
+        let mut w = Writer::new(Vec::new());
+        w.root().unwrap();
+        let words = [Ok(1), Err(Error::StringTooLong { len: 1 })];
+        assert!(matches!(
+            w.long_array(2, words),
+            Err(Error::StringTooLong { len: 1 })
+        ));
     }
 
     #[test]
@@ -344,18 +547,42 @@ mod tests {
         let mut w = Writer::new(Vec::new());
         let s = "x".repeat(70_000);
         assert!(matches!(
-            w.string(&s),
+            s.encode("s", &mut w),
             Err(Error::StringTooLong { len: 70_000 })
         ));
     }
 
     #[test]
-    fn scalar_sizes_match_tag_ids() {
-        assert_eq!(SCALAR_SIZE[1], Some(1)); // byte
-        assert_eq!(SCALAR_SIZE[2], Some(2)); // short
-        assert_eq!(SCALAR_SIZE[TAG_INT as usize], Some(4));
-        assert_eq!(SCALAR_SIZE[5], Some(4)); // float
-        assert_eq!(SCALAR_SIZE[TAG_LONG as usize], Some(8));
-        assert_eq!(SCALAR_SIZE[6], Some(8)); // double
+    fn reader_rejects_unknown_tag_ids() {
+        let mut r = Reader::new(&[13]);
+        assert!(matches!(
+            r.tag(),
+            Err(Error::InvalidTagId { id: 13, offset: 0 })
+        ));
+    }
+
+    #[test]
+    fn skip_value_enforces_the_depth_limit() {
+        let nested = |depth: usize| {
+            let mut bytes = Vec::new();
+            for _ in 0..depth {
+                bytes.extend_from_slice(&[Tag::Compound.id(), 0, 0]);
+            }
+            for _ in 0..=depth {
+                bytes.push(Tag::End.id());
+            }
+            bytes
+        };
+
+        // The compound passed to `skip_value` is itself the first level, so
+        // `MAX_DEPTH - 1` nested fields reach the limit exactly.
+        let bytes = nested(MAX_DEPTH - 1);
+        Reader::new(&bytes).skip_value(Tag::Compound, 0).unwrap();
+
+        let bytes = nested(MAX_DEPTH);
+        assert!(matches!(
+            Reader::new(&bytes).skip_value(Tag::Compound, 0),
+            Err(Error::DepthLimitExceeded { .. })
+        ));
     }
 }

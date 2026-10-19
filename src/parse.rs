@@ -6,9 +6,7 @@
 //! image data, ...) is skipped by length without allocation.
 
 use crate::error::{Error, Result};
-use crate::nbt::{
-    Reader, TAG_COMPOUND, TAG_END, TAG_INT, TAG_LIST, TAG_LONG, TAG_LONG_ARRAY, TAG_STRING,
-};
+use crate::nbt::{Reader, Tag};
 use crate::region::{BlockState, Region};
 use crate::Document;
 
@@ -19,11 +17,11 @@ const REGION_DEPTH: usize = 3;
 const REGION_FIELD_DEPTH: usize = 4;
 const PALETTE_DEPTH: usize = 5;
 
-fn expect_tag(r: &Reader<'_>, field: &'static str, actual: u8, expected: u8) -> Result<()> {
+fn expect_tag(r: &Reader<'_>, field: &'static str, actual: Tag, expected: Tag) -> Result<()> {
     if actual != expected {
         return Err(Error::UnexpectedTag {
             field,
-            tag: actual,
+            tag: actual.id(),
             offset: r.pos(),
         });
     }
@@ -60,11 +58,11 @@ impl<'a> Document<'a> {
     pub fn parse(buf: &'a [u8]) -> Result<Self> {
         let mut r = Reader::new(buf);
         let root_offset = r.pos();
-        let root_tag = r.tag_id()?;
-        if root_tag != TAG_COMPOUND {
+        let root_tag = r.tag()?;
+        if root_tag != Tag::Compound {
             return Err(Error::UnexpectedTag {
                 field: "root",
-                tag: root_tag,
+                tag: root_tag.id(),
                 offset: root_offset,
             });
         }
@@ -78,30 +76,30 @@ impl<'a> Document<'a> {
         let mut regions: Option<Vec<Region<'a>>> = None;
 
         loop {
-            let tag = r.tag_id()?;
-            if tag == TAG_END {
+            let tag = r.tag()?;
+            if tag == Tag::End {
                 break;
             }
             let name = r.string()?;
             match name.as_str() {
                 "MinecraftDataVersion" => {
-                    expect_tag(&r, "MinecraftDataVersion", tag, TAG_INT)?;
+                    expect_tag(&r, "MinecraftDataVersion", tag, Tag::Int)?;
                     minecraft_data_version = r.i32()?;
                 }
                 "Version" => {
-                    expect_tag(&r, "Version", tag, TAG_INT)?;
+                    expect_tag(&r, "Version", tag, Tag::Int)?;
                     version = r.i32()?;
                 }
                 "SubVersion" => {
-                    expect_tag(&r, "SubVersion", tag, TAG_INT)?;
+                    expect_tag(&r, "SubVersion", tag, Tag::Int)?;
                     sub_version = Some(r.i32()?);
                 }
                 "Metadata" => {
-                    expect_tag(&r, "Metadata", tag, TAG_COMPOUND)?;
+                    expect_tag(&r, "Metadata", tag, Tag::Compound)?;
                     metadata = Some(parse_metadata(&mut r)?);
                 }
                 "Regions" => {
-                    expect_tag(&r, "Regions", tag, TAG_COMPOUND)?;
+                    expect_tag(&r, "Regions", tag, Tag::Compound)?;
                     regions = Some(parse_regions(&mut r)?);
                 }
                 _ => r.skip_value(tag, ROOT_DEPTH)?,
@@ -149,57 +147,57 @@ fn parse_metadata(r: &mut Reader<'_>) -> Result<MetadataFields> {
     let mut enclosing_size: Option<[i32; 3]> = None;
 
     loop {
-        let tag = r.tag_id()?;
-        if tag == TAG_END {
+        let tag = r.tag()?;
+        if tag == Tag::End {
             break;
         }
         let field = r.string()?;
         match field.as_str() {
             "Name" => {
-                expect_tag(r, "Metadata.Name", tag, TAG_STRING)?;
+                expect_tag(r, "Metadata.Name", tag, Tag::String)?;
                 name = Some(r.string()?);
             }
             "Description" => {
-                expect_tag(r, "Metadata.Description", tag, TAG_STRING)?;
+                expect_tag(r, "Metadata.Description", tag, Tag::String)?;
                 description = Some(r.string()?);
             }
             "Author" => {
-                expect_tag(r, "Metadata.Author", tag, TAG_STRING)?;
+                expect_tag(r, "Metadata.Author", tag, Tag::String)?;
                 author = Some(r.string()?);
             }
             "RegionCount" => {
-                expect_tag(r, "Metadata.RegionCount", tag, TAG_INT)?;
+                expect_tag(r, "Metadata.RegionCount", tag, Tag::Int)?;
                 region_count = Some(r.i32()?);
             }
             "TotalVolume" => {
-                expect_tag(r, "Metadata.TotalVolume", tag, TAG_INT)?;
+                expect_tag(r, "Metadata.TotalVolume", tag, Tag::Int)?;
                 total_volume = Some(i64::from(r.i32()?));
             }
             "TotalBlocks" => {
                 // The Litematica mod writes an Int here; rustmatica writes a
                 // Long. Accept both.
                 match tag {
-                    TAG_INT => total_blocks = Some(i64::from(r.i32()?)),
-                    TAG_LONG => total_blocks = Some(r.i64()?),
+                    Tag::Int => total_blocks = Some(i64::from(r.i32()?)),
+                    Tag::Long => total_blocks = Some(r.i64()?),
                     _ => {
                         return Err(Error::UnexpectedTag {
                             field: "Metadata.TotalBlocks",
-                            tag,
+                            tag: tag.id(),
                             offset: r.pos(),
                         })
                     }
                 }
             }
             "TimeCreated" => {
-                expect_tag(r, "Metadata.TimeCreated", tag, TAG_LONG)?;
+                expect_tag(r, "Metadata.TimeCreated", tag, Tag::Long)?;
                 time_created = r.i64()?;
             }
             "TimeModified" => {
-                expect_tag(r, "Metadata.TimeModified", tag, TAG_LONG)?;
+                expect_tag(r, "Metadata.TimeModified", tag, Tag::Long)?;
                 time_modified = r.i64()?;
             }
             "EnclosingSize" => {
-                expect_tag(r, "Metadata.EnclosingSize", tag, TAG_COMPOUND)?;
+                expect_tag(r, "Metadata.EnclosingSize", tag, Tag::Compound)?;
                 enclosing_size = Some(parse_vec3(r, "EnclosingSize")?);
             }
             _ => r.skip_value(tag, SCHEMA_DEPTH)?,
@@ -223,12 +221,12 @@ fn parse_regions<'a>(r: &mut Reader<'a>) -> Result<Vec<Region<'a>>> {
     let mut regions = Vec::new();
     loop {
         let offset = r.pos();
-        let tag = r.tag_id()?;
-        if tag == TAG_END {
+        let tag = r.tag()?;
+        if tag == Tag::End {
             break;
         }
         let name = r.string()?;
-        expect_tag(r, "region", tag, TAG_COMPOUND)?;
+        expect_tag(r, "region", tag, Tag::Compound)?;
         regions.push(parse_region(r, name, offset)?);
     }
     Ok(regions)
@@ -242,26 +240,26 @@ fn parse_region<'a>(r: &mut Reader<'a>, name: String, region_offset: usize) -> R
     let mut states_offset = 0usize;
 
     loop {
-        let tag = r.tag_id()?;
-        if tag == TAG_END {
+        let tag = r.tag()?;
+        if tag == Tag::End {
             break;
         }
         let field = r.string()?;
         match field.as_str() {
             "Position" => {
-                expect_tag(r, "Position", tag, TAG_COMPOUND)?;
+                expect_tag(r, "Position", tag, Tag::Compound)?;
                 position = Some(parse_vec3(r, "Position")?);
             }
             "Size" => {
-                expect_tag(r, "Size", tag, TAG_COMPOUND)?;
+                expect_tag(r, "Size", tag, Tag::Compound)?;
                 size = Some(parse_vec3(r, "Size")?);
             }
             "BlockStatePalette" => {
-                expect_tag(r, "BlockStatePalette", tag, TAG_LIST)?;
+                expect_tag(r, "BlockStatePalette", tag, Tag::List)?;
                 palette = Some(parse_palette(r)?);
             }
             "BlockStates" => {
-                expect_tag(r, "BlockStates", tag, TAG_LONG_ARRAY)?;
+                expect_tag(r, "BlockStates", tag, Tag::LongArray)?;
                 states_offset = r.pos();
                 let count = r.count()?;
                 // Borrow the payload directly; never copy or expand it.
@@ -296,22 +294,22 @@ fn parse_region<'a>(r: &mut Reader<'a>, name: String, region_offset: usize) -> R
 fn parse_vec3(r: &mut Reader<'_>, field: &'static str) -> Result<[i32; 3]> {
     let mut values: [Option<i32>; 3] = [None, None, None];
     loop {
-        let tag = r.tag_id()?;
-        if tag == TAG_END {
+        let tag = r.tag()?;
+        if tag == Tag::End {
             break;
         }
         let axis = r.string()?;
         match axis.as_str() {
             "x" => {
-                expect_tag(r, field, tag, TAG_INT)?;
+                expect_tag(r, field, tag, Tag::Int)?;
                 values[0] = Some(r.i32()?);
             }
             "y" => {
-                expect_tag(r, field, tag, TAG_INT)?;
+                expect_tag(r, field, tag, Tag::Int)?;
                 values[1] = Some(r.i32()?);
             }
             "z" => {
-                expect_tag(r, field, tag, TAG_INT)?;
+                expect_tag(r, field, tag, Tag::Int)?;
                 values[2] = Some(r.i32()?);
             }
             _ => r.skip_value(tag, REGION_FIELD_DEPTH)?,
@@ -330,11 +328,11 @@ fn parse_vec3(r: &mut Reader<'_>, field: &'static str) -> Result<[i32; 3]> {
 /// Parses a `BlockStatePalette`: a TAG_List of compounds with a `Name`
 /// string and an optional `Properties` compound of string values.
 fn parse_palette(r: &mut Reader<'_>) -> Result<Vec<BlockState>> {
-    let elem = r.tag_id()?;
-    if elem != TAG_COMPOUND {
+    let elem = r.tag()?;
+    if elem != Tag::Compound {
         return Err(Error::UnexpectedTag {
             field: "BlockStatePalette element",
-            tag: elem,
+            tag: elem.id(),
             offset: r.pos(),
         });
     }
@@ -347,25 +345,25 @@ fn parse_palette(r: &mut Reader<'_>) -> Result<Vec<BlockState>> {
         let mut name: Option<String> = None;
         let mut properties: Vec<(String, String)> = Vec::new();
         loop {
-            let tag = r.tag_id()?;
-            if tag == TAG_END {
+            let tag = r.tag()?;
+            if tag == Tag::End {
                 break;
             }
             let field = r.string()?;
             match field.as_str() {
                 "Name" => {
-                    expect_tag(r, "palette entry Name", tag, TAG_STRING)?;
+                    expect_tag(r, "palette entry Name", tag, Tag::String)?;
                     name = Some(r.string()?);
                 }
                 "Properties" => {
-                    expect_tag(r, "palette entry Properties", tag, TAG_COMPOUND)?;
+                    expect_tag(r, "palette entry Properties", tag, Tag::Compound)?;
                     loop {
-                        let ptag = r.tag_id()?;
-                        if ptag == TAG_END {
+                        let ptag = r.tag()?;
+                        if ptag == Tag::End {
                             break;
                         }
                         let key = r.string()?;
-                        expect_tag(r, "palette property value", ptag, TAG_STRING)?;
+                        expect_tag(r, "palette property value", ptag, Tag::String)?;
                         let value = r.string()?;
                         properties.push((key, value));
                     }
