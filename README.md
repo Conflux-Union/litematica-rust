@@ -51,16 +51,15 @@ fn main() -> litematica::Result<()> {
     let file = File::open("bridge.litematic")?;
     let mut reader = StreamReader::open(file, 512 * 1024 * 1024)?;
 
-    while let Some(mut region) = reader.next_region()? {
+    while let Some(region) = reader.next_region()? {
         let mut counts = vec![0u64; region.palette().len()];
-        region.read_blocks(|index| {
+        for index in region.iter_blocks() {
             // A corrupt file may yield an out-of-range index; get_mut ignores it.
             if let Some(count) = counts.get_mut(index as usize) {
                 *count += 1;
             }
-            Ok(())
-        })?;
-        println!("{}: {} voxels", region.name(), region.volume());
+        }
+        println!("{}: {} voxels", region.name, region.volume());
     }
 
     if let Some(metadata) = reader.metadata() {
@@ -85,7 +84,7 @@ fn main() -> litematica::Result<()> {
 
     for region in &doc.regions {
         let pos = BlockPos::new(3, 4, 5);
-        let state = region.block_at(pos);
+        let state = region.state_at(pos);
         println!("{} {:?}", region.name, state);
     }
 
@@ -99,7 +98,7 @@ fn main() -> litematica::Result<()> {
 The writer never requires a materialized volume; it treats a `Layout` as a queryable source: declare the bounding box, return a block per coordinate, and declare the set of states that may occur. Procedural generation, overlays, and template stitching all fit the same interface; a composite layout only has to union its children's state sets, after which the writer pulls voxels in storage order and streams compressed output. Peak memory is the palette, independent of volume. Output is currently a single region without entities or block entities.
 
 ```rust
-use litematica::mc::{BlockPos, BlockState};
+use litematica::mc::{BlockPos, BlockSize, BlockState};
 use litematica::write::{write, Layout, WriteOptions};
 use std::collections::HashSet;
 
@@ -109,8 +108,8 @@ struct Floor {
 }
 
 impl Layout for Floor {
-    fn size(&self) -> BlockPos {
-        BlockPos::new(16, 16, 16)
+    fn size(&self) -> BlockSize {
+        BlockSize::new(16, 16, 16)
     }
 
     fn block_at(&self, pos: BlockPos) -> Option<BlockState> {

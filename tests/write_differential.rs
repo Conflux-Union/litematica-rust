@@ -104,8 +104,8 @@ impl Table {
 }
 
 impl Layout for Table {
-    fn size(&self) -> BlockPos {
-        self.size
+    fn size(&self) -> BlockSize {
+        BlockSize::of(self.size)
     }
 
     fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
@@ -175,7 +175,10 @@ fn assert_written_file_matches(table: &Table, options: &WriteOptions) {
     assert_eq!(oracle.metadata.name.to_string(), options.name);
     assert_eq!(oracle.metadata.description.to_string(), options.description);
     assert_eq!(oracle.metadata.author.to_string(), options.author);
-    assert_eq!(oracle.metadata.minecraft_data_version, options.data_version);
+    assert_eq!(
+        oracle.metadata.minecraft_data_version,
+        options.minecraft_data_version
+    );
     assert_eq!(oracle.metadata.version, 6);
     assert_eq!(oracle.metadata.sub_version, Some(1));
     assert_eq!(

@@ -135,13 +135,6 @@ pub enum Error {
         pos: BlockPos,
     },
 
-    /// A layout declared a negative dimension, which no region can span.
-    #[error("layout size {size:?} has a negative axis")]
-    NegativeSize {
-        /// The declared size, including the negative component.
-        size: BlockPos,
-    },
-
     /// A layout volume or a file quantity exceeds what a litematic file can
     /// store.
     #[error("layout {what} {value} exceeds the i32 limit of the litematic format")]

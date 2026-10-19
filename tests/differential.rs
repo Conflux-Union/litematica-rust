@@ -173,7 +173,7 @@ fn assert_matches_oracle(schem: &Schematic) {
             "position of {name}"
         );
         assert_eq!(
-            mregion.size,
+            mregion.declared_size,
             McBlockPos::new(oregion.size.x, oregion.size.y, oregion.size.z),
             "size of {name}"
         );

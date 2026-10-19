@@ -231,7 +231,7 @@ fn control_minimal_file_parses() {
     let region = &doc.regions[0];
     assert_eq!(region.name, "main");
     assert_eq!(region.position, BlockPos::new(0, 0, 0));
-    assert_eq!(region.size, BlockPos::new(4, 1, 1));
+    assert_eq!(region.declared_size, BlockPos::new(4, 1, 1));
     assert_eq!(region.volume(), 4);
     assert_eq!(region.bits_per_entry(), 2);
     assert_eq!(region.palette().len(), 2);
@@ -534,7 +534,7 @@ fn out_of_range_indices_yield_without_panic() {
     // Bounds-checking is the caller's job.
     assert!(doc.regions[0].palette().get(3).is_none());
     // The checked accessor treats the dangling index as absent.
-    assert_eq!(doc.regions[0].block_at(BlockPos::new(0, 0, 0)), None);
+    assert_eq!(doc.regions[0].state_at(BlockPos::new(0, 0, 0)), None);
 }
 
 #[test]

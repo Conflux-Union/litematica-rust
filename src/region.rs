@@ -1,84 +1,17 @@
-//! Regions, block state palettes, and the bit-unpacking block iterator.
+//! One region of a schematic and the validation its block data needs.
+//!
+//! A [`Region`] is the shared model of parsed block data: the random-access
+//! reader obtains one that borrows the decompressed file, and the streaming
+//! reader obtains one that owns its payload. Both answer the same queries and
+//! walk the same storage order; only the byte storage differs.
 
-use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::bitstream::{bits_for, BitStream, BlockIter};
+use crate::bitstream::{BitStream, BlockIter};
 use crate::error::{Error, Result};
 use crate::mc::{BlockPos, BlockSize, BlockState};
-use crate::nbt::{
-    Decode, FieldEntry, FieldOutcome, FieldTable, Reader, SliceSource, Slot, Source, Tag,
-};
-
-// Block state
-//
-// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
-
-impl<S: Source> Decode<S> for BlockState {
-    const TAG: Tag = Tag::Compound;
-
-    /// Reads one palette entry: a compound with a `Name` and an optional
-    /// `Properties` compound.
-    fn decode(r: &mut Reader<S>, _field: &'static str, enclosing: usize) -> Result<Self> {
-        let depth = r.nested(enclosing)?;
-        let offset = r.pos();
-        let fields = EntryFields::fields();
-        let mut entry = EntryFields::default();
-        while let Some((field, tag)) = r.next_field()? {
-            FieldTable::new(&fields).apply(&mut entry, r, &field, tag, depth)?;
-        }
-        Ok(Self {
-            name: Cow::Owned(entry.name.required("palette entry Name", offset)?),
-            properties: entry.properties.or_default(),
-        })
-    }
-}
-
-/// The members of a palette entry while they are still arriving.
-///
-/// `Properties` is optional, so it stays in a [`Slot`] until the compound
-/// ends; `Name` is required and reports the entry's byte offset when missing.
-#[derive(Default)]
-struct EntryFields {
-    name: Slot<String>,
-    properties: Slot<BTreeMap<Cow<'static, str>, Cow<'static, str>>>,
-}
-
-impl EntryFields {
-    /// The members of a palette entry and the way each one lands here.
-    fn fields<R: Source>() -> [FieldEntry<Self, R>; 2] {
-        [
-            FieldEntry::new("Name", |entry, r, tag, depth| {
-                entry
-                    .name
-                    .set(r.decode_field("palette entry Name", tag, depth)?);
-                Ok(())
-            }),
-            FieldEntry::new("Properties", |entry, r, tag, depth| {
-                entry.properties.set(decode_properties(r, tag, depth)?);
-                Ok(())
-            }),
-        ]
-    }
-}
-
-/// Reads a `Properties` compound as the keyed map the shared [`BlockState`]
-/// orders by, so a file's member order cannot leak into state identity.
-fn decode_properties<S: Source>(
-    r: &mut Reader<S>,
-    tag: Tag,
-    enclosing: usize,
-) -> Result<BTreeMap<Cow<'static, str>, Cow<'static, str>>> {
-    r.expect("palette entry Properties", tag, Tag::Compound)?;
-    let depth = r.nested(enclosing)?;
-    let mut properties = BTreeMap::new();
-    while let Some((key, tag)) = r.next_field()? {
-        let value = r.decode_field("palette property value", tag, depth)?;
-        properties.insert(Cow::Owned(key), Cow::Owned(value));
-    }
-    Ok(properties)
-}
+use crate::nbt::{FieldEntry, FieldOutcome, FieldTable, Reader, SliceSource, Slot, Source, Tag};
+use crate::palette::{Palette, PaletteId};
 
 // Region header
 //
@@ -159,26 +92,81 @@ pub(crate) struct RegionParts {
     pub(crate) palette: Palette,
 }
 
+// Geometry
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
+/// The facts every block read derives from a region's header: the addressed
+/// span, the bit width, and the voxel count.
+///
+/// Validation lives here so the random-access and streaming readers cannot
+/// disagree about what a well-formed region is.
+pub(crate) struct Geometry {
+    pub(crate) dims: BlockSize,
+    pub(crate) bits: u32,
+    pub(crate) volume: u64,
+}
+
+impl Geometry {
+    /// Validates a region against its palette and packed payload.
+    ///
+    /// `payload_bytes` is the byte length of the `BlockStates` array;
+    /// `offset` anchors the reported error.
+    pub(crate) fn new(
+        size: BlockPos,
+        palette: &Palette,
+        payload_bytes: u64,
+        offset: usize,
+    ) -> Result<Self> {
+        let dims = BlockSize::of(size);
+        let volume128 = dims.volume();
+        let bits = palette.bits();
+
+        if volume128 > 0 && palette.is_empty() {
+            return Err(Error::EmptyPalette { offset });
+        }
+        if (1u64 << bits) < palette.len() as u64 {
+            return Err(Error::PaletteTooLarge { offset });
+        }
+        // Checked before the u64 overflow check so that a hostile file with a
+        // huge claimed Size is always reported as truncated block data.
+        let required = (volume128 * u128::from(bits)).div_ceil(8);
+        if u128::from(payload_bytes) < required {
+            return Err(Error::TruncatedBlockStates {
+                have: payload_bytes,
+                need: required,
+                offset,
+            });
+        }
+        let volume = u64::try_from(volume128).map_err(|_| Error::VolumeOverflow { offset })?;
+        Ok(Self { dims, bits, volume })
+    }
+}
+
 // Region
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
 /// One region of a schematic.
 ///
-/// The block data itself is *not* materialized: palette indices are decoded
-/// from the borrowed `BlockStates` payload on demand, either one at a time in
+/// The block data itself is never expanded: palette identifiers are decoded
+/// from the packed `BlockStates` payload on demand, either one at a time in
 /// storage order through [`Region::iter_blocks`] or at random coordinates
-/// through [`Region::block_at`]. Both routes share one bit-stream decoder.
+/// through [`Region::state_at`]. Both routes share one bit-stream decoder.
+///
+/// A region either borrows the file's payload (`Document`) or owns it (the
+/// streaming reader). The variant is an implementation detail; every query
+/// behaves identically.
 #[derive(Clone)]
 pub struct Region<'a> {
     /// Name of the region, unique within a schematic.
     pub name: String,
     /// Position of the region in schematic coordinates.
     pub position: BlockPos,
-    /// Size of the region as stored in the file. Components may be negative,
-    /// which means the region extends in the negative axis direction; the
-    /// box actually addressed is [`Region::dims`].
-    pub size: BlockPos,
+    /// Size of the region as declared in the file. Components may be negative,
+    /// which means the region extends in the negative axis direction; the box
+    /// actually addressed is [`Region::dims`].
+    pub declared_size: BlockPos,
     dims: BlockSize,
     palette: Palette,
     blocks: BitStream<'a>,
@@ -190,7 +178,7 @@ impl fmt::Debug for Region<'_> {
         f.debug_struct("Region")
             .field("name", &self.name)
             .field("position", &self.position)
-            .field("size", &self.size)
+            .field("declared_size", &self.declared_size)
             .field("palette", &self.palette.states())
             .field("block_states_len", &self.blocks.byte_len())
             .finish()
@@ -198,8 +186,9 @@ impl fmt::Debug for Region<'_> {
 }
 
 impl<'a> Region<'a> {
-    /// Reads a region compound's fields. `name` is the compound's member name
-    /// in `Regions`; `region_offset` anchors errors about missing fields.
+    /// Reads a region compound's fields, borrowing its `BlockStates` payload
+    /// from the decompressed file. `name` is the compound's member name in
+    /// `Regions`; `region_offset` anchors errors about missing fields.
     pub(crate) fn decode(
         r: &mut Reader<SliceSource<'a>>,
         name: String,
@@ -221,16 +210,34 @@ impl<'a> Region<'a> {
 
         let parts = header.into_parts(region_offset)?;
         let (block_states, states_offset) = payload.required("BlockStates", region_offset)?;
-        Self::from_parts(name, parts, block_states, states_offset)
+        Self::from_borrowed(name, parts, block_states, states_offset)
     }
 
-    /// Assembles a region from parsed pieces and validates the block data
-    /// against the palette and volume. `offset` is the byte offset of the
-    /// region's `BlockStates` payload and is used in error reports.
-    fn from_parts(
+    /// Assembles a region whose payload is borrowed from the input buffer.
+    pub(crate) fn from_borrowed(
         name: String,
         parts: RegionParts,
         block_states: &'a [u8],
+        offset: usize,
+    ) -> Result<Self> {
+        Self::assemble(name, parts, BitStream::borrowed(block_states, 0), offset)
+    }
+
+    /// Assembles a region whose payload is owned by the region itself.
+    pub(crate) fn from_owned(
+        name: String,
+        parts: RegionParts,
+        block_states: Vec<u8>,
+        offset: usize,
+    ) -> Result<Self> {
+        Self::assemble(name, parts, BitStream::owned(block_states, 0), offset)
+    }
+
+    /// Validates the payload against the header and fixes the bit width.
+    fn assemble(
+        name: String,
+        parts: RegionParts,
+        blocks: BitStream<'a>,
         offset: usize,
     ) -> Result<Self> {
         let RegionParts {
@@ -238,19 +245,19 @@ impl<'a> Region<'a> {
             size,
             palette,
         } = parts;
-        let geometry = region_geometry(size, &palette, block_states.len() as u64, offset)?;
+        let geometry = Geometry::new(size, &palette, blocks.byte_len() as u64, offset)?;
         Ok(Self {
             name,
             position,
-            size,
+            declared_size: size,
             dims: geometry.dims,
             palette,
-            blocks: BitStream::new(block_states, geometry.bits),
+            blocks: blocks.with_bits(geometry.bits),
             volume: geometry.volume,
         })
     }
 
-    /// The block state palette, in file order. Palette indices yielded by
+    /// The block state palette, in file order. Palette identifiers yielded by
     /// [`Region::iter_blocks`] refer to this slice.
     pub fn palette(&self) -> &[BlockState] {
         self.palette.states()
@@ -276,12 +283,12 @@ impl<'a> Region<'a> {
         self.palette.bits()
     }
 
-    /// The palette index stored at `pos`, in region-local coordinates, or
+    /// The palette identifier stored at `pos`, in region-local coordinates, or
     /// `None` when `pos` falls outside [`Region::dims`].
     ///
     /// The cost is one bit-stream decode, independent of the region's volume;
     /// the packed payload is never expanded.
-    pub fn index_at(&self, pos: BlockPos) -> Option<u32> {
+    pub fn palette_id_at(&self, pos: BlockPos) -> Option<PaletteId> {
         let index = self.dims.index_of(pos)?;
         self.blocks.entry(index)
     }
@@ -289,15 +296,15 @@ impl<'a> Region<'a> {
     /// The block state at `pos`, in region-local coordinates, or `None` when
     /// `pos` is outside the region.
     ///
-    /// A stored index that does not name a palette entry — possible only for
-    /// a malformed file — also yields `None`, so this accessor is total.
-    pub fn block_at(&self, pos: BlockPos) -> Option<&BlockState> {
-        let index = self.index_at(pos)?;
-        self.palette.states().get(index as usize)
+    /// A stored identifier that does not name a palette entry — possible only
+    /// for a malformed file — also yields `None`, so this accessor is total.
+    pub fn state_at(&self, pos: BlockPos) -> Option<&BlockState> {
+        let id = self.palette_id_at(pos)?;
+        self.palette.state_at(id)
     }
 
     /// Iterates over every voxel of the region in storage order, yielding
-    /// palette indices.
+    /// palette identifiers.
     ///
     /// The voxel at local coordinates `(x, y, z)` is entry
     /// `i = (y * sz + z) * sx + x`; see [`BlockSize::index_of`]. The iterator
@@ -305,129 +312,12 @@ impl<'a> Region<'a> {
     ///
     /// # Malformed files
     ///
-    /// Indices are not validated against the palette length: a hostile or
-    /// corrupt file may yield indices `>= palette().len()`. Callers must
-    /// bounds-check, e.g. with `palette().get(index as usize)`, or use
-    /// [`Region::block_at`], which does it. This iterator never panics on such
+    /// Identifiers are not validated against the palette length: a hostile or
+    /// corrupt file may yield identifiers `>= palette().len()`. Callers must
+    /// bounds-check, e.g. with `palette().get(id as usize)`, or use
+    /// [`Region::state_at`], which does it. This iterator never panics on such
     /// input.
-    pub fn iter_blocks(&self) -> BlockIter<'_> {
-        self.blocks.iter(self.volume)
-    }
-}
-
-/// The facts both read modes derive before touching block data: the addressed
-/// span, the bit width, and the voxel count.
-///
-/// Validation lives here so the random-access and streaming readers cannot
-/// disagree about what a well-formed region is.
-pub(crate) struct Geometry {
-    pub(crate) dims: BlockSize,
-    pub(crate) bits: u32,
-    pub(crate) volume: u64,
-}
-
-/// Validates a region against its palette and packed payload, and derives the
-/// facts every block read needs.
-pub(crate) fn region_geometry(
-    size: BlockPos,
-    palette: &Palette,
-    payload_bytes: u64,
-    offset: usize,
-) -> Result<Geometry> {
-    let dims = BlockSize::of(size);
-    let volume128 = dims.volume();
-    let bits = palette.bits();
-
-    if volume128 > 0 && palette.states().is_empty() {
-        return Err(Error::EmptyPalette { offset });
-    }
-    if (1u64 << bits) < palette.states().len() as u64 {
-        return Err(Error::PaletteTooLarge { offset });
-    }
-    // Checked before the u64 overflow check so that a hostile file with a
-    // huge claimed Size is always reported as truncated block data.
-    let required = (volume128 * u128::from(bits)).div_ceil(8);
-    if u128::from(payload_bytes) < required {
-        return Err(Error::TruncatedBlockStates {
-            have: payload_bytes,
-            need: required,
-            offset,
-        });
-    }
-    let volume = u64::try_from(volume128).map_err(|_| Error::VolumeOverflow { offset })?;
-    Ok(Geometry { dims, bits, volume })
-}
-
-// Palette
-//
-// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
-
-/// The palette of one region, in file order, together with the bit width the
-/// region's packed data uses.
-///
-/// The width is derived from the length and stored once, because every block
-/// lookup needs it; deriving it per entry would repeat the same four
-/// comparisons for the whole volume.
-#[derive(Clone)]
-pub(crate) struct Palette {
-    states: Vec<BlockState>,
-    bits: u32,
-}
-
-impl<S: Source> Decode<S> for Palette {
-    const TAG: Tag = Tag::List;
-
-    /// Reads a `BlockStatePalette`: a list of palette entry compounds.
-    fn decode(r: &mut Reader<S>, _field: &'static str, enclosing: usize) -> Result<Self> {
-        let elem = r.tag()?;
-        r.expect("BlockStatePalette element", elem, Tag::Compound)?;
-        let count = r.count()?;
-        let entry_depth = r.nested(enclosing)?;
-        // Cap the pre-reservation: a hostile count may be huge while the
-        // payload is tiny; the payload bounds the real length.
-        let mut states = Vec::with_capacity(count.min(256));
-        for _ in 0..count {
-            states.push(BlockState::decode(r, "palette entry", entry_depth)?);
-        }
-        Ok(Self::from_states(states))
-    }
-}
-
-impl Palette {
-    /// Wraps the states read from a file, deriving the region's bit width.
-    fn from_states(states: Vec<BlockState>) -> Self {
-        let bits = bits_for(states.len());
-        Self { states, bits }
-    }
-
-    /// The states in file order; index 0 is the first entry.
-    pub(crate) fn states(&self) -> &[BlockState] {
-        &self.states
-    }
-
-    /// Bits per `BlockStates` entry.
-    pub(crate) fn bits(&self) -> u32 {
-        self.bits
-    }
-}
-
-// Tests
-//
-// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
-
-#[cfg(test)]
-mod tests {
-    use super::{BlockPos, BlockSize};
-
-    #[test]
-    fn block_size_index_round_trips_through_positions() {
-        let size = BlockSize::new(3, 2, 4);
-        for (index, pos) in size.cartesian_positions().enumerate() {
-            let index = index as u64;
-            assert_eq!(size.index_of(pos), Some(index));
-            assert_eq!(size.position_at(index), Some(pos));
-        }
-        assert_eq!(size.index_of(BlockPos::new(3, 0, 0)), None);
-        assert_eq!(size.position_at(size.volume() as u64), None);
+    pub fn iter_blocks(&self) -> BlockIter<'a> {
+        self.blocks.clone().iter(self.volume)
     }
 }

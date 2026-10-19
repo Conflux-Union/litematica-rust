@@ -1,20 +1,32 @@
-//! The litematic schema nodes shared by both read modes.
+//! Every NBT shape the litematic format defines, in one place.
+//!
+//! This module owns the codecs for the crate's vocabulary ([`BlockPos`],
+//! [`BlockState`], [`Palette`]) and the accumulators for the root and metadata
+//! compounds. Both read modes and the writer reach the same definitions here,
+//! so a model type never has one codec per task.
 //!
 //! A file's root compound describes the schematic before and around the
 //! regions: its format versions and its `Metadata` compound. Files are free to
-//! order those fields however they like, so the shared abstraction is
-//! [`Header`], an accumulator that accepts one field at a time. The
-//! random-access reader consumes it once at the end; the streaming reader may
-//! ask it for the metadata after every field, including ones that arrive after
-//! the regions.
+//! order those fields however they like, so [`RootFields`] accepts one field
+//! at a time. The random-access reader consumes it once at the end; the
+//! streaming reader may ask it for the metadata after every field, including
+//! ones that arrive after the regions.
 //!
-//! [`Header::read_field`] also reports when it reaches `Regions`, so a caller
-//! learns about the boundary without this module owning the region collection.
+//! [`RootFields::read_field`] also reports when it reaches `Regions`, so a
+//! caller learns about the boundary without this module owning the region
+//! collection.
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::io::Write as IoWrite;
+
+use crate::document::Metadata;
 use crate::error::{Error, Result};
-use crate::mc::BlockPos;
-use crate::nbt::{Decode, FieldEntry, FieldOutcome, FieldTable, Reader, Slot, Source, Tag};
-use crate::Metadata;
+use crate::mc::{BlockPos, BlockSize, BlockState};
+use crate::nbt::{
+    Decode, Encode, FieldEntry, FieldOutcome, FieldTable, Reader, Slot, Source, Tag, Writer,
+};
+use crate::palette::Palette;
 
 // Root fields
 //
@@ -22,7 +34,7 @@ use crate::Metadata;
 
 /// The root fields that describe a schematic, accumulated in any order.
 #[derive(Default)]
-pub(crate) struct Header {
+pub(crate) struct RootFields {
     minecraft_data_version: i32,
     version: i32,
     sub_version: Slot<i32>,
@@ -32,8 +44,8 @@ pub(crate) struct Header {
     resolved: Option<Metadata>,
 }
 
-impl Header {
-    /// Creates an empty header; every field defaults until one is read.
+impl RootFields {
+    /// Creates an empty accumulator; every field defaults until one is read.
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -108,6 +120,10 @@ impl Header {
     }
 }
 
+// Vocabulary codecs
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
 impl<S: Source> Decode<S> for BlockPos {
     const TAG: Tag = Tag::Compound;
 
@@ -115,7 +131,7 @@ impl<S: Source> Decode<S> for BlockPos {
     /// `EnclosingSize` are all written as. Unknown members are skipped.
     ///
     /// A `Size`-shaped field stays signed here, exactly as declared; use
-    /// [`crate::mc::BlockSize::of`] where it becomes a span.
+    /// [`BlockSize::of`] where it becomes a span.
     fn decode(r: &mut Reader<S>, field: &'static str, enclosing: usize) -> Result<Self> {
         /// The axis names in the order a position stores them.
         const AXES: [&str; 3] = ["x", "y", "z"];
@@ -136,6 +152,155 @@ impl<S: Source> Decode<S> for BlockPos {
             y.required(field, offset)?,
             z.required(field, offset)?,
         ))
+    }
+}
+
+impl Encode for BlockPos {
+    const TAG: Tag = Tag::Compound;
+
+    /// Writes the `{x, y, z}` compound shared by every position-shaped field.
+    fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
+        self.x.encode("x", out)?;
+        self.y.encode("y", out)?;
+        self.z.encode("z", out)?;
+        out.end()
+    }
+}
+
+impl Encode for BlockSize {
+    const TAG: Tag = Tag::Compound;
+
+    /// Writes a span as the signed triple the file expects, rejecting an axis
+    /// that does not fit an `i32`.
+    fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
+        let axis = |value: u32| {
+            i32::try_from(value).map_err(|_| Error::DimensionOverflow {
+                what: "size axis",
+                value: u128::from(value),
+            })
+        };
+        axis(self.x)?.encode("x", out)?;
+        axis(self.y)?.encode("y", out)?;
+        axis(self.z)?.encode("z", out)?;
+        out.end()
+    }
+}
+
+impl<S: Source> Decode<S> for BlockState {
+    const TAG: Tag = Tag::Compound;
+
+    /// Reads one palette entry: a compound with a `Name` and an optional
+    /// `Properties` compound.
+    fn decode(r: &mut Reader<S>, _field: &'static str, enclosing: usize) -> Result<Self> {
+        let depth = r.nested(enclosing)?;
+        let offset = r.pos();
+        let fields = EntryFields::fields();
+        let mut entry = EntryFields::default();
+        while let Some((field, tag)) = r.next_field()? {
+            FieldTable::new(&fields).apply(&mut entry, r, &field, tag, depth)?;
+        }
+        Ok(Self {
+            name: Cow::Owned(entry.name.required("palette entry Name", offset)?),
+            properties: entry.properties.or_default(),
+        })
+    }
+}
+
+impl Encode for BlockState {
+    const TAG: Tag = Tag::Compound;
+
+    /// Writes the entry body, omitting an empty `Properties` compound.
+    fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
+        self.name.as_ref().encode("Name", out)?;
+        if self.properties.is_empty() {
+            return out.end();
+        }
+        out.compound("Properties")?;
+        for (key, value) in &self.properties {
+            value.encode(key.as_ref(), out)?;
+        }
+        out.end()?;
+        out.end()
+    }
+}
+
+/// The members of a palette entry while they are still arriving.
+///
+/// `Properties` is optional, so it stays in a [`Slot`] until the compound
+/// ends; `Name` is required and reports the entry's byte offset when missing.
+#[derive(Default)]
+struct EntryFields {
+    name: Slot<String>,
+    properties: Slot<BTreeMap<Cow<'static, str>, Cow<'static, str>>>,
+}
+
+impl EntryFields {
+    /// The members of a palette entry and the way each one lands here.
+    fn fields<R: Source>() -> [FieldEntry<Self, R>; 2] {
+        [
+            FieldEntry::new("Name", |entry, r, tag, depth| {
+                entry
+                    .name
+                    .set(r.decode_field("palette entry Name", tag, depth)?);
+                Ok(())
+            }),
+            FieldEntry::new("Properties", |entry, r, tag, depth| {
+                entry.properties.set(decode_properties(r, tag, depth)?);
+                Ok(())
+            }),
+        ]
+    }
+}
+
+/// Reads a `Properties` compound as the keyed map the shared [`BlockState`]
+/// orders by, so a file's member order cannot leak into state identity.
+fn decode_properties<S: Source>(
+    r: &mut Reader<S>,
+    tag: Tag,
+    enclosing: usize,
+) -> Result<BTreeMap<Cow<'static, str>, Cow<'static, str>>> {
+    r.expect("palette entry Properties", tag, Tag::Compound)?;
+    let depth = r.nested(enclosing)?;
+    let mut properties = BTreeMap::new();
+    while let Some((key, tag)) = r.next_field()? {
+        let value = r.decode_field("palette property value", tag, depth)?;
+        properties.insert(Cow::Owned(key), Cow::Owned(value));
+    }
+    Ok(properties)
+}
+
+impl<S: Source> Decode<S> for Palette {
+    const TAG: Tag = Tag::List;
+
+    /// Reads a `BlockStatePalette`: the list of states whose order defines
+    /// every packed identifier in the region.
+    fn decode(r: &mut Reader<S>, _field: &'static str, enclosing: usize) -> Result<Self> {
+        let elem = r.tag()?;
+        r.expect("BlockStatePalette element", elem, Tag::Compound)?;
+        let count = r.count()?;
+        let entry_depth = r.nested(enclosing)?;
+        // Cap the pre-reservation: a hostile count may be huge while the
+        // payload is tiny; the payload bounds the real length.
+        let mut states = Vec::with_capacity(count.min(256));
+        for _ in 0..count {
+            states.push(BlockState::decode(r, "palette entry", entry_depth)?);
+        }
+        Ok(Palette::from_file(states))
+    }
+}
+
+impl Encode for Palette {
+    const TAG: Tag = Tag::List;
+
+    /// Writes the palette in its own order; a written palette already begins
+    /// with air.
+    fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
+        let len = i32::try_from(self.len()).map_err(|_| Error::DimensionOverflow {
+            what: "BlockStatePalette length",
+            value: self.len() as u128,
+        })?;
+        out.list(Tag::Compound, len)?;
+        self.states().iter().try_for_each(|state| state.body(out))
     }
 }
 

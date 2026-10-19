@@ -75,8 +75,8 @@ impl Table {
 }
 
 impl Layout for Table {
-    fn size(&self) -> BlockPos {
-        self.size
+    fn size(&self) -> BlockSize {
+        BlockSize::of(self.size)
     }
 
     fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
@@ -162,16 +162,20 @@ fn assert_voxels_match(table: &Table, doc: &Document<'_>) {
     // Random access must agree with the sequential stream entry by entry.
     let positions = BlockSize::of(table.size).cartesian_positions();
     for (i, pos) in positions.enumerate() {
-        assert_eq!(region.index_at(pos), Some(expect[i]), "index at {pos:?}");
         assert_eq!(
-            read_view(region.block_at(pos).expect("in-bounds position")),
+            region.palette_id_at(pos),
+            Some(expect[i]),
+            "index at {pos:?}"
+        );
+        assert_eq!(
+            read_view(region.state_at(pos).expect("in-bounds position")),
             write_view(&expected_palette[expect[i] as usize]),
             "state at {pos:?}"
         );
     }
     let outside = BlockPos::new(table.size.x, 0, 0);
-    assert_eq!(region.index_at(outside), None);
-    assert_eq!(region.block_at(outside), None);
+    assert_eq!(region.palette_id_at(outside), None);
+    assert_eq!(region.state_at(outside), None);
 }
 
 #[test]
@@ -219,7 +223,7 @@ fn round_trip_full_layout() {
     let region = &doc.regions[0];
     assert_eq!(region.name, "多区域 schematic ✓");
     assert_eq!(region.position, BlockPos::new(0, 0, 0));
-    assert_eq!(region.size, BlockPos::new(5, 3, 7));
+    assert_eq!(region.declared_size, BlockPos::new(5, 3, 7));
     assert_eq!(region.volume(), 105);
     let expected_palette = expected_file_palette(&table);
     let got: Vec<_> = region.palette().iter().map(read_view).collect();
@@ -313,8 +317,8 @@ struct Sparse {
 }
 
 impl Layout for Sparse {
-    fn size(&self) -> BlockPos {
-        self.size
+    fn size(&self) -> BlockSize {
+        BlockSize::of(self.size)
     }
 
     fn block_at(&self, _pos: BlockPos) -> Option<BlockState> {
@@ -356,14 +360,6 @@ fn write_rejections() {
     )
     .unwrap_err();
     assert!(matches!(err, Error::DimensionOverflow { .. }));
-
-    let err = write(
-        &sparse(BlockPos::new(-1, 1, 1)),
-        &WriteOptions::new(4189, "negative"),
-        Vec::new(),
-    )
-    .unwrap_err();
-    assert!(matches!(err, Error::NegativeSize { .. }));
 }
 
 #[test]
@@ -391,8 +387,8 @@ fn parsed_region_serializes_itself() {
     // The palette is rewritten canonically, so indices may move; states must not.
     for pos in BlockSize::of(size).cartesian_positions() {
         assert_eq!(
-            read_view(region.block_at(pos).expect("in bounds")),
-            read_view(doc.regions[0].block_at(pos).expect("in bounds")),
+            read_view(region.state_at(pos).expect("in bounds")),
+            read_view(doc.regions[0].state_at(pos).expect("in bounds")),
             "state at {pos:?}"
         );
     }
@@ -407,8 +403,8 @@ fn default_palette_discovers_only_used_states() {
         glass: BlockState,
     }
     impl Layout for Bare {
-        fn size(&self) -> BlockPos {
-            BlockPos::new(4, 2, 2)
+        fn size(&self) -> BlockSize {
+            BlockSize::new(4, 2, 2)
         }
         fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
             if pos.y % 2 == 0 {

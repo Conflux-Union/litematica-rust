@@ -85,25 +85,20 @@ fn real_file_stream_matches_document() {
     let file = std::fs::File::open(&path).expect("open test file");
     let mut reader = StreamReader::open(file, 8 << 30).expect("stream open");
     let mut count = 0usize;
-    while let Some(mut region) = reader.next_region().expect("region") {
+    while let Some(region) = reader.next_region().expect("region") {
         let expected = &doc.regions[count];
-        assert_eq!(region.name(), expected.name);
-        assert_eq!(region.position(), expected.position);
-        assert_eq!(region.size(), expected.size);
+        assert_eq!(region.name, expected.name);
+        assert_eq!(region.position, expected.position);
+        assert_eq!(region.declared_size, expected.declared_size);
         assert_eq!(region.dims(), expected.dims());
         assert_eq!(region.volume(), expected.volume());
         assert_eq!(region.palette(), expected.palette());
 
-        let name = region.name().to_owned();
+        let name = region.name.clone();
         let mut voxels = expected.iter_blocks();
-        let mut seen = 0u64;
-        region
-            .read_blocks(|index| {
-                assert_eq!(Some(index), voxels.next(), "voxel {seen} of {name}");
-                seen += 1;
-                Ok(())
-            })
-            .expect("stream payload");
+        for (seen, index) in region.iter_blocks().enumerate() {
+            assert_eq!(Some(index), voxels.next(), "voxel {seen} of {name}");
+        }
         assert!(voxels.next().is_none(), "region {name} is longer");
         count += 1;
     }

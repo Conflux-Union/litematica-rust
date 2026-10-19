@@ -1,7 +1,7 @@
 //! Single-pass parsing of the litematic NBT structure into a [`Document`].
 //!
 //! Each schema node reads itself: [`Document`] owns the root, the shared
-//! [`Header`] owns the version and metadata fields, and [`Regions`] owns the
+//! [`RootFields`] owns the version and metadata fields, and [`Regions`] owns the
 //! region collection, which in turn asks [`Region`] to read one region. The
 //! only thing a parent supplies is the name and depth its child sits at, so
 //! the shape of the file is stated once, next to the type that mirrors it.
@@ -11,11 +11,11 @@
 //! decoded; everything else (entities, tile entities, pending ticks, preview
 //! image data, ...) is skipped by length without allocation.
 
+use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::nbt::{Decode, FieldOutcome, Reader, SliceSource, Slot, Tag};
 use crate::region::Region;
-use crate::schema::Header;
-use crate::Document;
+use crate::schema::RootFields;
 
 // Document
 //
@@ -62,7 +62,7 @@ impl<'a> Decode<SliceSource<'a>> for Document<'a> {
         enclosing: usize,
     ) -> Result<Self> {
         let depth = r.nested(enclosing)?;
-        let mut header = Header::new();
+        let mut header = RootFields::new();
         let mut regions = Slot::default();
 
         while let Some((name, tag)) = r.next_field()? {

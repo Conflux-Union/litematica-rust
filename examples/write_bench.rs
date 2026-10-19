@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use litematica::mc::{BlockPos, BlockState};
+use litematica::mc::{BlockPos, BlockSize, BlockState};
 use litematica::write::{write, Layout, WriteOptions};
 
 /// Peak resident set size in bytes (Linux only, from VmHWM).
@@ -40,8 +40,8 @@ struct HollowSphere {
 }
 
 impl Layout for HollowSphere {
-    fn size(&self) -> BlockPos {
-        self.size
+    fn size(&self) -> BlockSize {
+        BlockSize::of(self.size)
     }
 
     fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
