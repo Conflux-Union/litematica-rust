@@ -3,6 +3,12 @@
 use std::fmt;
 
 use crate::error::{Error, Result};
+use crate::mc::BlockPos;
+use crate::nbt::{Decode, Reader, Tag};
+
+// Block state
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
 /// A single block state from a region palette.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -14,15 +20,58 @@ pub struct BlockState {
     pub properties: Vec<(String, String)>,
 }
 
-/// Computes the litematica bit width for a palette of `len` entries: the
-/// smallest `n >= 2` with `2^n >= len`.
-pub(crate) fn num_bits(len: usize) -> u32 {
-    let mut n = 2u32;
-    while n < 32 && (1u64 << n) < len as u64 {
-        n += 1;
+impl<'a> Decode<'a> for BlockState {
+    /// Reads one palette entry: a compound with a `Name` and an optional
+    /// `Properties` compound.
+    fn decode(r: &mut Reader<'a>, _field: &'static str, enclosing: usize) -> Result<Self> {
+        let depth = r.nested(enclosing)?;
+        let entry_offset = r.pos();
+        let mut name: Option<String> = None;
+        let mut properties: Vec<(String, String)> = Vec::new();
+        loop {
+            let tag = r.tag()?;
+            if tag == Tag::End {
+                break;
+            }
+            let field = r.string()?;
+            match field.as_str() {
+                "Name" => {
+                    r.expect("palette entry Name", tag, Tag::String)?;
+                    name = Some(r.string()?);
+                }
+                "Properties" => properties = Self::decode_properties(r, tag)?,
+                _ => r.skip_value(tag, depth)?,
+            }
+        }
+        let name = name.ok_or(Error::MissingField {
+            field: "palette entry Name",
+            offset: entry_offset,
+        })?;
+        Ok(Self { name, properties })
     }
-    n
 }
+
+impl BlockState {
+    /// Reads a `Properties` compound: a map from property name to string value.
+    fn decode_properties(r: &mut Reader<'_>, tag: Tag) -> Result<Vec<(String, String)>> {
+        r.expect("palette entry Properties", tag, Tag::Compound)?;
+        let mut properties = Vec::new();
+        loop {
+            let tag = r.tag()?;
+            if tag == Tag::End {
+                break;
+            }
+            let key = r.string()?;
+            r.expect("palette property value", tag, Tag::String)?;
+            properties.push((key, r.string()?));
+        }
+        Ok(properties)
+    }
+}
+
+// Region
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
 /// One region of a schematic.
 ///
@@ -38,10 +87,9 @@ pub struct Region<'a> {
     /// Size of the region as stored in the file. Components may be negative,
     /// which means the region extends in the negative axis direction.
     pub size: [i32; 3],
-    palette: Vec<BlockState>,
+    palette: Palette,
     block_states: &'a [u8],
     volume: u64,
-    bits: u32,
 }
 
 impl fmt::Debug for Region<'_> {
@@ -50,36 +98,100 @@ impl fmt::Debug for Region<'_> {
             .field("name", &self.name)
             .field("position", &self.position)
             .field("size", &self.size)
-            .field("palette", &self.palette)
+            .field("palette", &self.palette.states())
             .field("block_states_len", &self.block_states.len())
             .finish()
     }
 }
 
 impl<'a> Region<'a> {
+    /// Reads a region compound's fields. `name` is the compound's member name
+    /// in `Regions`; `region_offset` anchors errors about missing fields.
+    pub(crate) fn decode(
+        r: &mut Reader<'a>,
+        name: String,
+        region_offset: usize,
+        enclosing: usize,
+    ) -> Result<Self> {
+        let depth = r.nested(enclosing)?;
+        let mut position: Option<BlockPos> = None;
+        let mut size: Option<BlockPos> = None;
+        let mut palette: Option<Palette> = None;
+        let mut states: Option<&[u8]> = None;
+        let mut states_offset = 0usize;
+
+        loop {
+            let tag = r.tag()?;
+            if tag == Tag::End {
+                break;
+            }
+            let field = r.string()?;
+            match field.as_str() {
+                "Position" => {
+                    r.expect("Position", tag, Tag::Compound)?;
+                    position = Some(BlockPos::decode(r, "Position", depth)?);
+                }
+                "Size" => {
+                    r.expect("Size", tag, Tag::Compound)?;
+                    size = Some(BlockPos::decode(r, "Size", depth)?);
+                }
+                "BlockStatePalette" => {
+                    r.expect("BlockStatePalette", tag, Tag::List)?;
+                    palette = Some(Palette::decode(r, "BlockStatePalette", depth)?);
+                }
+                "BlockStates" => {
+                    r.expect("BlockStates", tag, Tag::LongArray)?;
+                    states_offset = r.pos();
+                    let count = r.count()?;
+                    // Borrow the payload directly; never copy or expand it.
+                    states = Some(r.take(count as u64 * 8)?);
+                }
+                _ => r.skip_value(tag, depth)?,
+            }
+        }
+
+        let position = position.ok_or(Error::MissingField {
+            field: "Position",
+            offset: region_offset,
+        })?;
+        let size = size.ok_or(Error::MissingField {
+            field: "Size",
+            offset: region_offset,
+        })?;
+        let palette = palette.ok_or(Error::MissingField {
+            field: "BlockStatePalette",
+            offset: region_offset,
+        })?;
+        let states = states.ok_or(Error::MissingField {
+            field: "BlockStates",
+            offset: region_offset,
+        })?;
+        Self::from_parts(name, position, size, palette, states, states_offset)
+    }
+
     /// Assembles a region from parsed pieces and validates the block data
     /// against the palette and volume. `offset` is the byte offset of the
     /// region's `BlockStates` payload and is used in error reports.
-    pub(crate) fn from_parts(
+    fn from_parts(
         name: String,
-        position: [i32; 3],
-        size: [i32; 3],
-        palette: Vec<BlockState>,
+        position: BlockPos,
+        size: BlockPos,
+        palette: Palette,
         block_states: &'a [u8],
         offset: usize,
     ) -> Result<Self> {
         let dims = [
-            size[0].unsigned_abs() as u128,
-            size[1].unsigned_abs() as u128,
-            size[2].unsigned_abs() as u128,
+            size.x.unsigned_abs() as u128,
+            size.y.unsigned_abs() as u128,
+            size.z.unsigned_abs() as u128,
         ];
         let volume128 = dims[0] * dims[1] * dims[2];
+        let bits = palette.bits();
 
-        if volume128 > 0 && palette.is_empty() {
+        if volume128 > 0 && palette.states().is_empty() {
             return Err(Error::EmptyPalette { offset });
         }
-        let bits = num_bits(palette.len());
-        if (1u64 << bits) < palette.len() as u64 {
+        if (1u64 << bits) < palette.states().len() as u64 {
             return Err(Error::PaletteTooLarge { offset });
         }
         // Checked before the u64 overflow check so that a hostile file with a
@@ -96,19 +208,18 @@ impl<'a> Region<'a> {
 
         Ok(Self {
             name,
-            position,
-            size,
+            position: [position.x, position.y, position.z],
+            size: [size.x, size.y, size.z],
             palette,
             block_states,
             volume,
-            bits,
         })
     }
 
     /// The block state palette, in file order. Palette indices yielded by
     /// [`Region::iter_blocks`] refer to this slice.
     pub fn palette(&self) -> &[BlockState] {
-        &self.palette
+        self.palette.states()
     }
 
     /// The absolute size per axis: `[|size.x|, |size.y|, |size.z|]`.
@@ -131,7 +242,7 @@ impl<'a> Region<'a> {
     /// Bits used per block entry in the `BlockStates` bit stream: the smallest
     /// `n >= 2` such that `2^n >= palette().len()`.
     pub fn bits_per_entry(&self) -> u32 {
-        self.bits
+        self.palette.bits()
     }
 
     /// Iterates over every voxel of the region in storage order, yielding
@@ -149,9 +260,70 @@ impl<'a> Region<'a> {
     /// bounds-check, e.g. with `palette().get(index as usize)`. This iterator
     /// never panics on such input.
     pub fn iter_blocks(&self) -> BlockIter<'_> {
-        BlockIter::new(self.block_states, self.bits, self.volume)
+        BlockIter::new(self.block_states, self.palette.bits(), self.volume)
     }
 }
+
+// Palette
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
+/// The palette of one region, in file order, together with the bit width the
+/// region's packed data uses.
+///
+/// The width is derived from the length and stored once, because every block
+/// lookup needs it; deriving it per entry would repeat the same four
+/// comparisons for the whole volume.
+#[derive(Clone)]
+struct Palette {
+    states: Vec<BlockState>,
+    bits: u32,
+}
+
+impl<'a> Decode<'a> for Palette {
+    /// Reads a `BlockStatePalette`: a list of palette entry compounds.
+    fn decode(r: &mut Reader<'a>, _field: &'static str, enclosing: usize) -> Result<Self> {
+        let elem = r.tag()?;
+        r.expect("BlockStatePalette element", elem, Tag::Compound)?;
+        let count = r.count()?;
+        let entry_depth = r.nested(enclosing)?;
+        // Cap the pre-reservation: a hostile count may be huge while the
+        // payload is tiny; the payload bounds the real length.
+        let mut states = Vec::with_capacity(count.min(256));
+        for _ in 0..count {
+            states.push(BlockState::decode(r, "palette entry", entry_depth)?);
+        }
+        Ok(Self::from_states(states))
+    }
+}
+
+impl Palette {
+    /// Wraps the states read from a file, deriving the region's bit width.
+    fn from_states(states: Vec<BlockState>) -> Self {
+        let bits = Self::bits_for(states.len());
+        Self { states, bits }
+    }
+
+    /// The litematica bit width for `len` palette entries: the smallest
+    /// `n >= 2` with `2^n >= len`.
+    fn bits_for(len: usize) -> u32 {
+        (2..32).find(|n| (1u64 << n) >= len as u64).unwrap_or(32)
+    }
+
+    /// The states in file order; index 0 is the first entry.
+    fn states(&self) -> &[BlockState] {
+        &self.states
+    }
+
+    /// Bits per `BlockStates` entry.
+    fn bits(&self) -> u32 {
+        self.bits
+    }
+}
+
+// Block iterator
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
 /// An [`Iterator`] over the palette indices of a region, decoded on the fly
 /// from the `BlockStates` bit stream.
@@ -240,24 +412,28 @@ impl ExactSizeIterator for BlockIter<'_> {
     }
 }
 
+// Tests
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
 #[cfg(test)]
 mod tests {
-    use super::{num_bits, BlockIter};
+    use super::{BlockIter, Palette};
 
     #[test]
-    fn num_bits_matches_litematica() {
-        assert_eq!(num_bits(1), 2);
-        assert_eq!(num_bits(2), 2);
-        assert_eq!(num_bits(3), 2);
-        assert_eq!(num_bits(4), 2);
-        assert_eq!(num_bits(5), 3);
-        assert_eq!(num_bits(8), 3);
-        assert_eq!(num_bits(9), 4);
-        assert_eq!(num_bits(16), 4);
-        assert_eq!(num_bits(17), 5);
-        assert_eq!(num_bits(64), 6);
-        assert_eq!(num_bits(65), 7);
-        assert_eq!(num_bits(100), 7);
+    fn bits_for_matches_litematica() {
+        assert_eq!(Palette::bits_for(1), 2);
+        assert_eq!(Palette::bits_for(2), 2);
+        assert_eq!(Palette::bits_for(3), 2);
+        assert_eq!(Palette::bits_for(4), 2);
+        assert_eq!(Palette::bits_for(5), 3);
+        assert_eq!(Palette::bits_for(8), 3);
+        assert_eq!(Palette::bits_for(9), 4);
+        assert_eq!(Palette::bits_for(16), 4);
+        assert_eq!(Palette::bits_for(17), 5);
+        assert_eq!(Palette::bits_for(64), 6);
+        assert_eq!(Palette::bits_for(65), 7);
+        assert_eq!(Palette::bits_for(100), 7);
     }
 
     #[test]

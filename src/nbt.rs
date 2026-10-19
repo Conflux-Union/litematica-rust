@@ -164,6 +164,42 @@ impl Encode for String {
     }
 }
 
+// Decode
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
+/// A value that knows its own NBT shape on the read side.
+///
+/// The reading mirror of [`Encode`]: a schema node implements this once and
+/// is then read wherever it appears, instead of every caller restating which
+/// fields to pull and in what order. `field` names the node in diagnostics,
+/// since a value's identity lives in the name its parent gave it, not in its
+/// payload; `enclosing` is the depth of the container holding the value, so a
+/// compound can derive the depth of its own fields and hand unknown members
+/// to [`Reader::skip_value`].
+pub(crate) trait Decode<'a>: Sized {
+    /// Reads this value's payload, without a tag id or a name.
+    fn decode(r: &mut Reader<'a>, field: &'static str, enclosing: usize) -> Result<Self>;
+}
+
+impl<'a> Decode<'a> for i32 {
+    fn decode(r: &mut Reader<'a>, _field: &'static str, _enclosing: usize) -> Result<Self> {
+        r.i32()
+    }
+}
+
+impl<'a> Decode<'a> for i64 {
+    fn decode(r: &mut Reader<'a>, _field: &'static str, _enclosing: usize) -> Result<Self> {
+        r.i64()
+    }
+}
+
+impl<'a> Decode<'a> for String {
+    fn decode(r: &mut Reader<'a>, _field: &'static str, _enclosing: usize) -> Result<Self> {
+        r.string()
+    }
+}
+
 // Reader
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
@@ -249,9 +285,22 @@ impl<'a> Reader<'a> {
         Tag::from_id(id).ok_or(Error::InvalidTagId { id, offset })
     }
 
-    /// Computes the depth of a nested container, enforcing [`MAX_DEPTH`].
-    fn descend(&self, enclosing_depth: usize) -> Result<usize> {
-        let depth = enclosing_depth + 1;
+    /// Rejects `actual` unless it is `expected`, naming the offending field.
+    pub(crate) fn expect(&self, field: &'static str, actual: Tag, expected: Tag) -> Result<()> {
+        if actual != expected {
+            return Err(Error::UnexpectedTag {
+                field,
+                tag: actual.id(),
+                offset: self.pos,
+            });
+        }
+        Ok(())
+    }
+
+    /// The depth of a container nested inside `enclosing`, enforcing
+    /// [`MAX_DEPTH`].
+    pub(crate) fn nested(&self, enclosing: usize) -> Result<usize> {
+        let depth = enclosing + 1;
         if depth > MAX_DEPTH {
             return Err(Error::DepthLimitExceeded { offset: self.pos });
         }
@@ -277,7 +326,7 @@ impl<'a> Reader<'a> {
                 let elem = self.tag()?;
                 let count = self.count()?;
                 if count > 0 {
-                    let depth = self.descend(enclosing_depth)?;
+                    let depth = self.nested(enclosing_depth)?;
                     if elem == Tag::End {
                         return Err(Error::UnexpectedTag {
                             field: "list element",
@@ -291,7 +340,7 @@ impl<'a> Reader<'a> {
                 }
             }
             Tag::Compound => {
-                let depth = self.descend(enclosing_depth)?;
+                let depth = self.nested(enclosing_depth)?;
                 loop {
                     let t = self.tag()?;
                     if t == Tag::End {

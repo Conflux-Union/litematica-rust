@@ -66,6 +66,17 @@ pub trait Layout {
             palette
         })
     }
+
+    /// Writes this layout as a single-region `.litematic` file into `sink`.
+    ///
+    /// The same operation as the free [`write()`], reached from the value that
+    /// describes the schematic.
+    fn as_litematic<W: IoWrite>(&self, options: &WriteOptions, sink: W) -> Result<()>
+    where
+        Self: Sized,
+    {
+        write(self, options, sink)
+    }
 }
 
 // Block values
@@ -277,44 +288,11 @@ impl WriteOptions {
 /// # }
 /// ```
 pub fn write<L: Layout, W: IoWrite>(layout: &L, options: &WriteOptions, sink: W) -> Result<()> {
-    let size = layout.size();
-    let axes = [("x", size.x), ("y", size.y), ("z", size.z)];
-    if let Some((axis, value)) = axes.into_iter().find(|(_, v)| *v < 0) {
-        return Err(Error::NegativeSize { axis, value });
-    }
-    let volume = u128::from(size.x.unsigned_abs())
-        * u128::from(size.y.unsigned_abs())
-        * u128::from(size.z.unsigned_abs());
-    let volume_i32 = i32::try_from(volume).map_err(|_| Error::DimensionOverflow {
-        what: "volume",
-        value: volume,
-    })?;
-
-    let palette = Palette::build(layout.block_palette());
-    let bits = palette.num_bits();
-    // `volume <= i32::MAX` and `bits <= 32` bound this well below i32::MAX;
-    // the checked conversion keeps the written length prefix honest.
-    let longs = (volume * u128::from(bits)).div_ceil(64);
-    let longs_i32 = i32::try_from(longs).map_err(|_| Error::DimensionOverflow {
-        what: "BlockStates length",
-        value: longs,
-    })?;
-
     let total_blocks = Cell::new(0i64);
-    let schematic = Schematic {
-        layout,
-        options,
-        palette,
-        size,
-        volume: volume_i32,
-        longs: longs_i32,
-        total_blocks: &total_blocks,
-    };
-
+    let schematic = Schematic::new(layout, options, &total_blocks)?;
     let mut gz = GzEncoder::new(sink, options.compression);
     let mut nbt = Writer::new(&mut gz);
-    nbt.root()?;
-    schematic.body(&mut nbt)?;
+    schematic.write(&mut nbt)?;
     nbt.into_inner()
         .map_err(|source| Error::WriteIo { source })?;
     gz.finish()
@@ -331,6 +309,55 @@ struct Schematic<'a, L: Layout> {
     volume: i32,
     longs: i32,
     total_blocks: &'a Cell<i64>,
+}
+
+impl<'a, L: Layout> Schematic<'a, L> {
+    /// Validates the layout's bounds and assembles the palette and lengths
+    /// every later stage reads.
+    fn new(layout: &'a L, options: &'a WriteOptions, total_blocks: &'a Cell<i64>) -> Result<Self> {
+        let size = layout.size();
+        let volume = Self::checked_volume(size)?;
+        let palette = Palette::build(layout.block_palette());
+        let bits = palette.num_bits();
+        // `volume <= i32::MAX` and `bits <= 32` bound this well below i32::MAX;
+        // the checked conversion keeps the written length prefix honest.
+        let longs = (u128::from(volume.unsigned_abs()) * u128::from(bits)).div_ceil(64);
+        let longs = i32::try_from(longs).map_err(|_| Error::DimensionOverflow {
+            what: "BlockStates length",
+            value: longs,
+        })?;
+        Ok(Self {
+            layout,
+            options,
+            palette,
+            size,
+            volume,
+            longs,
+            total_blocks,
+        })
+    }
+
+    /// Rejects negative axes, then returns the volume as the `i32` the format
+    /// stores in `TotalVolume`.
+    fn checked_volume(size: BlockPos) -> Result<i32> {
+        let axes = [("x", size.x), ("y", size.y), ("z", size.z)];
+        if let Some((axis, value)) = axes.into_iter().find(|(_, value)| *value < 0) {
+            return Err(Error::NegativeSize { axis, value });
+        }
+        let volume = u128::from(size.x.unsigned_abs())
+            * u128::from(size.y.unsigned_abs())
+            * u128::from(size.z.unsigned_abs());
+        i32::try_from(volume).map_err(|_| Error::DimensionOverflow {
+            what: "volume",
+            value: volume,
+        })
+    }
+
+    /// Opens the root compound and writes the whole document into it.
+    fn write<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
+        out.root()?;
+        self.body(out)
+    }
 }
 
 impl<L: Layout> Encode for Schematic<'_, L> {

@@ -1,45 +1,25 @@
 //! Single-pass parsing of the litematic NBT structure into a [`Document`].
 //!
+//! Each schema node reads itself: [`Document`] owns the root, [`MetadataFields`]
+//! owns the header compound, and [`Regions`] owns the region collection, which
+//! in turn asks [`Region`] to read one region. The only thing a parent supplies
+//! is the name and depth its child sits at, so the shape of the file is stated
+//! once, next to the type that mirrors it.
+//!
 //! The decompressed NBT buffer is scanned exactly once with a forward-only
 //! [`Reader`]. Only the schema fields known to the litematic format are
 //! decoded; everything else (entities, tile entities, pending ticks, preview
 //! image data, ...) is skipped by length without allocation.
 
 use crate::error::{Error, Result};
-use crate::nbt::{Reader, Tag};
-use crate::region::{BlockState, Region};
+use crate::mc::BlockPos;
+use crate::nbt::{Decode, Reader, Tag};
+use crate::region::Region;
 use crate::Document;
 
-// Nesting depths of the schema levels, used only for the depth limit.
-const ROOT_DEPTH: usize = 1;
-const SCHEMA_DEPTH: usize = 2;
-const REGION_DEPTH: usize = 3;
-const REGION_FIELD_DEPTH: usize = 4;
-const PALETTE_DEPTH: usize = 5;
-
-fn expect_tag(r: &Reader<'_>, field: &'static str, actual: Tag, expected: Tag) -> Result<()> {
-    if actual != expected {
-        return Err(Error::UnexpectedTag {
-            field,
-            tag: actual.id(),
-            offset: r.pos(),
-        });
-    }
-    Ok(())
-}
-
-/// Fields of the `Metadata` sub-compound of the file.
-struct MetadataFields {
-    name: String,
-    description: String,
-    author: String,
-    region_count: Option<i32>,
-    total_volume: Option<i64>,
-    total_blocks: Option<i64>,
-    time_created: i64,
-    time_modified: i64,
-    enclosing_size: Option<[i32; 3]>,
-}
+// Document
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
 impl<'a> Document<'a> {
     /// Parses a decompressed (gunzipped) litematic NBT buffer.
@@ -67,13 +47,20 @@ impl<'a> Document<'a> {
             });
         }
         // The root compound's name is arbitrary and ignored.
-        let _root_name = r.string()?;
+        r.string()?;
+        Self::decode(&mut r, "root", 0)
+    }
+}
 
+impl<'a> Decode<'a> for Document<'a> {
+    /// Reads the root compound's fields.
+    fn decode(r: &mut Reader<'a>, _field: &'static str, enclosing: usize) -> Result<Self> {
+        let depth = r.nested(enclosing)?;
         let mut minecraft_data_version = 0i32;
         let mut version = 0i32;
         let mut sub_version: Option<i32> = None;
         let mut metadata: Option<MetadataFields> = None;
-        let mut regions: Option<Vec<Region<'a>>> = None;
+        let mut regions: Option<Regions<'a>> = None;
 
         loop {
             let tag = r.tag()?;
@@ -83,26 +70,26 @@ impl<'a> Document<'a> {
             let name = r.string()?;
             match name.as_str() {
                 "MinecraftDataVersion" => {
-                    expect_tag(&r, "MinecraftDataVersion", tag, Tag::Int)?;
+                    r.expect("MinecraftDataVersion", tag, Tag::Int)?;
                     minecraft_data_version = r.i32()?;
                 }
                 "Version" => {
-                    expect_tag(&r, "Version", tag, Tag::Int)?;
+                    r.expect("Version", tag, Tag::Int)?;
                     version = r.i32()?;
                 }
                 "SubVersion" => {
-                    expect_tag(&r, "SubVersion", tag, Tag::Int)?;
+                    r.expect("SubVersion", tag, Tag::Int)?;
                     sub_version = Some(r.i32()?);
                 }
                 "Metadata" => {
-                    expect_tag(&r, "Metadata", tag, Tag::Compound)?;
-                    metadata = Some(parse_metadata(&mut r)?);
+                    r.expect("Metadata", tag, Tag::Compound)?;
+                    metadata = Some(MetadataFields::decode(r, "Metadata", depth)?);
                 }
                 "Regions" => {
-                    expect_tag(&r, "Regions", tag, Tag::Compound)?;
-                    regions = Some(parse_regions(&mut r)?);
+                    r.expect("Regions", tag, Tag::Compound)?;
+                    regions = Some(Regions::decode(r, "Regions", depth)?);
                 }
-                _ => r.skip_value(tag, ROOT_DEPTH)?,
+                _ => r.skip_value(tag, depth)?,
             }
         }
 
@@ -116,234 +103,120 @@ impl<'a> Document<'a> {
         })?;
 
         Ok(Document {
-            metadata: crate::Metadata {
-                name: fields.name,
-                description: fields.description,
-                author: fields.author,
-                minecraft_data_version,
-                version,
-                sub_version,
-                region_count: fields.region_count,
-                total_volume: fields.total_volume,
-                total_blocks: fields.total_blocks,
-                time_created: fields.time_created,
-                time_modified: fields.time_modified,
-                enclosing_size: fields.enclosing_size,
-            },
-            regions,
+            metadata: fields.into_metadata(minecraft_data_version, version, sub_version),
+            regions: regions.0,
         })
     }
 }
 
-fn parse_metadata(r: &mut Reader<'_>) -> Result<MetadataFields> {
-    let mut name: Option<String> = None;
-    let mut description: Option<String> = None;
-    let mut author: Option<String> = None;
-    let mut region_count: Option<i32> = None;
-    let mut total_volume: Option<i64> = None;
-    let mut total_blocks: Option<i64> = None;
-    let mut time_created = 0i64;
-    let mut time_modified = 0i64;
-    let mut enclosing_size: Option<[i32; 3]> = None;
+// Block geometry
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
-    loop {
-        let tag = r.tag()?;
-        if tag == Tag::End {
-            break;
-        }
-        let field = r.string()?;
-        match field.as_str() {
-            "Name" => {
-                expect_tag(r, "Metadata.Name", tag, Tag::String)?;
-                name = Some(r.string()?);
+impl<'a> Decode<'a> for BlockPos {
+    /// Reads the `{x, y, z}` compound that `Position`, `Size`, and
+    /// `EnclosingSize` are all written as. Unknown members are skipped.
+    fn decode(r: &mut Reader<'a>, field: &'static str, enclosing: usize) -> Result<Self> {
+        let depth = r.nested(enclosing)?;
+        let mut values: [Option<i32>; 3] = [None, None, None];
+        loop {
+            let tag = r.tag()?;
+            if tag == Tag::End {
+                break;
             }
-            "Description" => {
-                expect_tag(r, "Metadata.Description", tag, Tag::String)?;
-                description = Some(r.string()?);
-            }
-            "Author" => {
-                expect_tag(r, "Metadata.Author", tag, Tag::String)?;
-                author = Some(r.string()?);
-            }
-            "RegionCount" => {
-                expect_tag(r, "Metadata.RegionCount", tag, Tag::Int)?;
-                region_count = Some(r.i32()?);
-            }
-            "TotalVolume" => {
-                expect_tag(r, "Metadata.TotalVolume", tag, Tag::Int)?;
-                total_volume = Some(i64::from(r.i32()?));
-            }
-            "TotalBlocks" => {
-                // The Litematica mod writes an Int here; rustmatica writes a
-                // Long. Accept both.
-                match tag {
-                    Tag::Int => total_blocks = Some(i64::from(r.i32()?)),
-                    Tag::Long => total_blocks = Some(r.i64()?),
-                    _ => {
-                        return Err(Error::UnexpectedTag {
-                            field: "Metadata.TotalBlocks",
-                            tag: tag.id(),
-                            offset: r.pos(),
-                        })
-                    }
+            let axis = r.string()?;
+            let slot = match axis.as_str() {
+                "x" => 0,
+                "y" => 1,
+                "z" => 2,
+                _ => {
+                    r.skip_value(tag, depth)?;
+                    continue;
                 }
-            }
-            "TimeCreated" => {
-                expect_tag(r, "Metadata.TimeCreated", tag, Tag::Long)?;
-                time_created = r.i64()?;
-            }
-            "TimeModified" => {
-                expect_tag(r, "Metadata.TimeModified", tag, Tag::Long)?;
-                time_modified = r.i64()?;
-            }
-            "EnclosingSize" => {
-                expect_tag(r, "Metadata.EnclosingSize", tag, Tag::Compound)?;
-                enclosing_size = Some(parse_vec3(r, "EnclosingSize")?);
-            }
-            _ => r.skip_value(tag, SCHEMA_DEPTH)?,
+            };
+            r.expect(field, tag, Tag::Int)?;
+            values[slot] = Some(r.i32()?);
         }
-    }
-
-    Ok(MetadataFields {
-        name: name.unwrap_or_default(),
-        description: description.unwrap_or_default(),
-        author: author.unwrap_or_default(),
-        region_count,
-        total_volume,
-        total_blocks,
-        time_created,
-        time_modified,
-        enclosing_size,
-    })
-}
-
-fn parse_regions<'a>(r: &mut Reader<'a>) -> Result<Vec<Region<'a>>> {
-    let mut regions = Vec::new();
-    loop {
-        let offset = r.pos();
-        let tag = r.tag()?;
-        if tag == Tag::End {
-            break;
-        }
-        let name = r.string()?;
-        expect_tag(r, "region", tag, Tag::Compound)?;
-        regions.push(parse_region(r, name, offset)?);
-    }
-    Ok(regions)
-}
-
-fn parse_region<'a>(r: &mut Reader<'a>, name: String, region_offset: usize) -> Result<Region<'a>> {
-    let mut position: Option<[i32; 3]> = None;
-    let mut size: Option<[i32; 3]> = None;
-    let mut palette: Option<Vec<BlockState>> = None;
-    let mut states: Option<&[u8]> = None;
-    let mut states_offset = 0usize;
-
-    loop {
-        let tag = r.tag()?;
-        if tag == Tag::End {
-            break;
-        }
-        let field = r.string()?;
-        match field.as_str() {
-            "Position" => {
-                expect_tag(r, "Position", tag, Tag::Compound)?;
-                position = Some(parse_vec3(r, "Position")?);
-            }
-            "Size" => {
-                expect_tag(r, "Size", tag, Tag::Compound)?;
-                size = Some(parse_vec3(r, "Size")?);
-            }
-            "BlockStatePalette" => {
-                expect_tag(r, "BlockStatePalette", tag, Tag::List)?;
-                palette = Some(parse_palette(r)?);
-            }
-            "BlockStates" => {
-                expect_tag(r, "BlockStates", tag, Tag::LongArray)?;
-                states_offset = r.pos();
-                let count = r.count()?;
-                // Borrow the payload directly; never copy or expand it.
-                states = Some(r.take(count as u64 * 8)?);
-            }
-            _ => r.skip_value(tag, REGION_DEPTH)?,
-        }
-    }
-
-    let position = position.ok_or(Error::MissingField {
-        field: "Position",
-        offset: region_offset,
-    })?;
-    let size = size.ok_or(Error::MissingField {
-        field: "Size",
-        offset: region_offset,
-    })?;
-    let palette = palette.ok_or(Error::MissingField {
-        field: "BlockStatePalette",
-        offset: region_offset,
-    })?;
-    let states = states.ok_or(Error::MissingField {
-        field: "BlockStates",
-        offset: region_offset,
-    })?;
-
-    Region::from_parts(name, position, size, palette, states, states_offset)
-}
-
-/// Parses an `{x, y, z}` compound of i32 values. `field` names the compound
-/// for error reporting. Unknown members are skipped.
-fn parse_vec3(r: &mut Reader<'_>, field: &'static str) -> Result<[i32; 3]> {
-    let mut values: [Option<i32>; 3] = [None, None, None];
-    loop {
-        let tag = r.tag()?;
-        if tag == Tag::End {
-            break;
-        }
-        let axis = r.string()?;
-        match axis.as_str() {
-            "x" => {
-                expect_tag(r, field, tag, Tag::Int)?;
-                values[0] = Some(r.i32()?);
-            }
-            "y" => {
-                expect_tag(r, field, tag, Tag::Int)?;
-                values[1] = Some(r.i32()?);
-            }
-            "z" => {
-                expect_tag(r, field, tag, Tag::Int)?;
-                values[2] = Some(r.i32()?);
-            }
-            _ => r.skip_value(tag, REGION_FIELD_DEPTH)?,
-        }
-    }
-    if let [Some(x), Some(y), Some(z)] = values {
-        Ok([x, y, z])
-    } else {
-        Err(Error::MissingField {
-            field,
-            offset: r.pos(),
-        })
+        let [Some(x), Some(y), Some(z)] = values else {
+            return Err(Error::MissingField {
+                field,
+                offset: r.pos(),
+            });
+        };
+        Ok(BlockPos::new(x, y, z))
     }
 }
 
-/// Parses a `BlockStatePalette`: a TAG_List of compounds with a `Name`
-/// string and an optional `Properties` compound of string values.
-fn parse_palette(r: &mut Reader<'_>) -> Result<Vec<BlockState>> {
-    let elem = r.tag()?;
-    if elem != Tag::Compound {
-        return Err(Error::UnexpectedTag {
-            field: "BlockStatePalette element",
-            tag: elem.id(),
-            offset: r.pos(),
-        });
+// Metadata
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
+/// The `Metadata` compound, before the root-level versions are joined to it.
+struct MetadataFields {
+    name: String,
+    description: String,
+    author: String,
+    region_count: Option<i32>,
+    total_volume: Option<i64>,
+    total_blocks: Option<i64>,
+    time_created: i64,
+    time_modified: i64,
+    enclosing_size: Option<BlockPos>,
+}
+
+impl MetadataFields {
+    /// Reads `TotalBlocks`, which the Litematica mod writes as an Int and
+    /// rustmatica writes as a Long. Both are accepted.
+    fn decode_total_blocks(r: &mut Reader<'_>, tag: Tag) -> Result<i64> {
+        match tag {
+            Tag::Int => Ok(i64::from(r.i32()?)),
+            Tag::Long => r.i64(),
+            _ => Err(Error::UnexpectedTag {
+                field: "Metadata.TotalBlocks",
+                tag: tag.id(),
+                offset: r.pos(),
+            }),
+        }
     }
-    let count = r.count()?;
-    // Cap the pre-reservation: a hostile count may be huge while the payload
-    // is tiny; the payload bounds the real length.
-    let mut palette = Vec::with_capacity(count.min(256));
-    for _ in 0..count {
-        let entry_offset = r.pos();
+
+    /// Combines this compound with the versions declared beside it at the root.
+    fn into_metadata(
+        self,
+        minecraft_data_version: i32,
+        version: i32,
+        sub_version: Option<i32>,
+    ) -> crate::Metadata {
+        crate::Metadata {
+            name: self.name,
+            description: self.description,
+            author: self.author,
+            minecraft_data_version,
+            version,
+            sub_version,
+            region_count: self.region_count,
+            total_volume: self.total_volume,
+            total_blocks: self.total_blocks,
+            time_created: self.time_created,
+            time_modified: self.time_modified,
+            enclosing_size: self.enclosing_size.map(|size| [size.x, size.y, size.z]),
+        }
+    }
+}
+
+impl<'a> Decode<'a> for MetadataFields {
+    /// Reads the `Metadata` compound.
+    fn decode(r: &mut Reader<'a>, _field: &'static str, enclosing: usize) -> Result<Self> {
+        let depth = r.nested(enclosing)?;
         let mut name: Option<String> = None;
-        let mut properties: Vec<(String, String)> = Vec::new();
+        let mut description: Option<String> = None;
+        let mut author: Option<String> = None;
+        let mut region_count: Option<i32> = None;
+        let mut total_volume: Option<i64> = None;
+        let mut total_blocks: Option<i64> = None;
+        let mut time_created = 0i64;
+        let mut time_modified = 0i64;
+        let mut enclosing_size: Option<BlockPos> = None;
+
         loop {
             let tag = r.tag()?;
             if tag == Tag::End {
@@ -352,30 +225,78 @@ fn parse_palette(r: &mut Reader<'_>) -> Result<Vec<BlockState>> {
             let field = r.string()?;
             match field.as_str() {
                 "Name" => {
-                    expect_tag(r, "palette entry Name", tag, Tag::String)?;
+                    r.expect("Metadata.Name", tag, Tag::String)?;
                     name = Some(r.string()?);
                 }
-                "Properties" => {
-                    expect_tag(r, "palette entry Properties", tag, Tag::Compound)?;
-                    loop {
-                        let ptag = r.tag()?;
-                        if ptag == Tag::End {
-                            break;
-                        }
-                        let key = r.string()?;
-                        expect_tag(r, "palette property value", ptag, Tag::String)?;
-                        let value = r.string()?;
-                        properties.push((key, value));
-                    }
+                "Description" => {
+                    r.expect("Metadata.Description", tag, Tag::String)?;
+                    description = Some(r.string()?);
                 }
-                _ => r.skip_value(tag, PALETTE_DEPTH)?,
+                "Author" => {
+                    r.expect("Metadata.Author", tag, Tag::String)?;
+                    author = Some(r.string()?);
+                }
+                "RegionCount" => {
+                    r.expect("Metadata.RegionCount", tag, Tag::Int)?;
+                    region_count = Some(r.i32()?);
+                }
+                "TotalVolume" => {
+                    r.expect("Metadata.TotalVolume", tag, Tag::Int)?;
+                    total_volume = Some(i64::from(r.i32()?));
+                }
+                "TotalBlocks" => total_blocks = Some(Self::decode_total_blocks(r, tag)?),
+                "TimeCreated" => {
+                    r.expect("Metadata.TimeCreated", tag, Tag::Long)?;
+                    time_created = r.i64()?;
+                }
+                "TimeModified" => {
+                    r.expect("Metadata.TimeModified", tag, Tag::Long)?;
+                    time_modified = r.i64()?;
+                }
+                "EnclosingSize" => {
+                    r.expect("Metadata.EnclosingSize", tag, Tag::Compound)?;
+                    enclosing_size = Some(BlockPos::decode(r, "EnclosingSize", depth)?);
+                }
+                _ => r.skip_value(tag, depth)?,
             }
         }
-        let name = name.ok_or(Error::MissingField {
-            field: "palette entry Name",
-            offset: entry_offset,
-        })?;
-        palette.push(BlockState { name, properties });
+
+        Ok(Self {
+            name: name.unwrap_or_default(),
+            description: description.unwrap_or_default(),
+            author: author.unwrap_or_default(),
+            region_count,
+            total_volume,
+            total_blocks,
+            time_created,
+            time_modified,
+            enclosing_size,
+        })
     }
-    Ok(palette)
+}
+
+// Regions
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
+
+/// The `Regions` compound: a map from region name to region.
+struct Regions<'a>(Vec<Region<'a>>);
+
+impl<'a> Decode<'a> for Regions<'a> {
+    /// Reads every region in file order, passing each its member name.
+    fn decode(r: &mut Reader<'a>, _field: &'static str, enclosing: usize) -> Result<Self> {
+        let depth = r.nested(enclosing)?;
+        let mut regions = Vec::new();
+        loop {
+            let offset = r.pos();
+            let tag = r.tag()?;
+            if tag == Tag::End {
+                break;
+            }
+            let name = r.string()?;
+            r.expect("region", tag, Tag::Compound)?;
+            regions.push(Region::decode(r, name, offset, depth)?);
+        }
+        Ok(Self(regions))
+    }
 }
