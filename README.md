@@ -1,5 +1,10 @@
 # litematica
 
+![Crates.io Version](https://img.shields.io/crates/v/litematica?style=flat-square)
+![Crates.io Dependents](https://img.shields.io/crates/dependents/litematica?style=flat-square)
+![GitHub last commit](https://img.shields.io/github/last-commit/Conflux-Union/litematica-rust?style=flat-square)
+![GitHub Repo stars](https://img.shields.io/github/stars/Conflux-Union/litematica-rust?style=flat-square)
+
 Streaming, low-memory reader and writer for Minecraft `.litematic` schematic files (format version 6).
 
 ## Design goals
