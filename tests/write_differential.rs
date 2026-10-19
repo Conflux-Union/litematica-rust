@@ -1,16 +1,17 @@
 //! Differential tests for the streaming writer against `rustmatica` 0.5 as
 //! an independent oracle.
 //!
-//! Random layouts are serialized with `litematica::write`; the resulting
+//! Random layouts are serialized with `litematica::task::writer`; the resulting
 //! bytes must be readable by both rustmatica and this crate's own parser,
 //! and every consumer must agree on metadata, palette order, bit width and
 //! the voxel-by-voxel state stream.
 
 use std::collections::{HashMap, HashSet};
 
-use litematica::mc::{BlockPos, BlockSize, BlockState};
-use litematica::write::{write, Layout, WriteOptions};
-use litematica::{decompress_gzip_with_limit, Document};
+use litematica::knowledge::mc::{BlockPos, BlockSize, BlockState};
+use litematica::model::document::Document;
+use litematica::task::decompress::gzip_with_limit;
+use litematica::task::writer::{write, Layout, WriteOptions};
 use rustmatica::{Litematic, Region};
 
 type Schematic = Litematic<CowStrState, CowEntity, CowBlockEntity>;
@@ -104,8 +105,8 @@ impl Table {
 }
 
 impl Layout for Table {
-    fn size(&self) -> BlockPos {
-        self.size
+    fn size(&self) -> BlockSize {
+        BlockSize::of(self.size)
     }
 
     fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
@@ -133,9 +134,14 @@ fn expected_file_palette(table: &Table) -> Vec<BlockState> {
     p
 }
 
-/// A reader palette entry as `(name, properties)`, the shape both sides share.
-fn read_view(state: &litematica::BlockState) -> (String, Vec<(String, String)>) {
-    (state.name.clone(), state.properties.clone())
+/// A palette entry as `(name, properties)`, the shape both sides share.
+fn read_view(state: &litematica::knowledge::mc::BlockState) -> (String, Vec<(String, String)>) {
+    let props = state
+        .properties
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    (state.name.to_string(), props)
 }
 
 fn sorted_props(state: &BlockState) -> Vec<(String, String)> {
@@ -163,14 +169,17 @@ fn assert_written_file_matches(table: &Table, options: &WriteOptions) {
     // Oracle: rustmatica reads the raw gzip member.
     let oracle: Schematic = Litematic::from_bytes(&out).expect("rustmatica parses our output");
     // Our own reader agrees on the same bytes.
-    let nbt = decompress_gzip_with_limit(&out, 1 << 30).expect("decompress our output");
+    let nbt = gzip_with_limit(&out, 1 << 30).expect("decompress our output");
     let doc = Document::parse(&nbt).expect("our parse");
 
     // Metadata.
     assert_eq!(oracle.metadata.name.to_string(), options.name);
     assert_eq!(oracle.metadata.description.to_string(), options.description);
     assert_eq!(oracle.metadata.author.to_string(), options.author);
-    assert_eq!(oracle.metadata.minecraft_data_version, options.data_version);
+    assert_eq!(
+        oracle.metadata.minecraft_data_version,
+        options.minecraft_data_version
+    );
     assert_eq!(oracle.metadata.version, 6);
     assert_eq!(oracle.metadata.sub_version, Some(1));
     assert_eq!(
@@ -227,7 +236,7 @@ fn assert_written_file_matches(table: &Table, options: &WriteOptions) {
             "palette[{i}] properties"
         );
     }
-    let got: Vec<_> = region.palette().iter().map(read_view).collect();
+    let got: Vec<_> = region.palette().states().iter().map(read_view).collect();
     let want: Vec<_> = expected
         .iter()
         .map(|s| (s.name.to_string(), sorted_props(s)))
@@ -245,7 +254,7 @@ fn assert_written_file_matches(table: &Table, options: &WriteOptions) {
     for (i, b) in opalette.iter().enumerate() {
         ptr_to_idx.insert(b as *const _, i as u32);
     }
-    let mut ours = region.iter_blocks();
+    let mut ours = region.iter_palette_ids();
     for (i, (&cell, (_pos, block))) in table.grid.iter().zip(oregion.blocks()).enumerate() {
         let expected_id = match cell {
             AIR => 0,
@@ -288,7 +297,7 @@ fn random_layouts_match_oracle() {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         let table = Table::random(BlockPos::new(sx, sy, sz), distinct, &mut Rng::new(seed));
-        let mut options = WriteOptions::new(4189, "差分 write ✓");
+        let mut options = WriteOptions::new("差分 write ✓", 4189);
         options.description = "written by litematica-rust".into();
         options.author = "litematica-rust".into();
         options.time_created = 1_760_000_000_000;
@@ -305,7 +314,7 @@ fn palette_boundary_sizes_match_oracle() {
             distinct,
             &mut Rng::new(0x9e37_79b9_7f4a_7c15 ^ distinct as u64),
         );
-        let options = WriteOptions::new(4189, format!("palette {distinct}"));
+        let options = WriteOptions::new(format!("palette {distinct}"), 4189);
         assert_written_file_matches(&table, &options);
     }
 }
@@ -314,6 +323,6 @@ fn palette_boundary_sizes_match_oracle() {
 fn zero_axis_layout_matches_oracle() {
     let mut table = Table::random(BlockPos::new(4, 0, 2), 1, &mut Rng::new(1));
     table.grid.clear(); // volume zero: nothing to query
-    let options = WriteOptions::new(4189, "flat");
+    let options = WriteOptions::new("flat", 4189);
     assert_written_file_matches(&table, &options);
 }

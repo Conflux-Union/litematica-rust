@@ -12,8 +12,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use litematica::mc::{BlockPos as McBlockPos, BlockSize as McBlockSize};
-use litematica::{decompress_gzip_with_limit, Document};
+use litematica::knowledge::mc::{BlockPos as McBlockPos, BlockSize as McBlockSize};
+use litematica::model::document::Document;
+use litematica::task::decompress::gzip_with_limit;
 use mcdata::util::BlockPos;
 use mcdata::{GenericBlockEntity, GenericBlockState, GenericEntity};
 use rustmatica::{Litematic, Region};
@@ -66,10 +67,12 @@ fn oracle_num_bits(palette_len: usize) -> u32 {
     n
 }
 
-fn sorted_props(state: &litematica::BlockState) -> Vec<(String, String)> {
-    let mut props = state.properties.clone();
-    props.sort();
-    props
+fn sorted_props(state: &litematica::knowledge::mc::BlockState) -> Vec<(String, String)> {
+    state
+        .properties
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 fn oracle_sorted_props(state: &GenericBlockState) -> Vec<(String, String)> {
@@ -105,7 +108,7 @@ fn fill_region(region: &mut OracleRegion, rng: &mut Rng, states: &[GenericBlockS
 
 fn assert_matches_oracle(schem: &Schematic) {
     let bytes = schem.to_bytes().expect("serialize fixture");
-    let nbt = decompress_gzip_with_limit(&bytes, 1 << 40).expect("decompress fixture");
+    let nbt = gzip_with_limit(&bytes, 1 << 40).expect("decompress fixture");
     let doc = Document::parse(&nbt).expect("our parse");
     let oracle: Schematic = Litematic::from_bytes(&bytes).expect("oracle parse");
 
@@ -138,7 +141,7 @@ fn assert_matches_oracle(schem: &Schematic) {
 
     // Computed document values must match the oracle's formulas.
     assert_eq!(
-        doc.total_volume(),
+        doc.volume(),
         oracle
             .regions
             .iter()
@@ -146,7 +149,7 @@ fn assert_matches_oracle(schem: &Schematic) {
             .sum::<u64>()
     );
     assert_eq!(
-        doc.enclosing_size(),
+        doc.bounding_size(),
         Some(McBlockSize::new(
             enclosing.x as u32,
             enclosing.y as u32,
@@ -156,7 +159,7 @@ fn assert_matches_oracle(schem: &Schematic) {
 
     // Regions: same set of names, same layout, same palettes, same streams.
     assert_eq!(doc.regions.len(), oracle.regions.len());
-    let ours: HashMap<&str, &litematica::Region> =
+    let ours: HashMap<&str, &litematica::model::region::Region> =
         doc.regions.iter().map(|r| (r.name.as_str(), r)).collect();
     assert_eq!(ours.len(), doc.regions.len(), "duplicate region names");
 
@@ -171,7 +174,7 @@ fn assert_matches_oracle(schem: &Schematic) {
             "position of {name}"
         );
         assert_eq!(
-            mregion.size,
+            mregion.declared_size,
             McBlockPos::new(oregion.size.x, oregion.size.y, oregion.size.z),
             "size of {name}"
         );
@@ -182,7 +185,7 @@ fn assert_matches_oracle(schem: &Schematic) {
             opalette.len(),
             "palette length of {name}"
         );
-        for (i, (mstate, ostate)) in mregion.palette().iter().zip(opalette).enumerate() {
+        for (i, (mstate, ostate)) in mregion.palette().states().iter().zip(opalette).enumerate() {
             assert_eq!(
                 mstate.name,
                 ostate.name.to_string(),
@@ -211,7 +214,7 @@ fn assert_matches_oracle(schem: &Schematic) {
         for (i, b) in opalette.iter().enumerate() {
             ptr_to_idx.insert(b as *const _, i as u32);
         }
-        let mut ours_iter = mregion.iter_blocks();
+        let mut ours_iter = mregion.iter_palette_ids();
         assert_eq!(ours_iter.len() as u64, mregion.volume());
         for (i, (_pos, block)) in oregion.blocks().enumerate() {
             let oidx = *ptr_to_idx

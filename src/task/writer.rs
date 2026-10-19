@@ -8,10 +8,12 @@
 //! may over-approximate, and its default implementation discovers the palette
 //! with one extra scan.
 
-use crate::bitstream::{bits_for, Packer};
-use crate::error::{Error, Result};
-use crate::mc::{BlockPos, BlockSize, BlockState};
-use crate::nbt::{Encode, Tag, Writer};
+use crate::error::{Error, Quantity, Result};
+use crate::knowledge::mc::{BlockPos, BlockSize, BlockState, PositionIter};
+use crate::knowledge::nbt::{Encode, Tag, Writer};
+use crate::model::bitstream::Packer;
+use crate::model::palette::{Palette, PaletteId};
+use crate::model::region::Region;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::cell::Cell;
@@ -35,14 +37,12 @@ const FORMAT_SUB_VERSION: i32 = 1;
 /// generators (which can compute a block from its coordinates) and keeps
 /// memory at O(palette) for arbitrarily large schematics.
 pub trait Layout {
-    /// Absolute dimensions per axis, never negative. The signed [`BlockPos`]
-    /// shape mirrors the file's `Region.Size` field; the writer reads it as a
-    /// span through [`BlockSize::of`]. Every position handed to
-    /// [`Layout::block_at`] is contained by that span, as decided by
+    /// Absolute dimensions per axis. Every position handed to
+    /// [`Layout::block_at`] is contained by this span, as decided by
     /// [`BlockSize::contains`]. The value must stay stable throughout one
     /// [`write()`] call: it defines both the declared `Region.Size` and the
     /// voxels that get packed.
-    fn size(&self) -> BlockPos;
+    fn size(&self) -> BlockSize;
 
     /// The block state at `pos`, or `None` for air; `pos` is assumed in bounds.
     ///
@@ -63,7 +63,7 @@ pub trait Layout {
     /// with a full scan of the bounding box, which costs one extra pass over
     /// every voxel.
     fn block_palette(&self) -> HashSet<BlockState> {
-        let positions = BlockSize::of(self.size()).cartesian_positions();
+        let positions = self.size().cartesian_positions();
         positions.fold(HashSet::new(), |mut palette, pos| {
             palette.insert(self.block_at(pos).unwrap_or(BlockState::AIR));
             palette
@@ -82,123 +82,40 @@ pub trait Layout {
     }
 }
 
-// Block values
-//
-// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
-
-impl Encode for BlockPos {
-    const TAG: Tag = Tag::Compound;
-
-    fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
-        self.x.encode("x", out)?;
-        self.y.encode("y", out)?;
-        self.z.encode("z", out)?;
-        out.end()
-    }
-}
-
-impl Encode for BlockState {
-    const TAG: Tag = Tag::Compound;
-
-    /// Writes the entry body, omitting an empty `Properties` compound.
-    fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
-        self.name.as_ref().encode("Name", out)?;
-        if self.properties.is_empty() {
-            return out.end();
-        }
-        out.compound("Properties")?;
-        for (key, value) in &self.properties {
-            value.encode(key.as_ref(), out)?;
-        }
-        out.end()?;
-        out.end()
-    }
-}
-
-// Palette
-//
-// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
-
-/// The file-side block state palette of a written schematic.
+/// A parsed region is directly writable: its palette and voxels already have
+/// the shape a single-region schematic needs.
 ///
-/// Built from the states a [`Layout`] declares: air entries collapse
-/// into the format-mandated index 0, the rest are sorted and deduplicated so
-/// that [`Palette::id_of`] can answer with a binary search.
-pub(crate) struct Palette {
-    /// Non-air states in file order; plain `minecraft:air` is implicit at
-    /// index 0 and never stored.
-    states: Vec<BlockState>,
-}
-
-impl Palette {
-    /// Builds the file palette from the states a layout declared.
-    ///
-    /// Over-approximations are fine: duplicate entries collapse, and unused
-    /// entries simply travel along in the file. Air is never stored: the
-    /// format pins plain `minecraft:air` to index 0, and the palette list is
-    /// written with it first, as Litematica does.
-    pub(crate) fn build(declared: impl IntoIterator<Item = BlockState>) -> Self {
-        let mut states: Vec<BlockState> = declared
-            .into_iter()
-            .filter(|state| state != &BlockState::AIR)
-            .collect();
-        states.sort();
-        states.dedup();
-        Self { states }
+/// Each query costs one bit-stream decode, so serializing a region this way
+/// stays within the compact representation instead of expanding it. The
+/// region's declared direction is folded away, since the writer addresses the
+/// same box and a single-region file has nowhere to record a negative axis.
+impl Layout for Region<'_> {
+    fn size(&self) -> BlockSize {
+        self.size()
     }
 
-    /// The file palette index of `state`, or `None` if the declared palette
-    /// does not cover it.
-    pub(crate) fn id_of(&self, state: &BlockState) -> Option<u32> {
-        if state == &BlockState::AIR {
-            return Some(0);
-        }
-        self.states.binary_search(state).ok().map(|i| i as u32 + 1)
+    fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
+        self.state_at(pos).cloned()
     }
 
-    /// The non-air states in file order; index 0 is implicit air.
-    pub(crate) fn states(&self) -> &[BlockState] {
-        &self.states
-    }
-
-    /// Number of entries in the written `BlockStatePalette`, air included.
-    pub(crate) fn len(&self) -> usize {
-        self.states.len() + 1
-    }
-
-    /// Bits per `BlockStates` entry, matching the reader's width rule.
-    pub(crate) fn num_bits(&self) -> u32 {
-        bits_for(self.len())
-    }
-
-    /// Resolves the id written at `pos`: air is 0, and any other state must
-    /// be covered by this palette.
-    fn id_at<L: Layout>(&self, layout: &L, pos: BlockPos) -> Result<u32> {
-        let Some(state) = layout.block_at(pos) else {
-            return Ok(0);
-        };
-        self.id_of(&state).ok_or(Error::BlockNotInPalette {
-            name: state.name.to_string(),
-            x: pos.x,
-            y: pos.y,
-            z: pos.z,
-        })
+    fn block_palette(&self) -> HashSet<BlockState> {
+        self.palette().states().iter().cloned().collect()
     }
 }
 
-impl Encode for Palette {
-    const TAG: Tag = Tag::List;
+// Palette resolution
+//
+// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
-    /// Writes air first, then the stored states, naming a length one larger.
-    fn body<W: IoWrite>(&self, out: &mut Writer<W>) -> Result<()> {
-        let len = i32::try_from(self.len()).map_err(|_| Error::DimensionOverflow {
-            what: "BlockStatePalette length",
-            value: self.len() as u128,
-        })?;
-        out.list(Tag::Compound, len)?;
-        BlockState::AIR.body(out)?;
-        self.states().iter().try_for_each(|state| state.body(out))
-    }
+/// Resolves the identifier written at `pos`: air is 0, and any other state
+/// must be covered by the palette.
+fn resolve_id<L: Layout>(palette: &Palette, layout: &L, pos: BlockPos) -> Result<PaletteId> {
+    let Some(state) = layout.block_at(pos) else {
+        return Ok(0);
+    };
+    palette
+        .id_of(&state)
+        .ok_or(Error::BlockNotInPalette { state, pos })
 }
 
 // Metadata
@@ -217,7 +134,7 @@ pub struct WriteOptions {
     /// Target Minecraft data version (`MinecraftDataVersion`), e.g. 4189
     /// for 1.21.4. Not defaulted on purpose: the writer cannot know which
     /// game version the blocks are meant for.
-    pub data_version: i32,
+    pub minecraft_data_version: i32,
     /// Creation time in milliseconds since the Unix epoch
     /// (`Metadata.TimeCreated`).
     pub time_created: i64,
@@ -230,9 +147,9 @@ pub struct WriteOptions {
 
 impl WriteOptions {
     /// Creates options for a schematic named `name` targeting Minecraft
-    /// data version `data_version`. Timestamps default to now, description
-    /// and author to empty, compression to the default level.
-    pub fn new(data_version: i32, name: impl Into<String>) -> Self {
+    /// data version `minecraft_data_version`. Timestamps default to now,
+    /// description and author to empty, compression to the default level.
+    pub fn new(name: impl Into<String>, minecraft_data_version: i32) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -241,7 +158,7 @@ impl WriteOptions {
             name: name.into(),
             description: String::new(),
             author: String::new(),
-            data_version,
+            minecraft_data_version,
             time_created: now,
             time_modified: now,
             compression: Compression::default(),
@@ -267,18 +184,18 @@ impl WriteOptions {
 /// # Example
 ///
 /// ```no_run
-/// # use litematica::write::{write, Layout, WriteOptions};
+/// # use litematica::task::writer::{write, Layout, WriteOptions};
 /// # struct MyLayout;
 /// # impl Layout for MyLayout {
-/// #     fn size(&self) -> litematica::mc::BlockPos {
-/// #         litematica::mc::BlockPos::new(16, 16, 16)
+/// #     fn size(&self) -> litematica::knowledge::mc::BlockSize {
+/// #         litematica::knowledge::mc::BlockSize::new(16, 16, 16)
 /// #     }
-/// #     fn block_at(&self, pos: litematica::mc::BlockPos)
-/// #         -> Option<litematica::mc::BlockState> { None }
+/// #     fn block_at(&self, pos: litematica::knowledge::mc::BlockPos)
+/// #         -> Option<litematica::knowledge::mc::BlockState> { None }
 /// # }
-/// # fn main() -> Result<(), litematica::Error> {
+/// # fn main() -> Result<(), litematica::error::Error> {
 /// let layout = MyLayout;
-/// let options = WriteOptions::new(4189, "my build");
+/// let options = WriteOptions::new("my build", 4189);
 /// let file = std::fs::File::create("my_build.litematic")?;
 /// write(&layout, &options, file)?;
 /// # Ok(())
@@ -302,7 +219,7 @@ struct Schematic<'a, L: Layout> {
     layout: &'a L,
     options: &'a WriteOptions,
     palette: Palette,
-    size: BlockPos,
+    size: BlockSize,
     volume: i32,
     longs: i32,
     total_blocks: &'a Cell<i64>,
@@ -314,13 +231,12 @@ impl<'a, L: Layout> Schematic<'a, L> {
     fn new(layout: &'a L, options: &'a WriteOptions, total_blocks: &'a Cell<i64>) -> Result<Self> {
         let size = layout.size();
         let volume = Self::checked_volume(size)?;
-        let palette = Palette::build(layout.block_palette());
-        let bits = palette.num_bits();
+        let palette = Palette::from_declared(layout.block_palette());
         // `volume <= i32::MAX` and `bits <= 32` bound this well below i32::MAX;
         // the checked conversion keeps the written length prefix honest.
-        let longs = (u128::from(volume.unsigned_abs()) * u128::from(bits)).div_ceil(64);
+        let longs = (u128::from(volume as u32) * u128::from(palette.bits_per_entry())).div_ceil(64);
         let longs = i32::try_from(longs).map_err(|_| Error::DimensionOverflow {
-            what: "BlockStates length",
+            quantity: Quantity::BlockStatesLength,
             value: longs,
         })?;
         Ok(Self {
@@ -334,17 +250,11 @@ impl<'a, L: Layout> Schematic<'a, L> {
         })
     }
 
-    /// Rejects negative axes, then returns the volume as the `i32` the format
-    /// stores in `TotalVolume`.
-    fn checked_volume(size: BlockPos) -> Result<i32> {
-        let axes = [("x", size.x), ("y", size.y), ("z", size.z)];
-        if let Some((axis, value)) = axes.into_iter().find(|(_, value)| *value < 0) {
-            return Err(Error::NegativeSize { axis, value });
-        }
-        let volume = BlockSize::of(size).volume();
-        i32::try_from(volume).map_err(|_| Error::DimensionOverflow {
-            what: "volume",
-            value: volume,
+    /// Returns the volume as the `i32` the format stores in `TotalVolume`.
+    fn checked_volume(size: BlockSize) -> Result<i32> {
+        i32::try_from(size.volume()).map_err(|_| Error::DimensionOverflow {
+            quantity: Quantity::Volume,
+            value: size.volume(),
         })
     }
 
@@ -371,11 +281,11 @@ impl<L: Layout> Encode for Schematic<'_, L> {
         region.encode(&self.options.name, out)?;
         out.end()?; // Regions
         self.options
-            .data_version
+            .minecraft_data_version
             .encode("MinecraftDataVersion", out)?;
         FORMAT_VERSION.encode("Version", out)?;
         FORMAT_SUB_VERSION.encode("SubVersion", out)?;
-        let header = Header {
+        let header = MetadataNbt {
             options: self.options,
             size: self.size,
             volume: self.volume,
@@ -390,7 +300,7 @@ impl<L: Layout> Encode for Schematic<'_, L> {
 struct RegionNbt<'a, L: Layout> {
     layout: &'a L,
     palette: &'a Palette,
-    size: BlockPos,
+    size: BlockSize,
     longs: i32,
     total_blocks: &'a Cell<i64>,
 }
@@ -422,7 +332,7 @@ impl<L: Layout> Encode for RegionNbt<'_, L> {
 struct BlockStates<'a, L: Layout> {
     layout: &'a L,
     palette: &'a Palette,
-    size: BlockPos,
+    size: BlockSize,
     longs: i32,
     total_blocks: &'a Cell<i64>,
 }
@@ -440,9 +350,7 @@ impl<L: Layout> Encode for BlockStates<'_, L> {
 struct Packed<'a, L: Layout> {
     layout: &'a L,
     palette: &'a Palette,
-    size: BlockSize,
-    cursor: BlockPos,
-    remaining: u64,
+    positions: PositionIter,
     packer: Packer,
     finished: bool,
     total_blocks: &'a Cell<i64>,
@@ -453,39 +361,17 @@ impl<'a, L: Layout> Packed<'a, L> {
     fn new(
         layout: &'a L,
         palette: &'a Palette,
-        size: BlockPos,
+        size: BlockSize,
         total_blocks: &'a Cell<i64>,
     ) -> Self {
-        let size = BlockSize::of(size);
         Self {
             layout,
             palette,
-            size,
-            cursor: BlockPos::ORIGIN,
-            remaining: u64::try_from(size.volume()).unwrap_or(u64::MAX),
-            packer: Packer::new(palette.num_bits()),
+            positions: size.cartesian_positions(),
+            packer: Packer::new(palette.bits_per_entry()),
             finished: false,
             total_blocks,
         }
-    }
-}
-
-impl<L: Layout> Packed<'_, L> {
-    /// Advances the cursor in storage order (`x` fastest, then `z`, then `y`)
-    /// and returns the position it just left. The size was validated
-    /// non-negative, so every coordinate lies inside the box.
-    fn next_position(&mut self) -> BlockPos {
-        let pos = self.cursor;
-        self.cursor.x += 1;
-        if self.cursor.x == self.size.x as i32 {
-            self.cursor.x = 0;
-            self.cursor.z += 1;
-            if self.cursor.z == self.size.z as i32 {
-                self.cursor.z = 0;
-                self.cursor.y += 1;
-            }
-        }
-        pos
     }
 }
 
@@ -498,14 +384,8 @@ impl<L: Layout> Iterator for Packed<'_, L> {
         if self.finished {
             return None;
         }
-        loop {
-            if self.remaining == 0 {
-                self.finished = true;
-                return self.packer.finish().map(|word| Ok(word as i64));
-            }
-            self.remaining -= 1;
-            let pos = self.next_position();
-            let id = match self.palette.id_at(self.layout, pos) {
+        for pos in self.positions.by_ref() {
+            let id = match resolve_id(self.palette, self.layout, pos) {
                 Ok(id) => id,
                 Err(error) => {
                     self.finished = true;
@@ -519,20 +399,22 @@ impl<L: Layout> Iterator for Packed<'_, L> {
                 return Some(Ok(word as i64));
             }
         }
+        self.finished = true;
+        self.packer.finish().map(|word| Ok(word as i64))
     }
 }
 
 /// The metadata compound of the written schematic.
-struct Header<'a> {
+struct MetadataNbt<'a> {
     options: &'a WriteOptions,
-    size: BlockPos,
+    size: BlockSize,
     volume: i32,
     /// Accumulated by `BlockStates` while the regions stream. Metadata is
     /// written after the regions, so the count is final when read here.
     total_blocks: &'a Cell<i64>,
 }
 
-impl Encode for Header<'_> {
+impl Encode for MetadataNbt<'_> {
     const TAG: Tag = Tag::Compound;
 
     /// Writes the metadata body.
@@ -545,7 +427,7 @@ impl Encode for Header<'_> {
         self.volume.encode("TotalVolume", out)?;
         let total_blocks =
             i32::try_from(self.total_blocks.get()).map_err(|_| Error::DimensionOverflow {
-                what: "TotalBlocks",
+                quantity: Quantity::TotalBlocks,
                 value: self.total_blocks.get() as u128,
             })?;
         total_blocks.encode("TotalBlocks", out)?;
@@ -561,61 +443,17 @@ impl Encode for Header<'_> {
     }
 }
 
-// Packing
-//
-// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
-
 // Tests
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
 #[cfg(test)]
 mod tests {
-    use super::{Layout, Palette};
-    use crate::mc::{BlockPos, BlockState};
-
-    fn st(name: &str, props: &[(&str, &str)]) -> BlockState {
-        BlockState {
-            name: name.to_string().into(),
-            properties: props
-                .iter()
-                .map(|(k, v)| (k.to_string().into(), v.to_string().into()))
-                .collect(),
-        }
-    }
+    use super::Layout;
+    use crate::knowledge::mc::{BlockPos, BlockSize, BlockState};
 
     fn air() -> BlockState {
-        st("minecraft:air", &[])
-    }
-
-    #[test]
-    fn palette_build_maps_air_to_zero_and_sorts_rest() {
-        let declared = [st("c", &[]), air(), st("a", &[]), st("c", &[])];
-        let p = Palette::build(declared);
-        assert_eq!(p.len(), 3);
-        assert_eq!(p.states(), [st("a", &[]), st("c", &[])]);
-        assert_eq!(p.num_bits(), 2);
-        assert_eq!(p.id_of(&air()), Some(0));
-        assert_eq!(p.id_of(&st("a", &[])), Some(1));
-        assert_eq!(p.id_of(&st("c", &[])), Some(2));
-        assert_eq!(p.id_of(&st("minecraft:dirt", &[])), None);
-    }
-
-    #[test]
-    fn palette_build_keeps_cave_air_as_regular_entry() {
-        let declared = [st("minecraft:cave_air", &[]), air()];
-        let p = Palette::build(declared);
-        assert_eq!(p.len(), 2);
-        assert_eq!(p.states(), [st("minecraft:cave_air", &[])]);
-        assert_eq!(p.id_of(&st("minecraft:cave_air", &[])), Some(1));
-    }
-
-    #[test]
-    fn palette_build_empty_declared_is_air_only() {
-        let p = Palette::build(std::iter::empty());
-        assert_eq!(p.len(), 1);
-        assert!(p.states().is_empty());
-        assert_eq!(p.num_bits(), 2);
+        BlockState::AIR
     }
 
     #[test]
@@ -623,8 +461,8 @@ mod tests {
         struct Empty(BlockPos);
 
         impl Layout for Empty {
-            fn size(&self) -> BlockPos {
-                self.0
+            fn size(&self) -> BlockSize {
+                BlockSize::of(self.0)
             }
 
             fn block_at(&self, _pos: BlockPos) -> Option<BlockState> {

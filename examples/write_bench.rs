@@ -12,11 +12,10 @@
 //! cargo run --release --example write_bench -- [out.litematic]
 //! ```
 
-use std::collections::BTreeMap;
 use std::time::Instant;
 
-use litematica::mc::{BlockPos, BlockState};
-use litematica::write::{write, Layout, WriteOptions};
+use litematica::knowledge::mc::{BlockPos, BlockSize, BlockState};
+use litematica::task::writer::{write, Layout, WriteOptions};
 
 /// Peak resident set size in bytes (Linux only, from VmHWM).
 fn peak_rss_bytes() -> Option<u64> {
@@ -40,8 +39,8 @@ struct HollowSphere {
 }
 
 impl Layout for HollowSphere {
-    fn size(&self) -> BlockPos {
-        self.size
+    fn size(&self) -> BlockSize {
+        BlockSize::of(self.size)
     }
 
     fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
@@ -65,23 +64,17 @@ impl Layout for HollowSphere {
     }
 }
 
-fn main() -> Result<(), litematica::Error> {
+fn main() -> Result<(), litematica::error::Error> {
     let out_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "write_bench.litematic".to_string());
 
     let layout = HollowSphere {
         size: BlockPos::new(566, 256, 1423),
-        shell: BlockState {
-            name: "minecraft:stone".into(),
-            properties: BTreeMap::new(),
-        },
-        filler: BlockState {
-            name: "minecraft:glass".into(),
-            properties: BTreeMap::new(),
-        },
+        shell: "minecraft:stone".into(),
+        filler: "minecraft:glass".into(),
     };
-    let options = WriteOptions::new(4189, "write bench");
+    let options = WriteOptions::new("write bench", 4189);
 
     let t0 = Instant::now();
     let file = std::fs::File::create(&out_path)?;

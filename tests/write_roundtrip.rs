@@ -1,15 +1,17 @@
 //! Round-trip and error-path tests for the streaming writer.
 //!
 //! Layouts are hand-built tables (a grid of palette indices), serialized
-//! with `litematica::write`, then parsed back with `Document::parse` and
+//! with `litematica::task::writer`, then parsed back with `Document::parse` and
 //! checked field by field: metadata, region layout, palette order
 //! (air pinned to index 0, rest sorted), and the voxel-by-voxel stream.
 
 use std::collections::HashSet;
 
-use litematica::mc::{BlockPos, BlockSize, BlockState};
-use litematica::write::{write, Layout, WriteOptions};
-use litematica::{decompress_gzip_with_limit, Document, Error};
+use litematica::error::Error;
+use litematica::knowledge::mc::{BlockPos, BlockSize, BlockState};
+use litematica::model::document::Document;
+use litematica::task::decompress::gzip_with_limit;
+use litematica::task::writer::{write, Layout, WriteOptions};
 
 fn st(name: &str, props: &[(&str, &str)]) -> BlockState {
     BlockState {
@@ -25,19 +27,18 @@ fn air() -> BlockState {
     st("minecraft:air", &[])
 }
 
-/// A reader palette entry as `(name, properties)`, the shape both sides share.
-fn read_view(state: &litematica::BlockState) -> (String, Vec<(String, String)>) {
-    (state.name.clone(), state.properties.clone())
-}
-
-/// A writer palette entry in that same shape; its map is already sorted.
-fn write_view(state: &BlockState) -> (String, Vec<(String, String)>) {
+/// A palette entry as `(name, properties)`, the shape both sides share.
+fn read_view(state: &BlockState) -> (String, Vec<(String, String)>) {
     let props = state
         .properties
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     (state.name.to_string(), props)
+}
+
+fn write_view(state: &BlockState) -> (String, Vec<(String, String)>) {
+    read_view(state)
 }
 
 const AIR: u8 = 255;
@@ -47,7 +48,7 @@ struct Table {
     size: BlockPos,
     states: Vec<BlockState>,
     grid: Vec<u8>,
-    /// Overrides `palette()` when set; may over-approximate.
+    /// Overrides `block_palette()` when set; may over-approximate.
     declared: Option<Vec<BlockState>>,
 }
 
@@ -76,8 +77,8 @@ impl Table {
 }
 
 impl Layout for Table {
-    fn size(&self) -> BlockPos {
-        self.size
+    fn size(&self) -> BlockSize {
+        BlockSize::of(self.size)
     }
 
     fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
@@ -106,7 +107,7 @@ impl RoundTrip {
     fn run<L: Layout>(table: &L, opts: &WriteOptions) -> Self {
         let mut out = Vec::new();
         write(table, opts, &mut out).expect("serialize");
-        let nbt = decompress_gzip_with_limit(&out, 1 << 30).expect("decompress our own output");
+        let nbt = gzip_with_limit(&out, 1 << 30).expect("decompress our own output");
         Self { nbt }
     }
 
@@ -157,22 +158,26 @@ fn assert_voxels_match(table: &Table, doc: &Document<'_>) {
             i => id_of(&table.states[i as usize]),
         })
         .collect();
-    let got: Vec<u32> = region.iter_blocks().collect();
+    let got: Vec<u32> = region.iter_palette_ids().collect();
     assert_eq!(got, expect, "voxel stream");
 
     // Random access must agree with the sequential stream entry by entry.
     let positions = BlockSize::of(table.size).cartesian_positions();
     for (i, pos) in positions.enumerate() {
-        assert_eq!(region.index_at(pos), Some(expect[i]), "index at {pos:?}");
         assert_eq!(
-            read_view(region.block_at(pos).expect("in-bounds position")),
+            region.palette_id_at(pos),
+            Some(expect[i]),
+            "index at {pos:?}"
+        );
+        assert_eq!(
+            read_view(region.state_at(pos).expect("in-bounds position")),
             write_view(&expected_palette[expect[i] as usize]),
             "state at {pos:?}"
         );
     }
     let outside = BlockPos::new(table.size.x, 0, 0);
-    assert_eq!(region.index_at(outside), None);
-    assert_eq!(region.block_at(outside), None);
+    assert_eq!(region.palette_id_at(outside), None);
+    assert_eq!(region.state_at(outside), None);
 }
 
 #[test]
@@ -187,7 +192,7 @@ fn round_trip_full_layout() {
         st("litematica:x", &[("a", "1"), ("b", "2")]),
     ];
     let size = BlockPos::new(5, 3, 7);
-    let mut opts = WriteOptions::new(4189, "多区域 schematic ✓");
+    let mut opts = WriteOptions::new("多区域 schematic ✓", 4189);
     opts.description = "round trip".into();
     opts.author = "litematica-rust".into();
     opts.time_created = 1_700_000_000_123;
@@ -220,10 +225,10 @@ fn round_trip_full_layout() {
     let region = &doc.regions[0];
     assert_eq!(region.name, "多区域 schematic ✓");
     assert_eq!(region.position, BlockPos::new(0, 0, 0));
-    assert_eq!(region.size, BlockPos::new(5, 3, 7));
+    assert_eq!(region.declared_size, BlockPos::new(5, 3, 7));
     assert_eq!(region.volume(), 105);
     let expected_palette = expected_file_palette(&table);
-    let got: Vec<_> = region.palette().iter().map(read_view).collect();
+    let got: Vec<_> = region.palette().states().iter().map(read_view).collect();
     let want: Vec<_> = expected_palette.iter().map(write_view).collect();
     assert_eq!(got, want);
     assert_eq!(region.bits_per_entry(), num_bits(expected_palette.len()));
@@ -231,6 +236,7 @@ fn round_trip_full_layout() {
     // Properties survive keyed by name, in the map's sorted order.
     let wire = region
         .palette()
+        .states()
         .iter()
         .find(|s| s.name == "minecraft:redstone_wire")
         .expect("wire in palette");
@@ -238,7 +244,7 @@ fn round_trip_full_layout() {
     let props: Vec<(&str, &str)> = wire
         .properties
         .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .map(|(k, v)| (k.as_ref(), v.as_ref()))
         .collect();
     assert_eq!(props, vec![("east", "side"), ("power", "15")]);
 
@@ -260,19 +266,19 @@ fn round_trip_over_approximated_palette_keeps_unused_entries() {
         st("minecraft:stone", &[]),
         st("minecraft:stone", &[]), // duplicate collapses
     ]);
-    let rt = RoundTrip::run(&table, &WriteOptions::new(4189, "over-approx"));
+    let rt = RoundTrip::run(&table, &WriteOptions::new("over-approx", 4189));
     let doc = rt.doc();
 
     let region = &doc.regions[0];
     // air + sorted {stone, unused_entry}; the unused entry travels along.
     assert_eq!(region.palette().len(), 3);
-    assert_eq!(read_view(&region.palette()[0]), write_view(&air()));
+    assert_eq!(read_view(&region.palette().states()[0]), write_view(&air()));
     assert_eq!(
-        read_view(&region.palette()[1]),
+        read_view(&region.palette().states()[1]),
         write_view(&st("minecraft:stone", &[]))
     );
     assert_eq!(
-        read_view(&region.palette()[2]),
+        read_view(&region.palette().states()[2]),
         write_view(&st("minecraft:unused_entry", &[("never", "emitted")]))
     );
     assert_voxels_match(&table, &doc);
@@ -283,26 +289,26 @@ fn round_trip_degenerate_volumes() {
     // A zero axis has no voxels; `EnclosingSize` mirrors `Region.Size`
     // verbatim, zero axes included.
     let table = Table::filled(BlockPos::new(4, 0, 2), vec![], |_| AIR);
-    let rt = RoundTrip::run(&table, &WriteOptions::new(4189, "flat"));
+    let rt = RoundTrip::run(&table, &WriteOptions::new("flat", 4189));
     let doc = rt.doc();
 
     let region = &doc.regions[0];
     assert_eq!(region.volume(), 0);
     assert_eq!(region.palette().len(), 1);
-    assert_eq!(read_view(&region.palette()[0]), write_view(&air()));
-    assert_eq!(region.iter_blocks().len(), 0);
+    assert_eq!(read_view(&region.palette().states()[0]), write_view(&air()));
+    assert_eq!(region.iter_palette_ids().len(), 0);
     assert_eq!(doc.metadata.total_blocks, Some(0));
     assert_eq!(doc.metadata.total_volume, Some(0));
     assert_eq!(doc.metadata.enclosing_size, Some(BlockPos::new(4, 0, 2)));
 
     // All air still uses the 2-bit floor rather than a zero-width palette.
     let table = Table::filled(BlockPos::new(3, 3, 3), vec![], |_| AIR);
-    let rt = RoundTrip::run(&table, &WriteOptions::new(4189, "air only"));
+    let rt = RoundTrip::run(&table, &WriteOptions::new("air only", 4189));
     let doc = rt.doc();
     let region = &doc.regions[0];
     assert_eq!(region.bits_per_entry(), 2);
     assert_eq!(region.palette().len(), 1);
-    assert_eq!(read_view(&region.palette()[0]), write_view(&air()));
+    assert_eq!(read_view(&region.palette().states()[0]), write_view(&air()));
     assert_eq!(doc.metadata.total_blocks, Some(0));
 }
 
@@ -314,8 +320,8 @@ struct Sparse {
 }
 
 impl Layout for Sparse {
-    fn size(&self) -> BlockPos {
-        self.size
+    fn size(&self) -> BlockSize {
+        BlockSize::of(self.size)
     }
 
     fn block_at(&self, _pos: BlockPos) -> Option<BlockState> {
@@ -340,11 +346,11 @@ fn write_rejections() {
     let states = vec![st("minecraft:stone", &[]), st("litematica:missing", &[])];
     let mut table = Table::filled(BlockPos::new(2, 1, 2), states, |pos| (pos.x % 2) as u8);
     table.declared = Some(vec![st("minecraft:stone", &[])]); // misses index 1
-    let err = write(&table, &WriteOptions::new(4189, "bad palette"), Vec::new()).unwrap_err();
+    let err = write(&table, &WriteOptions::new("bad palette", 4189), Vec::new()).unwrap_err();
     match err {
-        Error::BlockNotInPalette { name, x, y, z } => {
-            assert_eq!(name, "litematica:missing");
-            assert_eq!([x, y, z], [1, 0, 0]);
+        Error::BlockNotInPalette { state, pos } => {
+            assert_eq!(state.name, "litematica:missing");
+            assert_eq!(pos, BlockPos::new(1, 0, 0));
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -352,19 +358,43 @@ fn write_rejections() {
     // A volume beyond the format's i32 limit and a negative axis.
     let err = write(
         &sparse(BlockPos::new(65536, 65536, 1)),
-        &WriteOptions::new(4189, "huge"),
+        &WriteOptions::new("huge", 4189),
         Vec::new(),
     )
     .unwrap_err();
     assert!(matches!(err, Error::DimensionOverflow { .. }));
+}
 
-    let err = write(
-        &sparse(BlockPos::new(-1, 1, 1)),
-        &WriteOptions::new(4189, "negative"),
-        Vec::new(),
-    )
-    .unwrap_err();
-    assert!(matches!(err, Error::NegativeSize { .. }));
+#[test]
+fn parsed_region_serializes_itself() {
+    let states = vec![st("minecraft:stone", &[]), st("minecraft:glass", &[])];
+    let size = BlockPos::new(3, 2, 4);
+    let table = Table::filled(size, states, |pos| ((pos.x + pos.z) % 2) as u8);
+    let source = RoundTrip::run(&table, &WriteOptions::new("source", 4189));
+    let doc = source.doc();
+
+    let mut out = Vec::new();
+    let opts = WriteOptions::new("source", 4189);
+    write(&doc.regions[0], &opts, &mut out).expect("rewrite a parsed region");
+    let nbt = gzip_with_limit(&out, 1 << 30).expect("decompress");
+    let copy = Document::parse(&nbt).expect("parse the rewrite");
+
+    assert_eq!(copy.regions.len(), 1);
+    let region = &copy.regions[0];
+    assert_eq!(region.size(), BlockSize::of(size));
+    assert_eq!(copy.metadata.total_blocks, doc.metadata.total_blocks);
+    assert_eq!(
+        region.iter_palette_ids().count(),
+        BlockSize::of(size).volume() as usize
+    );
+    // The palette is rewritten canonically, so indices may move; states must not.
+    for pos in BlockSize::of(size).cartesian_positions() {
+        assert_eq!(
+            read_view(region.state_at(pos).expect("in bounds")),
+            read_view(doc.regions[0].state_at(pos).expect("in bounds")),
+            "state at {pos:?}"
+        );
+    }
 }
 
 #[test]
@@ -376,8 +406,8 @@ fn default_palette_discovers_only_used_states() {
         glass: BlockState,
     }
     impl Layout for Bare {
-        fn size(&self) -> BlockPos {
-            BlockPos::new(4, 2, 2)
+        fn size(&self) -> BlockSize {
+            BlockSize::new(4, 2, 2)
         }
         fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
             if pos.y % 2 == 0 {
@@ -391,10 +421,10 @@ fn default_palette_discovers_only_used_states() {
         stone: st("minecraft:stone", &[]),
         glass: st("minecraft:glass", &[]),
     };
-    let rt = RoundTrip::run(&bare, &WriteOptions::new(4189, "bare"));
+    let rt = RoundTrip::run(&bare, &WriteOptions::new("bare", 4189));
     let doc = rt.doc();
     let region = &doc.regions[0];
-    let got: Vec<_> = region.palette().iter().map(read_view).collect();
+    let got: Vec<_> = region.palette().states().iter().map(read_view).collect();
     let want: Vec<_> = [
         air(),
         st("minecraft:glass", &[]),

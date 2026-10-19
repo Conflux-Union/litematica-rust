@@ -1,12 +1,11 @@
 //! Sequential, bounded-memory reading of `.litematic` files.
 //!
-//! The counterpart of [`crate::Document`]: instead of borrowing a fully
-//! decompressed buffer, a [`StreamReader`] pulls the gzip member through a
-//! small buffer and hands out one region at a time. A region's palette is
+//! The counterpart of [`crate::model::document::Document`]: instead of
+//! borrowing a fully decompressed buffer, a [`Reader`] pulls the gzip member through a
+//! small buffer and hands out one [`Region`] at a time. A region's palette is
 //! materialized (it is small) and its packed `BlockStates` payload is held
-//! only until the region's other fields have been read, then decoded voxel by
-//! voxel and released. Peak memory is O(buffer + palette + one region
-//! payload), independent of the file's volume.
+//! only while that region is alive, then released. Peak memory is
+//! O(buffer + palette + one region payload), independent of the file's volume.
 //!
 //! NBT compounds are unordered and real files disagree about field order, so
 //! a streaming reader must not assume one. Holding the current region's
@@ -16,24 +15,22 @@
 //! cost is that the payload of the region being read is resident; nothing
 //! larger is.
 //!
-//! Random access remains the job of [`crate::Document`]. The two modes share
-//! the same NBT decoders, header accumulators, geometry validation, and
-//! bit-level cursor, so they agree on every decoded value; only the storage
-//! strategy differs.
+//! Random access remains the job of [`crate::model::document::Document`]. The
+//! two modes share the same [`Region`] type, NBT decoders, header accumulators,
+//! geometry validation, and bit-level cursor, so they agree on every decoded
+//! value; only the storage strategy differs.
 
 use std::io::{BufReader, Read};
 
 use flate2::read::GzDecoder;
 
-use crate::bitstream::decode_payload;
 use crate::error::{Error, Result};
-use crate::mc::{BlockPos, BlockSize};
-use crate::nbt::{FieldOutcome, IoSource, Reader, Slot, Source, Tag};
-use crate::region::{region_geometry, BlockState, Palette, RegionHeader, RegionParts};
-use crate::schema::Header;
-use crate::Metadata;
+use crate::knowledge::nbt::{FieldOutcome, IoSource, Reader as NbtReader, Slot, Source, Tag};
+use crate::model::document::Metadata;
+use crate::model::region::{Region, RegionHeader, RegionParts};
+use crate::model::schema::RootFields;
 
-/// A buffered gzip stream, the byte source a [`StreamReader`] consumes.
+/// A buffered gzip stream, the byte source a [`Reader`] consumes.
 type GzipSource<R> = IoSource<BufReader<GzDecoder<R>>>;
 
 // Stream reader
@@ -43,37 +40,37 @@ type GzipSource<R> = IoSource<BufReader<GzDecoder<R>>>;
 /// A sequential reader for gzip-compressed `.litematic` files.
 ///
 /// Opening the stream scans root fields until `Regions` is reached, collecting
-/// header fields whenever they appear. [`StreamReader::metadata`] returns
+/// header fields whenever they appear. [`Reader::metadata`] returns
 /// `None` until `Metadata` has been scanned, which may be after the last
-/// region. Each call to [`StreamReader::next_region`] parses one region
+/// region. Each call to [`Reader::next_region`] parses one region
 /// completely and returns it.
-pub struct StreamReader<R: Read> {
-    reader: Reader<GzipSource<R>>,
+pub struct Reader<R: Read> {
+    reader: NbtReader<GzipSource<R>>,
     root_depth: usize,
     regions_depth: usize,
-    header: Header,
+    header: RootFields,
     done: bool,
 }
 
-impl<R: Read> std::fmt::Debug for StreamReader<R> {
+impl<R: Read> std::fmt::Debug for Reader<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamReader")
+        f.debug_struct("Reader")
             .field("metadata", &self.header.metadata())
             .field("done", &self.done)
             .finish_non_exhaustive()
     }
 }
 
-impl<R: Read> StreamReader<R> {
+impl<R: Read> Reader<R> {
     /// Opens a gzip-compressed litematic and scans the root up to `Regions`.
     ///
     /// `limit` caps the decompressed byte count; exceeding it fails with
-    /// [`Error::SizeLimitExceeded`] while inflating, so an untrusted file
+    /// [`Error::DecompressionLimitExceeded`] while inflating, so an untrusted file
     /// cannot force unbounded memory or CPU use. Trailing bytes after the
     /// first gzip member are ignored.
     pub fn open(inner: R, limit: u64) -> Result<Self> {
         let decoder = BufReader::with_capacity(64 * 1024, GzDecoder::new(inner));
-        let mut reader = Reader::new(IoSource::new(decoder, limit));
+        let mut reader = NbtReader::new(IoSource::new(decoder, limit));
 
         let tag = reader.tag()?;
         reader.expect("root", tag, Tag::Compound)?;
@@ -85,7 +82,7 @@ impl<R: Read> StreamReader<R> {
             reader,
             root_depth,
             regions_depth: 0,
-            header: Header::new(),
+            header: RootFields::new(),
             done: false,
         };
         stream.scan_to_regions()?;
@@ -105,10 +102,10 @@ impl<R: Read> StreamReader<R> {
     ///
     /// The region's header and packed payload are read before the call
     /// returns, so field order inside the region compound does not matter.
-    /// The payload stays with the returned [`StreamRegion`] until it is
-    /// dropped. At the end of `Regions`, the remaining root fields are
-    /// scanned so that a trailing `Metadata` is still collected.
-    pub fn next_region(&mut self) -> Result<Option<StreamRegion>> {
+    /// The payload stays with the returned [`Region`] until it is dropped. At
+    /// the end of `Regions`, the remaining root fields are scanned so that a
+    /// trailing `Metadata` is still collected.
+    pub fn next_region(&mut self) -> Result<Option<Region<'static>>> {
         if self.done {
             return Ok(None);
         }
@@ -126,7 +123,7 @@ impl<R: Read> StreamReader<R> {
     ///
     /// `BlockStates` is copied aside rather than decoded immediately, because
     /// the palette and size it depends on may still be ahead in the compound.
-    fn read_region(&mut self, name: String, region_depth: usize) -> Result<StreamRegion> {
+    fn read_region(&mut self, name: String, region_depth: usize) -> Result<Region<'static>> {
         let region_offset = self.reader.pos();
         let mut header = RegionHeader::new();
         let mut payload = Slot::default();
@@ -140,25 +137,9 @@ impl<R: Read> StreamReader<R> {
             }
         }
 
-        let RegionParts {
-            position,
-            size,
-            palette,
-        } = header.into_parts(region_offset)?;
+        let parts: RegionParts = header.into_parts(region_offset)?;
         let payload = payload.required("BlockStates", region_offset)?;
-
-        let geometry = region_geometry(size, &palette, payload.len() as u64, region_offset)?;
-        Ok(StreamRegion {
-            name,
-            position,
-            size,
-            dims: geometry.dims,
-            palette,
-            bits: geometry.bits,
-            volume: geometry.volume,
-            payload,
-            blocks_done: false,
-        })
+        Region::from_owned(name, parts, payload, region_offset)
     }
 
     /// Scans root fields until `Regions` opens.
@@ -194,7 +175,7 @@ impl<R: Read> StreamReader<R> {
         }
     }
 
-    /// Consumes one root-level field, handing it to the shared header.
+    /// Consumes one root-level field, handing it to the shared accumulator.
     fn read_root_field(&mut self) -> Result<Option<FieldOutcome>> {
         let Some((name, tag)) = self.reader.next_field()? else {
             return Ok(None);
@@ -205,12 +186,32 @@ impl<R: Read> StreamReader<R> {
     }
 }
 
+impl<R: Read> Iterator for Reader<R> {
+    type Item = Result<Region<'static>>;
+
+    /// Yields regions until the end of `Regions`.
+    ///
+    /// An error ends the iteration: the stream cannot be resumed after a parse
+    /// failure, so every later call returns `None`. Once exhausted, a trailing
+    /// `Metadata` has been scanned and is available through
+    /// [`Reader::metadata`].
+    fn next(&mut self) -> Option<Self::Item> {
+        let region = self.next_region();
+        if region.is_err() {
+            self.done = true;
+        }
+        region.transpose()
+    }
+}
+
+impl<R: Read> std::iter::FusedIterator for Reader<R> {}
+
 /// Reads a `BlockStates` long array into owned bytes.
 ///
 /// The buffer grows in chunks and is never pre-allocated at the claimed
 /// length, so a hostile count cannot force a huge allocation before the
 /// payload (and the decompression limit) proves it real.
-fn read_payload<S: Source>(reader: &mut Reader<S>, longs: usize) -> Result<Vec<u8>> {
+fn read_payload<S: Source>(reader: &mut NbtReader<S>, longs: usize) -> Result<Vec<u8>> {
     const CHUNK: usize = 64 * 1024;
     let total = longs.checked_mul(8).ok_or_else(|| Error::PayloadTooLarge {
         longs,
@@ -223,88 +224,4 @@ fn read_payload<S: Source>(reader: &mut Reader<S>, longs: usize) -> Result<Vec<u
         reader.read_exact(&mut bytes[start..])?;
     }
     Ok(bytes)
-}
-
-// Stream region
-//
-// ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
-
-/// One region yielded by a [`StreamReader`], fully parsed.
-///
-/// The header is materialized, palette included, and the packed payload is
-/// retained until the region is dropped. Block data is emitted once, in
-/// storage order, by [`StreamRegion::read_blocks`].
-pub struct StreamRegion {
-    name: String,
-    position: BlockPos,
-    size: BlockPos,
-    dims: BlockSize,
-    palette: Palette,
-    bits: u32,
-    volume: u64,
-    payload: Vec<u8>,
-    blocks_done: bool,
-}
-
-impl std::fmt::Debug for StreamRegion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamRegion")
-            .field("name", &self.name)
-            .field("position", &self.position)
-            .field("size", &self.size)
-            .field("palette", &self.palette.states())
-            .finish_non_exhaustive()
-    }
-}
-
-impl StreamRegion {
-    /// Name of this region within `Regions`.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Position of the region in schematic coordinates.
-    pub fn position(&self) -> BlockPos {
-        self.position
-    }
-
-    /// Size as stored in the file. Components may be negative, which means the
-    /// region extends in the negative axis direction; the box actually
-    /// addressed is [`StreamRegion::dims`].
-    pub fn size(&self) -> BlockPos {
-        self.size
-    }
-
-    /// The absolute size per axis, with any negative direction folded away.
-    pub fn dims(&self) -> BlockSize {
-        self.dims
-    }
-
-    /// The block state palette in file order; emitted indices refer to it.
-    pub fn palette(&self) -> &[BlockState] {
-        self.palette.states()
-    }
-
-    /// Bits used per block entry in the packed payload.
-    pub fn bits_per_entry(&self) -> u32 {
-        self.bits
-    }
-
-    /// Number of voxels in this region.
-    pub fn volume(&self) -> u64 {
-        self.volume
-    }
-
-    /// Emits every palette index in storage order, calling `f` once per voxel.
-    ///
-    /// Indices are decoded as they are handed to `f` and are never stored.
-    /// Returning an error from `f` stops the read and propagates the error;
-    /// the region counts as consumed, so a second call is a no-op.
-    pub fn read_blocks(&mut self, f: impl FnMut(u32) -> Result<()>) -> Result<()> {
-        if self.blocks_done {
-            return Ok(());
-        }
-        self.blocks_done = true;
-        decode_payload(&self.payload, self.bits, self.volume, f)
-    }
 }

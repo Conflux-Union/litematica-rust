@@ -1,18 +1,22 @@
-//! The Minecraft vocabulary a schematic is built from: where a block sits and
-//! what that block is.
+//! The Minecraft vocabulary a schematic is built from: what a block is and
+//! where it sits.
 //!
-//! [`BlockState`] is one half of that vocabulary: a namespaced block id
-//! together with its properties. It is cheap to clone and orders
-//! deterministically, which is what makes it usable as a palette key in both
-//! the writer and downstream layout combinators.
+//! [`BlockState`] is the "what": a namespaced block id together with its
+//! properties. It is cheap to clone and orders deterministically, which is
+//! what lets it serve as a key wherever states are deduplicated or sorted.
 //!
-//! The other half is split by role. [`BlockPos`] is a point in the world, a
+//! Location is split by role. [`BlockPos`] is a point in the world, a
 //! signed coordinate on every axis; it answers "where". [`BlockSize`] is the
 //! span of a box, a non-negative cell count per axis; it answers "how much".
 //! A file declares both with the same signed triple, because a region may
 //! extend along a negative direction, so [`BlockSize::of`] is the single place
 //! where a declaration becomes a span. Keeping them apart means a position can
 //! never silently bound an index, and a span can never be mistaken for a point.
+//!
+//! This module contains world definitions only. File-format concepts built on
+//! top of them — the palette that numbers states, the bit stream that packs
+//! those numbers — live in the model layer. Every reader and writer reaches
+//! these types through the same names; no task defines a look-alike of its own.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -23,11 +27,11 @@ use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssi
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
 
-/// A single block state from a region palette.
+/// A single block state: a namespaced block id together with its properties.
 ///
 /// The id is namespaced, as in `minecraft:redstone_wire`. Properties are keyed
 /// by name, so equality and ordering are independent of the order a file
-/// happened to list them in; this is what lets a palette deduplicate states
+/// happened to list them in; this is what lets callers deduplicate states
 /// found anywhere in a volume and still order them deterministically.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockState {
@@ -38,11 +42,36 @@ pub struct BlockState {
 }
 
 impl BlockState {
-    /// `minecraft:air`, the empty block state; always palette index 0.
+    /// `minecraft:air`, the empty block state.
     pub const AIR: Self = Self {
         name: Cow::Borrowed("minecraft:air"),
         properties: BTreeMap::new(),
     };
+}
+
+impl From<&'static str> for BlockState {
+    /// A state with the given id and no properties.
+    ///
+    /// Only static names convert this way, so a literal is borrowed instead of
+    /// copied into the state.
+    fn from(name: &'static str) -> Self {
+        Self {
+            name: Cow::Borrowed(name),
+            properties: BTreeMap::new(),
+        }
+    }
+}
+
+impl From<String> for BlockState {
+    /// A state with the given owned id and no properties.
+    ///
+    /// The name moves into the state, so a dynamically built id costs no copy.
+    fn from(name: String) -> Self {
+        Self {
+            name: Cow::Owned(name),
+            properties: BTreeMap::new(),
+        }
+    }
 }
 
 // BlockPos
@@ -78,6 +107,12 @@ impl BlockPos {
     /// lower corner shared by all spans.
     pub const ORIGIN: Self = Self::new(0, 0, 0);
 
+    /// The position one cell past the origin on every axis.
+    ///
+    /// Useful when moving from a declared size to the far corner of the box it
+    /// spans.
+    pub const UNIT: Self = Self::new(1, 1, 1);
+
     /// Creates a position from its three components.
     ///
     /// Any signed triple is a valid world position. When the value is meant as
@@ -92,7 +127,7 @@ impl BlockPos {
     /// The result always lies in the positive octant. This is a plain
     /// coordinate operation, not the way to obtain a span; use
     /// [`BlockSize::of`] to read a signed size as the box it covers.
-    pub const fn abs(&self) -> Self {
+    pub const fn abs(self) -> Self {
         Self {
             x: self.x.abs(),
             y: self.y.abs(),
@@ -131,6 +166,27 @@ impl BlockPos {
             x: if self.x > other.x { self.x } else { other.x },
             y: if self.y > other.y { self.y } else { other.y },
             z: if self.z > other.z { self.z } else { other.z },
+        }
+    }
+
+    /// Component-wise addition that saturates at the `i32` bounds.
+    ///
+    /// Used where coordinates come from an untrusted file and a plain `+`
+    /// could overflow on a hostile declaration.
+    pub const fn saturating_add(self, other: Self) -> Self {
+        Self {
+            x: self.x.saturating_add(other.x),
+            y: self.y.saturating_add(other.y),
+            z: self.z.saturating_add(other.z),
+        }
+    }
+
+    /// Component-wise subtraction that saturates at the `i32` bounds.
+    pub const fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            x: self.x.saturating_sub(other.x),
+            y: self.y.saturating_sub(other.y),
+            z: self.z.saturating_sub(other.z),
         }
     }
 
@@ -354,13 +410,49 @@ impl BlockSize {
     }
 
     /// Every position in the box, in storage order: `x` fastest, then `z`,
-    /// then `y`. An empty axis yields no items. Items are produced lazily.
-    pub fn cartesian_positions(self) -> impl Iterator<Item = BlockPos> {
-        (0..self.y)
-            .flat_map(move |y| (0..self.z).map(move |z| (y, z)))
-            .flat_map(move |(y, z)| {
-                (0..self.x).map(move |x| BlockPos::new(x as i32, y as i32, z as i32))
-            })
+    /// then `y`. An empty axis yields no items.
+    pub fn cartesian_positions(self) -> PositionIter {
+        let end = u64::try_from(self.volume()).unwrap_or(u64::MAX);
+        PositionIter {
+            size: self,
+            next: 0,
+            end,
+        }
+    }
+}
+
+/// A lazy walk over the positions of a [`BlockSize`] in storage order.
+///
+/// The iterator carries only the size and a cursor, so walking a huge box
+/// costs the same as walking a small one.
+#[derive(Debug, Clone)]
+pub struct PositionIter {
+    size: BlockSize,
+    next: u64,
+    end: u64,
+}
+
+impl Iterator for PositionIter {
+    type Item = BlockPos;
+
+    fn next(&mut self) -> Option<BlockPos> {
+        if self.next >= self.end {
+            return None;
+        }
+        let pos = self.size.position_at(self.next)?;
+        self.next += 1;
+        Some(pos)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for PositionIter {
+    fn len(&self) -> usize {
+        usize::try_from(self.end - self.next).unwrap_or(usize::MAX)
     }
 }
 

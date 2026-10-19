@@ -21,12 +21,9 @@ Requires Rust 1.88 or newer.
 Three types carry the Minecraft vocabulary. `BlockState` is a namespaced id plus a property map, cheap to clone and deterministically ordered, so it can key a palette. `BlockPos` is a signed world position and supports vector arithmetic, while `BlockSize` is a non-negative cell count per axis, anchored at the origin and half-open, and owns storage-order indexing. Keeping position and span apart stops a signed file size from being used as an index bound, and lets either value move through a query without a conversion type.
 
 ```rust
-use litematica::mc::{BlockPos, BlockSize, BlockState};
+use litematica::knowledge::mc::{BlockPos, BlockSize, BlockState};
 
-let stone = BlockState {
-    name: "minecraft:stone".into(),
-    properties: Default::default(),
-};
+let stone: BlockState = "minecraft:stone".into();
 
 let pos = BlockPos::new(3, 2, 5);
 let size = BlockSize::of(BlockPos::new(16, -4, 8)); // negative axes fold into spans
@@ -41,26 +38,23 @@ assert_eq!(size.position_at(0), Some(BlockPos::ORIGIN));
 
 ## Pure streaming reads
 
-Use `StreamReader` when the file is much larger than available memory. It inflates the gzip stream through a fixed-size buffer and yields one region at a time, keeping a region's packed payload only until that region is consumed. Peak memory is independent of file size: the buffer, the palette, and one region. NBT field order does not matter; a `Metadata` compound that trails the regions becomes available once the stream is exhausted.
+Use `Reader` when the file is much larger than available memory. It inflates the gzip stream through a fixed-size buffer and yields one region at a time, keeping a region's packed payload only until that region is consumed. Peak memory is independent of file size: the buffer, the palette, and one region. NBT field order does not matter; a `Metadata` compound that trails the regions becomes available once the stream is exhausted.
 
 ```rust
-use litematica::StreamReader;
-use std::fs::File;
+use litematica::knowledge::mc::BlockState;
+use litematica::task::stream::Reader;
 
-fn main() -> litematica::Result<()> {
-    let file = File::open("bridge.litematic")?;
-    let mut reader = StreamReader::open(file, 512 * 1024 * 1024)?;
+fn count_air(path: &str) -> litematica::error::Result<()> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = Reader::open(file, 512 * 1024 * 1024)?;
 
-    while let Some(mut region) = reader.next_region()? {
-        let mut counts = vec![0u64; region.palette().len()];
-        region.read_blocks(|index| {
-            // A corrupt file may yield an out-of-range index; get_mut ignores it.
-            if let Some(count) = counts.get_mut(index as usize) {
-                *count += 1;
-            }
-            Ok(())
-        })?;
-        println!("{}: {} voxels", region.name(), region.volume());
+    for region in &mut reader {
+        let region = region?;
+        let air = region
+            .iter_states()
+            .filter(|&state| state == &BlockState::AIR)
+            .count();
+        println!("{}: {} air of {} voxels", region.name, air, region.volume());
     }
 
     if let Some(metadata) = reader.metadata() {
@@ -75,21 +69,22 @@ fn main() -> litematica::Result<()> {
 Use `Document` when the data can reside in memory as a whole but blocks should not be expanded per voxel. It keeps only the decompressed bytes and the palettes, decoding a block at query time, so a lookup does not depend on a region's volume. This suits repeated random access to one schematic; the tradeoff is holding the full decompressed buffer, which must outlive the document.
 
 ```rust
-use litematica::mc::BlockPos;
-use litematica::{decompress_gzip_with_limit, Document};
+use litematica::knowledge::mc::BlockPos;
+use litematica::model::document::Document;
+use litematica::task::decompress::gzip_with_limit;
 
-fn main() -> litematica::Result<()> {
-    let raw = std::fs::read("map.litematic")?;
-    let nbt = decompress_gzip_with_limit(&raw, 512 * 1024 * 1024)?;
+fn inspect(path: &str) -> litematica::error::Result<()> {
+    let raw = std::fs::read(path)?;
+    let nbt = gzip_with_limit(&raw, 512 * 1024 * 1024)?;
     let doc = Document::parse(&nbt)?;
 
     for region in &doc.regions {
         let pos = BlockPos::new(3, 4, 5);
-        let state = region.block_at(pos);
+        let state = region.state_at(pos);
         println!("{} {:?}", region.name, state);
     }
 
-    println!("enclosing size: {:?}", doc.enclosing_size());
+    println!("enclosing size: {:?}", doc.bounding_size());
     Ok(())
 }
 ```
@@ -99,8 +94,8 @@ fn main() -> litematica::Result<()> {
 The writer never requires a materialized volume; it treats a `Layout` as a queryable source: declare the bounding box, return a block per coordinate, and declare the set of states that may occur. Procedural generation, overlays, and template stitching all fit the same interface; a composite layout only has to union its children's state sets, after which the writer pulls voxels in storage order and streams compressed output. Peak memory is the palette, independent of volume. Output is currently a single region without entities or block entities.
 
 ```rust
-use litematica::mc::{BlockPos, BlockState};
-use litematica::write::{write, Layout, WriteOptions};
+use litematica::knowledge::mc::{BlockPos, BlockSize, BlockState};
+use litematica::task::writer::{write, Layout, WriteOptions};
 use std::collections::HashSet;
 
 /// One layer of stone on the floor, air everywhere else.
@@ -109,8 +104,8 @@ struct Floor {
 }
 
 impl Layout for Floor {
-    fn size(&self) -> BlockPos {
-        BlockPos::new(16, 16, 16)
+    fn size(&self) -> BlockSize {
+        BlockSize::new(16, 16, 16)
     }
 
     fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
@@ -124,16 +119,13 @@ impl Layout for Floor {
     }
 }
 
-fn main() -> litematica::Result<()> {
+fn write_floor(path: &str) -> litematica::error::Result<()> {
     let layout = Floor {
-        state: BlockState {
-            name: "minecraft:stone".into(),
-            properties: Default::default(),
-        },
+        state: "minecraft:stone".into(),
     };
 
-    let options = WriteOptions::new(4189, "floor"); // 4189 = 1.21.4
-    write(&layout, &options, std::fs::File::create("floor.litematic")?)?;
+    let options = WriteOptions::new("floor", 4189); // 4189 = 1.21.4
+    write(&layout, &options, std::fs::File::create(path)?)?;
     Ok(())
 }
 ```

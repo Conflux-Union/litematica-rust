@@ -13,8 +13,9 @@
 use std::io::{Cursor, Write as _};
 
 use flate2::{write::GzEncoder, Compression};
-use litematica::mc::{BlockPos, BlockSize};
-use litematica::{Document, Error, StreamReader};
+use litematica::knowledge::mc::{BlockPos, BlockSize};
+use litematica::model::document::Document;
+use litematica::task::stream::Reader;
 
 // NBT fixture builder
 //
@@ -261,8 +262,8 @@ fn gzip(data: &[u8]) -> Vec<u8> {
     enc.finish().expect("gzip finish")
 }
 
-fn open(bytes: &[u8]) -> StreamReader<Cursor<Vec<u8>>> {
-    StreamReader::open(Cursor::new(bytes.to_vec()), 1 << 30).expect("open fixture")
+fn open(bytes: &[u8]) -> Reader<Cursor<Vec<u8>>> {
+    Reader::open(Cursor::new(bytes.to_vec()), 1 << 30).expect("open fixture")
 }
 
 // Fixtures
@@ -312,10 +313,19 @@ fn three_regions() -> Vec<RegionSpec<'static>> {
     ]
 }
 
-fn palette_view(palette: &[litematica::BlockState]) -> Vec<(String, Vec<(String, String)>)> {
+fn palette_view(
+    palette: &[litematica::knowledge::mc::BlockState],
+) -> Vec<(String, Vec<(String, String)>)> {
     palette
         .iter()
-        .map(|state| (state.name.clone(), state.properties.clone()))
+        .map(|state| {
+            let props = state
+                .properties
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            (state.name.to_string(), props)
+        })
         .collect()
 }
 
@@ -332,36 +342,38 @@ fn stream_matches_document_region_by_region() {
     let mut reader = open(&gzip(&raw));
     assert_eq!(reader.metadata(), Some(&doc.metadata));
 
-    for (spec, doc_region) in specs.iter().zip(&doc.regions) {
-        let mut region = reader
-            .next_region()
-            .expect("region header")
-            .expect("region present");
+    for ((spec, doc_region), streamed) in specs.iter().zip(&doc.regions).zip(&mut reader) {
+        let region = streamed.expect("region present");
 
-        assert_eq!(region.name(), spec.name);
-        assert_eq!(region.position(), spec.position);
-        assert_eq!(region.size(), spec.size);
-        assert_eq!(region.dims(), BlockSize::of(spec.size));
+        assert_eq!(region.name, spec.name);
+        assert_eq!(region.position, spec.position);
+        assert_eq!(region.declared_size, spec.size);
+        assert_eq!(region.size(), BlockSize::of(spec.size));
         assert_eq!(region.volume(), spec.volume());
         assert_eq!(region.bits_per_entry(), spec.bits());
         assert_eq!(
-            palette_view(region.palette()),
-            palette_view(doc_region.palette())
+            palette_view(region.palette().states()),
+            palette_view(doc_region.palette().states())
         );
 
-        let mut streamed = Vec::new();
-        region
-            .read_blocks(|index| {
-                streamed.push(index);
-                Ok(())
-            })
-            .expect("read payload");
-        assert_eq!(streamed, spec.indices, "voxel stream of {}", spec.name);
-        let random: Vec<u32> = doc_region.iter_blocks().collect();
-        assert_eq!(streamed, random, "stream vs Document for {}", spec.name);
+        let ids: Vec<u32> = region.iter_palette_ids().collect();
+        assert_eq!(ids, spec.indices, "voxel stream of {}", spec.name);
+        let random: Vec<u32> = doc_region.iter_palette_ids().collect();
+        assert_eq!(ids, random, "stream vs Document for {}", spec.name);
+
+        let states: Vec<&str> = region
+            .iter_states()
+            .map(|state| state.name.as_ref())
+            .collect();
+        let expected: Vec<&str> = spec
+            .indices
+            .iter()
+            .map(|&id| spec.palette[id as usize].0)
+            .collect();
+        assert_eq!(states, expected, "resolved states of {}", spec.name);
     }
 
-    assert!(reader.next_region().expect("end of regions").is_none());
+    assert!(reader.next().is_none());
 }
 
 #[test]
@@ -384,21 +396,15 @@ fn field_order_is_irrelevant() {
         }
 
         for (spec, doc_region) in specs.iter().zip(&doc.regions) {
-            let mut region = reader.next_region().expect("region").expect("present");
-            assert_eq!(region.position(), spec.position);
-            assert_eq!(region.size(), spec.size);
+            let region = reader.next_region().expect("region").expect("present");
+            assert_eq!(region.position, spec.position);
+            assert_eq!(region.declared_size, spec.size);
             assert_eq!(
-                palette_view(region.palette()),
-                palette_view(doc_region.palette())
+                palette_view(region.palette().states()),
+                palette_view(doc_region.palette().states())
             );
 
-            let mut streamed = Vec::new();
-            region
-                .read_blocks(|index| {
-                    streamed.push(index);
-                    Ok(())
-                })
-                .expect("read payload");
+            let streamed: Vec<u32> = region.iter_palette_ids().collect();
             assert_eq!(streamed, spec.indices, "voxel stream of {}", spec.name);
         }
 
@@ -421,75 +427,32 @@ fn dropping_an_unread_region_advances_the_stream() {
         .next_region()
         .expect("first header")
         .expect("present");
-    assert_eq!(first.name(), "dense");
+    assert_eq!(first.name, "dense");
     drop(first);
 
-    let mut second = reader
+    let second = reader
         .next_region()
         .expect("second header")
         .expect("present");
-    assert_eq!(second.name(), "negative");
-    let mut streamed = Vec::new();
-    second
-        .read_blocks(|index| {
-            streamed.push(index);
-            Ok(())
-        })
-        .expect("read payload");
+    assert_eq!(second.name, "negative");
+    let streamed: Vec<u32> = second.iter_palette_ids().collect();
     assert_eq!(streamed, specs[1].indices);
 }
 
 #[test]
-fn read_blocks_lifecycle() {
+fn iterating_a_streamed_region_is_repeatable() {
     let specs = three_regions();
     let mut reader = open(&gzip(&document_bytes(&specs, false, false)));
 
-    // The payload is emitted exactly once; a second call is a no-op.
-    let mut region = reader.next_region().expect("header").expect("present");
-    let mut first = Vec::new();
-    region
-        .read_blocks(|index| {
-            first.push(index);
-            Ok(())
-        })
-        .expect("first read");
+    let region = reader.next_region().expect("header").expect("present");
+    let first: Vec<u32> = region.iter_palette_ids().collect();
+    let second: Vec<u32> = region.iter_palette_ids().collect();
     assert_eq!(first, specs[0].indices);
-
-    let mut second = Vec::new();
-    region
-        .read_blocks(|index| {
-            second.push(index);
-            Ok(())
-        })
-        .expect("second read");
-    assert!(second.is_empty(), "payload is emitted exactly once");
-
-    // A callback error escapes, yet the region counts as consumed so the
-    // stream stays usable.
-    let mut region = reader.next_region().expect("header").expect("present");
-    let err = region
-        .read_blocks(|_| {
-            Err(Error::MissingField {
-                field: "callback",
-                offset: 0,
-            })
-        })
-        .expect_err("callback error must escape");
-    assert!(matches!(
-        err,
-        Error::MissingField {
-            field: "callback",
-            ..
-        }
-    ));
-    assert!(
-        region.read_blocks(|_| Ok(())).is_ok(),
-        "a consumed region is not retried"
-    );
+    assert_eq!(first, second);
     drop(region);
 
     let next = reader.next_region().expect("stream continues");
-    assert_eq!(next.expect("third region present").name(), "empty");
+    assert_eq!(next.expect("second region present").name, "negative");
 }
 
 #[test]
@@ -499,9 +462,9 @@ fn truncated_and_corrupt_inputs_error_without_panicking() {
     // error; every cut inside the deflate stream must be.
     for cut in [0, bytes.len() / 4, bytes.len() / 2, bytes.len() * 3 / 4] {
         let input = bytes[..cut].to_vec();
-        let outcome = StreamReader::open(Cursor::new(input), 1 << 30).and_then(|mut reader| {
-            while let Some(mut region) = reader.next_region()? {
-                region.read_blocks(|_| Ok(()))?;
+        let outcome = Reader::open(Cursor::new(input), 1 << 30).and_then(|mut reader| {
+            while let Some(region) = reader.next_region()? {
+                region.iter_palette_ids().for_each(drop);
             }
             Ok(())
         });
@@ -509,5 +472,5 @@ fn truncated_and_corrupt_inputs_error_without_panicking() {
     }
 
     let garbage = vec![0xFFu8; 64];
-    assert!(StreamReader::open(Cursor::new(garbage), 1 << 30).is_err());
+    assert!(Reader::open(Cursor::new(garbage), 1 << 30).is_err());
 }

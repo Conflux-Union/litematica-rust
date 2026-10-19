@@ -18,7 +18,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use litematica::{decompress_gzip_with_limit, Document};
+use litematica::model::document::Document;
+use litematica::task::decompress::gzip_with_limit;
 use mcdata::GenericBlockState;
 use rustmatica::Litematic;
 
@@ -52,12 +53,12 @@ fn main() {
 
     // ---- our side ------------------------------------------------------
     let t0 = Instant::now();
-    let nbt = decompress_gzip_with_limit(&raw, 8 << 30).expect("our decompress");
+    let nbt = gzip_with_limit(&raw, 8 << 30).expect("our decompress");
     let doc = Document::parse(&nbt).expect("our parse");
     let mut our_checksum = FNV_OFFSET;
     let mut our_volume: u64 = 0;
     for region in &doc.regions {
-        for index in region.iter_blocks() {
+        for index in region.iter_palette_ids() {
             our_volume += 1;
             our_checksum ^= u64::from(index);
             our_checksum = our_checksum.wrapping_mul(FNV_PRIME);
@@ -92,7 +93,7 @@ fn main() {
         for (i, b) in palette.iter().enumerate() {
             ptr_to_idx.insert(b as *const _, i as u32);
         }
-        let mut iter = mregion.iter_blocks();
+        let mut iter = mregion.iter_palette_ids();
         let mut count: u64 = 0;
         for (_pos, block) in oregion.blocks() {
             let oidx = *ptr_to_idx

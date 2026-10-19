@@ -1,5 +1,7 @@
 //! Error types for this crate.
 
+use crate::knowledge::mc::{BlockPos, BlockState};
+use std::fmt;
 use std::io;
 
 /// Convenient result alias used throughout this crate.
@@ -16,19 +18,19 @@ pub enum Error {
     /// Decompressing the gzip stream produced more than the configured number
     /// of bytes. Detection happens while decompressing, not after.
     #[error("decompressed output exceeds limit of {limit} bytes")]
-    SizeLimitExceeded {
+    DecompressionLimitExceeded {
         /// The limit that was passed by the caller.
         limit: u64,
     },
 
     /// The gzip stream is corrupt or truncated. The underlying I/O error is
     /// preserved as the source.
-    #[error("corrupt gzip stream: {0}")]
-    CorruptGzip(
+    #[error("corrupt gzip stream: {source}")]
+    CorruptGzip {
         /// The wrapped I/O error.
         #[from]
-        io::Error,
-    ),
+        source: io::Error,
+    },
 
     /// The NBT payload ended before a value was complete.
     #[error("unexpected end of NBT payload at byte offset {offset}")]
@@ -122,33 +124,24 @@ pub enum Error {
 
     /// A `Layout::block_at` result is not covered by the layout's declared
     /// palette.
-    #[error("block state `{name}` at ({x}, {y}, {z}) is not present in the declared palette")]
+    #[error(
+        "block state `{}` at {:?} is not present in the declared palette",
+        .state.name,
+        .pos
+    )]
     BlockNotInPalette {
-        /// Name of the offending block state.
-        name: String,
-        /// X coordinate of the query position.
-        x: i32,
-        /// Y coordinate of the query position.
-        y: i32,
-        /// Z coordinate of the query position.
-        z: i32,
-    },
-
-    /// A layout declared a negative dimension, which no region can span.
-    #[error("layout {axis} size {value} is negative")]
-    NegativeSize {
-        /// The axis with the negative dimension, e.g. `x`.
-        axis: &'static str,
-        /// The negative dimension.
-        value: i32,
+        /// The offending block state.
+        state: BlockState,
+        /// The position that produced it.
+        pos: BlockPos,
     },
 
     /// A layout volume or a file quantity exceeds what a litematic file can
     /// store.
-    #[error("layout {what} {value} exceeds the i32 limit of the litematic format")]
+    #[error("layout {quantity} {value} exceeds the i32 limit of the litematic format")]
     DimensionOverflow {
-        /// Which quantity overflowed, e.g. `volume`.
-        what: &'static str,
+        /// Which quantity overflowed.
+        quantity: Quantity,
         /// The overflowing value.
         value: u128,
     },
@@ -179,4 +172,36 @@ pub enum Error {
         /// Byte offset of the payload length.
         offset: usize,
     },
+}
+
+/// A quantity that failed to fit the `i32` the litematic format stores.
+///
+/// Naming the quantity here keeps callers from matching on free-form strings
+/// and gives every overflow report the same wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Quantity {
+    /// One axis of a region size.
+    SizeAxis,
+    /// The number of palette entries.
+    PaletteLength,
+    /// The voxel count of a region.
+    Volume,
+    /// The number of longs in a packed `BlockStates` array.
+    BlockStatesLength,
+    /// The non-air block count written into the metadata.
+    TotalBlocks,
+}
+
+impl fmt::Display for Quantity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::SizeAxis => "size axis",
+            Self::PaletteLength => "BlockStatePalette length",
+            Self::Volume => "volume",
+            Self::BlockStatesLength => "BlockStates length",
+            Self::TotalBlocks => "TotalBlocks",
+        };
+        f.write_str(name)
+    }
 }
