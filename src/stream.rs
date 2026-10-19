@@ -27,9 +27,10 @@ use flate2::read::GzDecoder;
 
 use crate::bitstream::decode_payload;
 use crate::error::{Error, Result};
+use crate::mc::BlockState;
 use crate::mc::{BlockPos, BlockSize};
 use crate::nbt::{FieldOutcome, IoSource, Reader, Slot, Source, Tag};
-use crate::region::{region_geometry, BlockState, Palette, RegionHeader, RegionParts};
+use crate::region::{region_geometry, Palette, RegionHeader, RegionParts};
 use crate::schema::Header;
 use crate::Metadata;
 

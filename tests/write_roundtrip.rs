@@ -25,19 +25,18 @@ fn air() -> BlockState {
     st("minecraft:air", &[])
 }
 
-/// A reader palette entry as `(name, properties)`, the shape both sides share.
-fn read_view(state: &litematica::BlockState) -> (String, Vec<(String, String)>) {
-    (state.name.clone(), state.properties.clone())
-}
-
-/// A writer palette entry in that same shape; its map is already sorted.
-fn write_view(state: &BlockState) -> (String, Vec<(String, String)>) {
+/// A palette entry as `(name, properties)`, the shape both sides share.
+fn read_view(state: &BlockState) -> (String, Vec<(String, String)>) {
     let props = state
         .properties
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     (state.name.to_string(), props)
+}
+
+fn write_view(state: &BlockState) -> (String, Vec<(String, String)>) {
+    read_view(state)
 }
 
 const AIR: u8 = 255;
@@ -238,7 +237,7 @@ fn round_trip_full_layout() {
     let props: Vec<(&str, &str)> = wire
         .properties
         .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .map(|(k, v)| (k.as_ref(), v.as_ref()))
         .collect();
     assert_eq!(props, vec![("east", "side"), ("power", "15")]);
 
@@ -342,9 +341,9 @@ fn write_rejections() {
     table.declared = Some(vec![st("minecraft:stone", &[])]); // misses index 1
     let err = write(&table, &WriteOptions::new(4189, "bad palette"), Vec::new()).unwrap_err();
     match err {
-        Error::BlockNotInPalette { name, x, y, z } => {
-            assert_eq!(name, "litematica:missing");
-            assert_eq!([x, y, z], [1, 0, 0]);
+        Error::BlockNotInPalette { state, pos } => {
+            assert_eq!(state.name, "litematica:missing");
+            assert_eq!(pos, BlockPos::new(1, 0, 0));
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -365,6 +364,38 @@ fn write_rejections() {
     )
     .unwrap_err();
     assert!(matches!(err, Error::NegativeSize { .. }));
+}
+
+#[test]
+fn parsed_region_serializes_itself() {
+    let states = vec![st("minecraft:stone", &[]), st("minecraft:glass", &[])];
+    let size = BlockPos::new(3, 2, 4);
+    let table = Table::filled(size, states, |pos| ((pos.x + pos.z) % 2) as u8);
+    let source = RoundTrip::run(&table, &WriteOptions::new(4189, "source"));
+    let doc = source.doc();
+
+    let mut out = Vec::new();
+    let opts = WriteOptions::new(4189, "source");
+    write(&doc.regions[0], &opts, &mut out).expect("rewrite a parsed region");
+    let nbt = decompress_gzip_with_limit(&out, 1 << 30).expect("decompress");
+    let copy = Document::parse(&nbt).expect("parse the rewrite");
+
+    assert_eq!(copy.regions.len(), 1);
+    let region = &copy.regions[0];
+    assert_eq!(region.dims(), BlockSize::of(size));
+    assert_eq!(copy.metadata.total_blocks, doc.metadata.total_blocks);
+    assert_eq!(
+        region.iter_blocks().count(),
+        BlockSize::of(size).volume() as usize
+    );
+    // The palette is rewritten canonically, so indices may move; states must not.
+    for pos in BlockSize::of(size).cartesian_positions() {
+        assert_eq!(
+            read_view(region.block_at(pos).expect("in bounds")),
+            read_view(doc.regions[0].block_at(pos).expect("in bounds")),
+            "state at {pos:?}"
+        );
+    }
 }
 
 #[test]

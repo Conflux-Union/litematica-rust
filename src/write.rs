@@ -12,6 +12,7 @@ use crate::bitstream::{bits_for, Packer};
 use crate::error::{Error, Result};
 use crate::mc::{BlockPos, BlockSize, BlockState};
 use crate::nbt::{Encode, Tag, Writer};
+use crate::region::Region;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::cell::Cell;
@@ -79,6 +80,27 @@ pub trait Layout {
         Self: Sized,
     {
         write(self, options, sink)
+    }
+}
+
+/// A parsed region is directly writable: its palette and voxels already have
+/// the shape a single-region schematic needs.
+///
+/// Each query costs one bit-stream decode, so serializing a region this way
+/// stays within the compact representation instead of expanding it. The
+/// region's declared direction is folded away, since the writer addresses the
+/// same box and a single-region file has nowhere to record a negative axis.
+impl Layout for Region<'_> {
+    fn size(&self) -> BlockPos {
+        self.size.abs()
+    }
+
+    fn block_at(&self, pos: BlockPos) -> Option<BlockState> {
+        Region::block_at(self, pos).cloned()
+    }
+
+    fn block_palette(&self) -> HashSet<BlockState> {
+        self.palette().iter().cloned().collect()
     }
 }
 
@@ -177,12 +199,8 @@ impl Palette {
         let Some(state) = layout.block_at(pos) else {
             return Ok(0);
         };
-        self.id_of(&state).ok_or(Error::BlockNotInPalette {
-            name: state.name.to_string(),
-            x: pos.x,
-            y: pos.y,
-            z: pos.z,
-        })
+        self.id_of(&state)
+            .ok_or(Error::BlockNotInPalette { state, pos })
     }
 }
 
@@ -337,9 +355,8 @@ impl<'a, L: Layout> Schematic<'a, L> {
     /// Rejects negative axes, then returns the volume as the `i32` the format
     /// stores in `TotalVolume`.
     fn checked_volume(size: BlockPos) -> Result<i32> {
-        let axes = [("x", size.x), ("y", size.y), ("z", size.z)];
-        if let Some((axis, value)) = axes.into_iter().find(|(_, value)| *value < 0) {
-            return Err(Error::NegativeSize { axis, value });
+        if size.x < 0 || size.y < 0 || size.z < 0 {
+            return Err(Error::NegativeSize { size });
         }
         let volume = BlockSize::of(size).volume();
         i32::try_from(volume).map_err(|_| Error::DimensionOverflow {

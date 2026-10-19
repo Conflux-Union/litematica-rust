@@ -84,7 +84,8 @@ pub mod write;
 pub use bitstream::BlockIter;
 pub use error::{Error, Result};
 pub use flate2::Compression;
-pub use region::{BlockState, Region};
+pub use mc::BlockState;
+pub use region::Region;
 pub use stream::{StreamReader, StreamRegion};
 
 /// Decompresses a single gzip member with a hard cap on the output size.

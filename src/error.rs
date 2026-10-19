@@ -1,5 +1,6 @@
 //! Error types for this crate.
 
+use crate::mc::{BlockPos, BlockState};
 use std::io;
 
 /// Convenient result alias used throughout this crate.
@@ -122,25 +123,23 @@ pub enum Error {
 
     /// A `Layout::block_at` result is not covered by the layout's declared
     /// palette.
-    #[error("block state `{name}` at ({x}, {y}, {z}) is not present in the declared palette")]
+    #[error(
+        "block state `{}` at {:?} is not present in the declared palette",
+        .state.name,
+        .pos
+    )]
     BlockNotInPalette {
-        /// Name of the offending block state.
-        name: String,
-        /// X coordinate of the query position.
-        x: i32,
-        /// Y coordinate of the query position.
-        y: i32,
-        /// Z coordinate of the query position.
-        z: i32,
+        /// The offending block state.
+        state: BlockState,
+        /// The position that produced it.
+        pos: BlockPos,
     },
 
     /// A layout declared a negative dimension, which no region can span.
-    #[error("layout {axis} size {value} is negative")]
+    #[error("layout size {size:?} has a negative axis")]
     NegativeSize {
-        /// The axis with the negative dimension, e.g. `x`.
-        axis: &'static str,
-        /// The negative dimension.
-        value: i32,
+        /// The declared size, including the negative component.
+        size: BlockPos,
     },
 
     /// A layout volume or a file quantity exceeds what a litematic file can

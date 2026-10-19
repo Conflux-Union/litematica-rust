@@ -1,10 +1,12 @@
 //! Regions, block state palettes, and the bit-unpacking block iterator.
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::bitstream::{bits_for, BitStream, BlockIter};
 use crate::error::{Error, Result};
-use crate::mc::{BlockPos, BlockSize};
+use crate::mc::{BlockPos, BlockSize, BlockState};
 use crate::nbt::{
     Decode, FieldEntry, FieldOutcome, FieldTable, Reader, SliceSource, Slot, Source, Tag,
 };
@@ -12,16 +14,6 @@ use crate::nbt::{
 // Block state
 //
 // ++++++++++++============++++++++++++============++++++++++++============++++++++++++============
-
-/// A single block state from a region palette.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BlockState {
-    /// Namespaced block id, e.g. `minecraft:redstone_wire`.
-    pub name: String,
-    /// Block state properties as `(name, value)` pairs, exactly in the order
-    /// they appear in the file.
-    pub properties: Vec<(String, String)>,
-}
 
 impl<S: Source> Decode<S> for BlockState {
     const TAG: Tag = Tag::Compound;
@@ -37,7 +29,7 @@ impl<S: Source> Decode<S> for BlockState {
             FieldTable::new(&fields).apply(&mut entry, r, &field, tag, depth)?;
         }
         Ok(Self {
-            name: entry.name.required("palette entry Name", offset)?,
+            name: Cow::Owned(entry.name.required("palette entry Name", offset)?),
             properties: entry.properties.or_default(),
         })
     }
@@ -50,7 +42,7 @@ impl<S: Source> Decode<S> for BlockState {
 #[derive(Default)]
 struct EntryFields {
     name: Slot<String>,
-    properties: Slot<Vec<(String, String)>>,
+    properties: Slot<BTreeMap<Cow<'static, str>, Cow<'static, str>>>,
 }
 
 impl EntryFields {
@@ -64,30 +56,28 @@ impl EntryFields {
                 Ok(())
             }),
             FieldEntry::new("Properties", |entry, r, tag, depth| {
-                entry
-                    .properties
-                    .set(BlockState::decode_properties(r, tag, depth)?);
+                entry.properties.set(decode_properties(r, tag, depth)?);
                 Ok(())
             }),
         ]
     }
 }
 
-impl BlockState {
-    /// Reads a `Properties` compound: a map from property name to string value.
-    fn decode_properties<S: Source>(
-        r: &mut Reader<S>,
-        tag: Tag,
-        enclosing: usize,
-    ) -> Result<Vec<(String, String)>> {
-        r.expect("palette entry Properties", tag, Tag::Compound)?;
-        let depth = r.nested(enclosing)?;
-        let mut properties = Vec::new();
-        while let Some((key, tag)) = r.next_field()? {
-            properties.push((key, r.decode_field("palette property value", tag, depth)?));
-        }
-        Ok(properties)
+/// Reads a `Properties` compound as the keyed map the shared [`BlockState`]
+/// orders by, so a file's member order cannot leak into state identity.
+fn decode_properties<S: Source>(
+    r: &mut Reader<S>,
+    tag: Tag,
+    enclosing: usize,
+) -> Result<BTreeMap<Cow<'static, str>, Cow<'static, str>>> {
+    r.expect("palette entry Properties", tag, Tag::Compound)?;
+    let depth = r.nested(enclosing)?;
+    let mut properties = BTreeMap::new();
+    while let Some((key, tag)) = r.next_field()? {
+        let value = r.decode_field("palette property value", tag, depth)?;
+        properties.insert(Cow::Owned(key), Cow::Owned(value));
     }
+    Ok(properties)
 }
 
 // Region header

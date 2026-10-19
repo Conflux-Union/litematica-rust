@@ -315,7 +315,14 @@ fn three_regions() -> Vec<RegionSpec<'static>> {
 fn palette_view(palette: &[litematica::BlockState]) -> Vec<(String, Vec<(String, String)>)> {
     palette
         .iter()
-        .map(|state| (state.name.clone(), state.properties.clone()))
+        .map(|state| {
+            let props = state
+                .properties
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            (state.name.to_string(), props)
+        })
         .collect()
 }
 

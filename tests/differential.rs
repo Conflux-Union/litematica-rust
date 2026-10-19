@@ -67,9 +67,11 @@ fn oracle_num_bits(palette_len: usize) -> u32 {
 }
 
 fn sorted_props(state: &litematica::BlockState) -> Vec<(String, String)> {
-    let mut props = state.properties.clone();
-    props.sort();
-    props
+    state
+        .properties
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 fn oracle_sorted_props(state: &GenericBlockState) -> Vec<(String, String)> {

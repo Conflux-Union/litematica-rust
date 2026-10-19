@@ -133,9 +133,14 @@ fn expected_file_palette(table: &Table) -> Vec<BlockState> {
     p
 }
 
-/// A reader palette entry as `(name, properties)`, the shape both sides share.
+/// A palette entry as `(name, properties)`, the shape both sides share.
 fn read_view(state: &litematica::BlockState) -> (String, Vec<(String, String)>) {
-    (state.name.clone(), state.properties.clone())
+    let props = state
+        .properties
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    (state.name.to_string(), props)
 }
 
 fn sorted_props(state: &BlockState) -> Vec<(String, String)> {
