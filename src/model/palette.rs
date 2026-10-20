@@ -101,7 +101,7 @@ impl OrderedPalette {
     pub fn new(declared: impl IntoIterator<Item = BlockState>) -> Self {
         let mut states: Vec<BlockState> = declared
             .into_iter()
-            .filter(|state| state != &BlockState::AIR)
+            .filter(|state| !state.is_air_variant())
             .collect();
         states.sort();
         states.dedup();
@@ -114,7 +114,7 @@ impl OrderedPalette {
     /// The search relies on the canonical order this type promises, so it is
     /// a binary search rather than a scan.
     pub fn id_of(&self, state: &BlockState) -> Option<PaletteId> {
-        if state == &BlockState::AIR {
+        if state.is_air_variant() {
             return Some(0);
         }
         let rest = self.states().get(1..)?;
@@ -204,15 +204,20 @@ mod tests {
     }
 
     #[test]
-    fn ordered_palette_keeps_cave_air_as_regular_entry() {
-        let declared = [st("minecraft:cave_air"), st("minecraft:air")];
+    fn ordered_palette_folds_all_air_variants_to_zero() {
+        let declared = [
+            st("minecraft:cave_air"),
+            st("minecraft:air"),
+            st("minecraft:void_air"),
+            st("a"),
+        ];
         let palette = OrderedPalette::new(declared);
         assert_eq!(palette.len(), 2);
-        assert_eq!(
-            palette.states(),
-            [st("minecraft:air"), st("minecraft:cave_air")]
-        );
-        assert_eq!(palette.id_of(&st("minecraft:cave_air")), Some(1));
+        assert_eq!(palette.states()[0].name.as_ref(), "minecraft:air");
+        assert_eq!(palette.id_of(&st("minecraft:air")), Some(0));
+        assert_eq!(palette.id_of(&st("minecraft:cave_air")), Some(0));
+        assert_eq!(palette.id_of(&st("minecraft:void_air")), Some(0));
+        assert_eq!(palette.id_of(&st("a")), Some(1));
     }
 
     #[test]

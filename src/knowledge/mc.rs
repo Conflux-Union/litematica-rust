@@ -47,6 +47,14 @@ impl BlockState {
         name: Cow::Borrowed("minecraft:air"),
         properties: BTreeMap::new(),
     };
+
+    /// Whether this state is one of Minecraft's three air variants.
+    pub fn is_air_variant(&self) -> bool {
+        matches!(
+            self.name.as_ref(),
+            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+        )
+    }
 }
 
 impl From<&'static str> for BlockState {
