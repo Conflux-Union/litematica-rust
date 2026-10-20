@@ -1,6 +1,6 @@
 [package]
 name = "litematica"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 # slice::as_chunks, used by the block iterator, was stabilized in 1.88.
 rust-version = "1.88"
