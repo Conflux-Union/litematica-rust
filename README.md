@@ -15,7 +15,7 @@ The design separates where data comes from from how it is stored: the read side 
 
 ```bash
 # run the following cargo command in your project directory:
-cargo add litematica --version ">=0.2.2, <0.3.0"
+cargo add litematica --version ">=0.2.1, <0.3.0"
 ```
 
 ## Basic types

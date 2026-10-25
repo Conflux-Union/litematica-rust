@@ -1,6 +1,6 @@
 [package]
 name = "litematica"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Conflux-Union/litematica-rust"
@@ -10,11 +10,11 @@ keywords = ["minecraft", "litematic", "litematica", "nbt", "schematic"]
 categories = ["encoding", "parser-implementations", "game-development"]
 
 [dependencies]
-flate2 = ">=1.0, <2.0"
-thiserror = ">=2.0, <3.0"
+flate2 = ">=1.0.0, <2.0.0"
+thiserror = ">=2.0.0, <3.0.0"
 
 [dev-dependencies]
 # Differential oracle and fixture generator for tests only. Default features
 # are disabled so the oracle exposes raw i64 timestamps and stays lightweight.
-rustmatica = { version = ">=0.5, <0.6", default-features = false }
-mcdata = ">=0.4, <0.5"
+rustmatica = { version = ">=0.5.0, <0.6.0", default-features = false }
+mcdata = ">=0.4.0, <0.5.0"
