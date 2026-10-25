@@ -6,7 +6,7 @@
 
 use std::io::{Cursor, Write as _};
 
-use flate2::{write::GzEncoder, Compression};
+use flate2::{Compression, write::GzEncoder};
 use litematica::error::Error;
 use litematica::knowledge::mc::{BlockPos, BlockSize};
 use litematica::model::document::Document;

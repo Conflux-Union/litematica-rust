@@ -1,9 +1,7 @@
 [package]
 name = "litematica"
-version = "0.2.1"
-edition = "2021"
-# slice::as_chunks, used by the block iterator, was stabilized in 1.88.
-rust-version = "1.88"
+version = "0.2.2"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Conflux-Union/litematica-rust"
 readme = "README.md"
@@ -12,11 +10,11 @@ keywords = ["minecraft", "litematic", "litematica", "nbt", "schematic"]
 categories = ["encoding", "parser-implementations", "game-development"]
 
 [dependencies]
-flate2 = "1.0"
-thiserror = "2.0"
+flate2 = ">=1.0, <2.0"
+thiserror = ">=2.0, <3.0"
 
 [dev-dependencies]
 # Differential oracle and fixture generator for tests only. Default features
 # are disabled so the oracle exposes raw i64 timestamps and stays lightweight.
-rustmatica = { version = "0.5", default-features = false }
-mcdata = "0.4"
+rustmatica = { version = ">=0.5, <0.6", default-features = false }
+mcdata = ">=0.4, <0.5"

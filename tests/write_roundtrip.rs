@@ -11,7 +11,7 @@ use litematica::error::Error;
 use litematica::knowledge::mc::{BlockPos, BlockSize, BlockState};
 use litematica::model::document::Document;
 use litematica::task::decompress::gzip_with_limit;
-use litematica::task::writer::{write, Layout, WriteOptions};
+use litematica::task::writer::{Layout, WriteOptions, write};
 
 fn st(name: &str, props: &[(&str, &str)]) -> BlockState {
     BlockState {
@@ -255,11 +255,7 @@ fn round_trip_full_layout() {
 fn round_trip_over_approximated_palette_keeps_unused_entries() {
     let states = vec![st("minecraft:stone", &[])];
     let mut table = Table::filled(BlockPos::new(4, 2, 3), states, |pos| {
-        if pos.x % 2 == 0 {
-            0
-        } else {
-            AIR
-        }
+        if pos.x % 2 == 0 { 0 } else { AIR }
     });
     table.declared = Some(vec![
         st("minecraft:unused_entry", &[("never", "emitted")]),

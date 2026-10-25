@@ -15,7 +15,7 @@
 use std::time::Instant;
 
 use litematica::knowledge::mc::{BlockPos, BlockSize, BlockState};
-use litematica::task::writer::{write, Layout, WriteOptions};
+use litematica::task::writer::{Layout, WriteOptions, write};
 
 /// Peak resident set size in bytes (Linux only, from VmHWM).
 fn peak_rss_bytes() -> Option<u64> {
