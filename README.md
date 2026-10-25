@@ -1,9 +1,9 @@
 # litematica
 
-![Crates.io Version](https://img.shields.io/crates/v/litematica?style=flat-square)
-![Crates.io Dependents](https://img.shields.io/crates/dependents/litematica?style=flat-square)
-![GitHub last commit](https://img.shields.io/github/last-commit/Conflux-Union/litematica-rust?style=flat-square)
-![GitHub Repo stars](https://img.shields.io/github/stars/Conflux-Union/litematica-rust?style=flat-square)
+[![Crates.io Version](https://img.shields.io/crates/v/litematica?style=flat-square&logo=rust&labelColor=363a4f&color=f5a97f)](https://crates.io/crates/litematica)
+[![Crates.io Dependents](https://img.shields.io/crates/dependents/litematica?style=flat-square&logo=rust&labelColor=363a4f&color=ee99a0)](https://crates.io/crates/litematica/reverse_dependencies)
+[![GitHub last commit](https://img.shields.io/github/last-commit/Conflux-Union/litematica-rust?style=flat-square&logo=github&labelColor=363a4f&color=f5bde6)](https://github.com/Conflux-Union/litematica-rust/activity)
+[![GitHub Repo stars](https://img.shields.io/github/stars/Conflux-Union/litematica-rust?style=flat-square&logo=github&labelColor=363a4f&color=c6a0f6)](https://github.com/Conflux-Union/litematica-rust)
 
 Streaming, low-memory reader and writer for Minecraft `.litematic` schematic files (format version 6).
 
@@ -13,13 +13,10 @@ The crate serves three distinct use cases: pure streaming reads whose memory doe
 
 The design separates where data comes from from how it is stored: the read side promises only to produce the next block or the block at a coordinate, and the write side asks a layout for its bounds, a single block, and the set of states it may produce, so volume never enters the memory budget. Positions, spans, and block states each have a distinct type, and the format invariants live on those types; composite layouts assemble by unioning state sets instead of materializing intermediate results.
 
-## Installation
-
-```sh
-cargo add litematica
+```bash
+# run the following cargo command in your project directory:
+cargo add litematica --version ">=0.2.2, <0.3.0"
 ```
-
-Requires Rust 1.88 or newer.
 
 ## Basic types
 

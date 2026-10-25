@@ -897,7 +897,7 @@ impl<W: IoWrite> Writer<W> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Encode, Reader, SliceSource, Tag, Writer, MAX_DEPTH};
+    use super::{Encode, MAX_DEPTH, Reader, SliceSource, Tag, Writer};
     use crate::error::Error;
 
     #[test]

@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use litematica::knowledge::mc::{BlockPos, BlockSize, BlockState};
 use litematica::model::document::Document;
 use litematica::task::decompress::gzip_with_limit;
-use litematica::task::writer::{write, Layout, WriteOptions};
+use litematica::task::writer::{Layout, WriteOptions, write};
 use rustmatica::{Litematic, Region};
 
 type Schematic = Litematic<CowStrState, CowEntity, CowBlockEntity>;
